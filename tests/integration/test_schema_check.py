@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "024"
+HEAD_REVISION = "025"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -5113,4 +5113,337 @@ def test_downgrade_024_refuses_a_table_it_did_not_create():
         assert result.returncode != 0
         assert "024's comment marker" in result.stdout + result.stderr
         assert fetchval(url, "SELECT to_regclass('public.user_sessions')") is not None
+        assert alembic_version(url) == HEAD_REVISION
+
+
+# ── 025: `users.oidc_subject` and its partial unique index ──────────────────
+#
+# The column is what binds a provider identity to a local account, and the
+# index is the database's half of "one provider identity, one account". Both
+# are additive and NULL for every pre-025 row, so the exposure is not the
+# upgrade — it is a *reconciliation* that adopts something 025 did not create:
+# a non-unique index of the right name (every existence check passes while two
+# accounts may claim one `sub`), or a column that is NOT NULL (which no local
+# account can satisfy) or carries a default (an identity every new row silently
+# acquires).
+
+OIDC_COLUMN = "oidc_subject"
+OIDC_INDEX = "ux_users_oidc_subject"
+# Byte identical to `COLUMN_MARKER` in the migration and to
+# `_OIDC_SUBJECT_COLUMN_MARKER` in `src/models/db.py`.
+OIDC_MARKER = "the identity provider's stable subject claim (025_oidc_subject)"
+
+
+def oidc_column_comment(url):
+    return fetchval(
+        url,
+        "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
+        "WHERE a.attrelid = 'users'::regclass AND a.attname = $1",
+        OIDC_COLUMN,
+    )
+
+
+def oidc_index_shape(url):
+    """`(columns, unique, usable, partial-or-expression, predicate)` or None."""
+    rows = fetch(
+        url,
+        "SELECT (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(string_to_array(i.indkey::text, ' ')) "
+        "               WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = i.indrelid "
+        "                             AND a.attnum = k.attnum::smallint) AS columns, "
+        "       i.indisunique, (i.indisvalid AND i.indisready) AS usable, "
+        "       (i.indpred IS NOT NULL OR i.indexprs IS NOT NULL) AS restricted, "
+        "       pg_get_expr(i.indpred, i.indrelid) AS predicate "
+        "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+        "WHERE i.indrelid = 'users'::regclass AND ic.relname = $1",
+        OIDC_INDEX,
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    return (
+        list(row["columns"] or []),
+        row["indisunique"],
+        row["usable"],
+        row["restricted"],
+        row["predicate"],
+    )
+
+
+def refuse_025(url, *, must_mention):
+    """Stamp back to 024, re-run 025, require a refusal, return the message.
+
+    `refuse_024`'s device one revision on, and adversarial for its reason: the
+    stamp-back is the same path `make test-schema` exercises for idempotence,
+    so a shape waved through here would be waved through on a real database
+    somebody had altered by hand.
+    """
+    _harness.run_alembic(url, "stamp", "024", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "025 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "024", "nothing should have been recorded"
+    return combined
+
+
+def test_025_creates_the_column_and_index_it_promises():
+    with throwaway_db("schema_oidc_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+
+        # Nullable, no default, marked. Each of the three is the thing that
+        # makes NULL mean "this account has never signed in through a
+        # provider", which is every account on the day 025 lands.
+        assert column_shape(url, "users", OIDC_COLUMN) == (
+            False,
+            "character varying(255)",
+            None,
+        )
+        assert oidc_column_comment(url) == OIDC_MARKER
+
+        columns, unique, usable, restricted, predicate = oidc_index_shape(url)
+        assert columns == [OIDC_COLUMN]
+        assert unique is True, (
+            "without uniqueness two rows could claim one provider identity and "
+            "which vault a person reached would depend on row order"
+        )
+        assert usable is True
+        assert restricted is True, "the index is partial over the non-NULL rows"
+        assert predicate == "(oidc_subject IS NOT NULL)"
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+        assert "No new upgrade operations detected" in check.stdout
+
+
+def test_025_writes_no_rows():
+    """No existing account has ever authenticated against a provider, so NULL
+    is the correct value for all of them and inventing one would be inventing
+    an identity claim nobody made."""
+    with throwaway_db("schema_oidc_backfill", revision="024") as url:
+        insert_user(url, 1, "max")
+        insert_user(url, 2, "sam")
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert fetchval(
+            url, f"SELECT count(*) FROM users WHERE {OIDC_COLUMN} IS NOT NULL"
+        ) == 0
+        assert fetchval(url, "SELECT count(*) FROM users") == 2
+
+
+def test_025_enforces_one_provider_identity_per_account():
+    """The invariant the index exists for, asserted against the database."""
+    with throwaway_db("schema_oidc_unique") as url:
+        insert_user(url, 1, "max")
+        insert_user(url, 2, "sam")
+        sql(url, f"UPDATE users SET {OIDC_COLUMN} = 'sub-1' WHERE id = 1")
+
+        with pytest.raises(asyncpg.exceptions.UniqueViolationError):
+            sql(url, f"UPDATE users SET {OIDC_COLUMN} = 'sub-1' WHERE id = 2")
+
+        # NULL is not a value the uniqueness covers: every local account has
+        # one, and they must not collide with each other.
+        insert_user(url, 3, "kim")
+        assert fetchval(
+            url, f"SELECT count(*) FROM users WHERE {OIDC_COLUMN} IS NULL"
+        ) == 2
+
+
+def test_025_creates_in_public_under_a_redirected_search_path():
+    """021's case, repeated for 025 because the exposure is the same.
+
+    Every `op.*` call in 025 is unqualified and resolves through
+    `search_path`, so without the pin the column would be added to a `users` in
+    `decoy` — and the callback, which resolves the unqualified name through the
+    *application's* path, would write a federated identity somewhere nothing
+    ever looks and fail to find it again on the next login.
+
+    024 `RESET`s its own pin, which is exactly why 025 needs one of its own.
+    """
+    with throwaway_db("schema_oidc_path", revision="024") as url:
+        dbname = fetchval(url, "SELECT current_database()")
+        sql(url, "CREATE SCHEMA decoy")
+        sql(url, f'ALTER DATABASE "{dbname}" SET search_path TO decoy, public')
+        assert fetchval(url, "SHOW search_path") == "decoy, public"
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert oidc_column_comment(url) == OIDC_MARKER
+        assert oidc_index_shape(url)[0] == [OIDC_COLUMN]
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM pg_class c "
+            "WHERE c.relnamespace = 'decoy'::regnamespace",
+        ) == 0, "nothing at all was created in the decoy schema"
+
+        # The pin is `SET LOCAL`, so it must not have outlived the transaction.
+        assert fetchval(url, "SHOW search_path") == "decoy, public"
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_025_chains_from_024_and_is_the_head():
+    """Adding a revision without teaching this module about it must fail here
+    rather than leaving the new migration unexercised."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+
+    assert script.get_current_head() == HEAD_REVISION
+    assert script.get_revision("025").down_revision == "024"
+
+
+def test_025_accepts_its_own_shape_on_a_stamp_back():
+    """The benign case, and the one `make test-schema` actually runs."""
+    with throwaway_db("schema_oidc_rerun") as url:
+        insert_user(url, 1, "max")
+        sql(url, f"UPDATE users SET {OIDC_COLUMN} = 'sub-1' WHERE id = 1")
+
+        _harness.run_alembic(url, "stamp", "024", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        # The re-run writes and deletes nothing, so a gate exercise cannot
+        # unlink somebody's federated account.
+        assert fetchval(
+            url, f"SELECT {OIDC_COLUMN} FROM users WHERE id = 1"
+        ) == "sub-1"
+
+
+def test_025_refuses_a_not_null_column_of_its_name():
+    with throwaway_db("schema_oidc_notnull") as url:
+        sql(url, f"UPDATE users SET {OIDC_COLUMN} = 'x' WHERE {OIDC_COLUMN} IS NULL")
+        sql(url, f"ALTER TABLE users ALTER COLUMN {OIDC_COLUMN} SET NOT NULL")
+        refuse_025(url, must_mention=["it is NOT NULL"])
+
+
+def test_025_refuses_a_column_carrying_a_default():
+    """A default here is a provider identity every new row silently acquires —
+    and under the unique index the second such row cannot insert at all."""
+    with throwaway_db("schema_oidc_default") as url:
+        sql(url, f"ALTER TABLE users ALTER COLUMN {OIDC_COLUMN} SET DEFAULT 'x'")
+        refuse_025(url, must_mention=["server default"])
+
+
+def test_025_refuses_a_column_of_its_name_it_did_not_create():
+    with throwaway_db("schema_oidc_unmarked") as url:
+        sql(url, f"COMMENT ON COLUMN users.{OIDC_COLUMN} IS 'somebody else made this'")
+        refuse_025(url, must_mention=["025's comment marker"])
+
+
+def test_025_refuses_a_non_unique_index_of_its_name():
+    """The damaging adoption: every other check passes while the invariant
+    quietly stops being true."""
+    with throwaway_db("schema_oidc_nonunique") as url:
+        sql(url, f"DROP INDEX {OIDC_INDEX}")
+        sql(
+            url,
+            f"CREATE INDEX {OIDC_INDEX} ON users ({OIDC_COLUMN}) "
+            f"WHERE {OIDC_COLUMN} IS NOT NULL",
+        )
+        refuse_025(url, must_mention=[OIDC_INDEX, "unique=False"])
+
+
+def test_025_refuses_a_non_partial_index_of_its_name():
+    with throwaway_db("schema_oidc_nonpartial") as url:
+        sql(url, f"DROP INDEX {OIDC_INDEX}")
+        sql(url, f"CREATE UNIQUE INDEX {OIDC_INDEX} ON users ({OIDC_COLUMN})")
+        refuse_025(url, must_mention=["partial-or-expression=False"])
+
+
+def test_025_refuses_an_index_of_its_name_on_another_column():
+    with throwaway_db("schema_oidc_wrong_column") as url:
+        sql(url, f"DROP INDEX {OIDC_INDEX}")
+        sql(
+            url,
+            f"CREATE UNIQUE INDEX {OIDC_INDEX} ON users (username) "
+            "WHERE username IS NOT NULL",
+        )
+        refuse_025(url, must_mention=[OIDC_INDEX, "username"])
+
+
+def test_025_refuses_a_differently_restricted_index_of_its_name():
+    """Partial, unique, on the right column — and covering the wrong rows.
+
+    `WHERE oidc_subject <> ''` passes every flag check while admitting two rows
+    that both hold the empty string, which is why the predicate is compared
+    against the server's own rendering rather than the flag being trusted.
+    """
+    with throwaway_db("schema_oidc_wrong_predicate") as url:
+        sql(url, f"DROP INDEX {OIDC_INDEX}")
+        sql(
+            url,
+            f"CREATE UNIQUE INDEX {OIDC_INDEX} ON users ({OIDC_COLUMN}) "
+            f"WHERE {OIDC_COLUMN} <> ''",
+        )
+        refuse_025(url, must_mention=["its predicate is"])
+
+
+def test_025_refuses_to_build_the_index_over_pre_existing_duplicates():
+    """Named as the invariant, not surfaced as a raw `duplicate key value`.
+
+    Only reachable on a database where the column was populated outside this
+    migration — which is exactly the operator who needs to be told *why* the
+    two rows may not both stand.
+    """
+    with throwaway_db("schema_oidc_duplicates", revision="024") as url:
+        insert_user(url, 1, "max")
+        insert_user(url, 2, "sam")
+        sql(url, f"ALTER TABLE users ADD COLUMN {OIDC_COLUMN} varchar(255)")
+        sql(
+            url,
+            f"COMMENT ON COLUMN users.{OIDC_COLUMN} IS $${OIDC_MARKER}$$",
+        )
+        sql(url, f"UPDATE users SET {OIDC_COLUMN} = 'sub-1'")
+
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "claimed by more than one row" in combined
+        assert alembic_version(url) == "024"
+
+
+def test_downgrade_025_drops_its_work_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_oidc_downgrade") as url:
+        _harness.run_alembic(url, "downgrade", "024", dimensions=DIM)
+        assert alembic_version(url) == "024"
+        assert column_shape(url, "users", OIDC_COLUMN) is None
+        assert oidc_index_shape(url) is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert oidc_column_comment(url) == OIDC_MARKER
+        assert oidc_index_shape(url)[1] is True
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_025_refuses_a_column_it_did_not_create():
+    """013's rule on the way back down: undo *this* migration, not drop
+    somebody else's column of the same name — which on `users` would take every
+    federated link with it."""
+    with throwaway_db("schema_oidc_downgrade_foreign") as url:
+        sql(url, f"COMMENT ON COLUMN users.{OIDC_COLUMN} IS 'somebody else made this'")
+        result = _harness.run_alembic(
+            url, "downgrade", "024", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "025's comment marker" in result.stdout + result.stderr
+        assert column_shape(url, "users", OIDC_COLUMN) is not None
         assert alembic_version(url) == HEAD_REVISION

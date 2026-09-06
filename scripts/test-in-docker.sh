@@ -54,9 +54,11 @@ if [ -n "${PGVECTOR_TEST_ADMIN_URL:-}" ]; then
             --add-host=host.docker.internal:host-gateway)
 fi
 
+# The `${arr[@]+...}` guard is required: under `set -u`, expanding an empty
+# array is an unbound-variable error on the bash 3.2 that ships with macOS.
 exec docker run --rm \
-  "${net_args[@]}" \
-  "${env_args[@]}" \
+  ${net_args[@]+"${net_args[@]}"} \
+  ${env_args[@]+"${env_args[@]}"} \
   -v "$REPO_ROOT:/app" \
   -w /app \
   -e PYTHONDONTWRITEBYTECODE=1 \

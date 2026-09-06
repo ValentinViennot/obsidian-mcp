@@ -1,0 +1,45 @@
+# Pre-commit hooks for this fork.
+#
+# Upstream pins no formatter or linter, and this fork deliberately does not
+# introduce one: reformatting 38K lines would turn every future merge from
+# upstream into a conflict, and would rewrite the blame of a codebase whose
+# commit messages are unusually load-bearing. The cost would land on every merge
+# forever, for a cosmetic gain.
+#
+# So these hooks police the two things that are actually dangerous in a public
+# repository serving a private vault: leaked secrets, and leaked vault content.
+#
+#   pre-commit install
+#   VAULT_LEAK_CHECK_PATH=/path/to/vault pre-commit run --all-files
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        # An Obsidian plugin cache can be hundreds of megabytes. Committed once,
+        # it is in the history permanently.
+        args: [--maxkb=2048]
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: detect-private-key
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: check-vault-leak
+        name: check for private vault content
+        entry: python scripts/check-vault-leak.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        # No-ops unless VAULT_LEAK_CHECK_PATH points at a vault, so contributors
+        # without one are unaffected. The denylist is built at runtime from the
+        # vault and never stored in this repository — a committed list of
+        # forbidden vault strings would be the very leak it aims to prevent.

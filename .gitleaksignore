@@ -1,0 +1,23 @@
+# gitleaks baseline for this fork.
+#
+# Every entry below is a verified false positive inherited from upstream's
+# history: deliberate fixture credentials inside tests whose whole purpose is
+# to assert that placeholder secrets are REJECTED, plus one code comment about
+# database "duplicate-key errors" that the generic-api-key rule matched on the
+# word "key".
+#
+# These are pinned as exact fingerprints rather than allowlisting tests/ as a
+# directory. A path-based rule would silently hide a genuine secret committed
+# to a test file later; a fingerprint only suppresses the specific finding that
+# was actually reviewed. Any new finding, anywhere, still fails the scan.
+
+2178687022852a386bc0b3fe99d2f651029d66a2:tests/test_issue_128_edit_note_frontmatter.py:generic-api-key:374
+22812ca49871ab1999e6300a219008abc1460b99:src/services/indexer.py:generic-api-key:32
+22812ca49871ab1999e6300a219008abc1460b99:tests/test_issue_2_secret_key_placeholder.py:generic-api-key:37
+417d6aea2b168622d7abca7cf7268ed44e597433:tests/test_password_policy.py:generic-api-key:154
+4a6b9b2fa0581fd520bb50f3ad29ae6a81d9c9a9:tests/test_issue_66_vault_unassignment_revokes_tools.py:generic-api-key:658
+4a6b9b2fa0581fd520bb50f3ad29ae6a81d9c9a9:tests/test_issue_66_vault_unassignment_revokes_tools.py:generic-api-key:662
+4ec1105a7ab184d9f12a76e6c83cf59e36867567:tests/test_config_validation.py:generic-api-key:114
+7877c91df8c07f4db868a23273fc0a4baa679819:tests/test_issue_128_edit_note_frontmatter.py:generic-api-key:374
+a9f2215895bd970a08f8af635c86ee9c09aee0b5:tests/test_password_policy.py:generic-api-key:154
+c87b95a26f1eb6571696f2acf1d99f4531f18d84:tests/test_issue_92_oauth_error_headers.py:generic-api-key:82

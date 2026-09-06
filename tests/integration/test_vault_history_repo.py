@@ -83,20 +83,33 @@ def _a_tracked_note(root: Path) -> str:
     markdown at all — that is a property of the repository handed in, not a
     defect in the tools.
     """
+    # Ask for files that are *currently tracked*, not for whatever the last
+    # markdown-touching commit named. Those differ whenever the most recent
+    # such commit was a deletion — the name is in the log, the file is not on
+    # disk, and every test here skips for a reason that has nothing to do with
+    # the tools being exercised.
     done = subprocess.run(
-        [
-            shutil.which("git"),
-            "-C", str(root),
-            "log", "-1", "--name-only", "--pretty=format:", "--", "*.md",
-        ],
+        [shutil.which("git"), "-C", str(root), "ls-files", "--", "*.md"],
         capture_output=True,
         text=True,
     )
     for line in done.stdout.splitlines():
         candidate = line.strip()
-        if candidate.endswith(".md") and (root / candidate).is_file():
-            return candidate
-    pytest.skip("no committed markdown file found in VAULT_HISTORY_TEST_REPO")
+        if not candidate.endswith(".md"):
+            continue
+        path = root / candidate
+        # Must have content: a real vault carries empty notes, and blame on an
+        # empty file correctly reports that there is nothing to attribute —
+        # which is the tool working, but tells us nothing about attribution.
+        # Enough lines to exercise the range arguments, too.
+        if not path.is_file():
+            continue
+        try:
+            if len(path.read_text(encoding="utf-8", errors="replace").splitlines()) >= 5:
+                return candidate
+        except OSError:
+            continue
+    pytest.skip("no committed non-empty markdown file found in VAULT_HISTORY_TEST_REPO")
 
 
 async def test_the_repository_resolves(vault):

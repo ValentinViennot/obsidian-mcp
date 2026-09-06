@@ -74,9 +74,19 @@ jobs:
       # script's staleness check compares the image's *creation* timestamp —
       # which comes from the cache and can predate the checkout — against the
       # manifests' mtimes, and rebuilds from scratch on every run.
+      #
+      # OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1 is the opt-out
+      # tests/integration/test_transfer_pg.py defines for itself. That module
+      # FAILS rather than skips without a database, deliberately, so a run with
+      # no Postgres exits non-zero however green the offline suite was. Opting
+      # out here is not weakening the gate: ci.yml runs that module for real,
+      # against a pgvector service, on this same pull request. Taking it here
+      # too would mean standing up a second Postgres to run the same tests
+      # twice.
       - name: Run the suite
         env:
           SKIP_BUILD: "1"
+          OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION: "1"
         run: scripts/test-in-docker.sh -q -rs
 
   # Secret scan over the full history, against the reviewed `.gitleaksignore`

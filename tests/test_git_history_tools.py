@@ -436,6 +436,28 @@ async def test_blame_of_a_missing_note(vault):
     assert "note_history" in result
 
 
+async def test_blame_marks_uncommitted_lines_and_does_not_overrun(vault):
+    """A vault an agent is writing to always has uncommitted lines.
+
+    Blaming `HEAD` would be two bugs at once: the line range was resolved
+    against the file on disk, so a longer working tree overruns `HEAD`'s
+    version and git answers a fatal; and the lines that *do* exist in both get
+    today's text attributed to yesterday's numbering.
+    """
+    (vault / "Projects" / "Kickoff.md").write_text(
+        KICKOFF_FINAL + "\n## Draft\nnot committed anywhere\n", encoding="utf-8"
+    )
+
+    result = await tools.note_blame_impl("Projects/Kickoff.md")
+
+    rows = _blame_rows(result)
+    assert set(rows) == set(range(1, 12)), rows
+    assert "(not committed yet)" in rows[11]
+    assert "not committed anywhere" in rows[11]
+    # The committed lines keep their real attribution.
+    assert "Bob Decider" in rows[8]
+
+
 async def test_blame_of_an_untracked_note_says_no_commit_authored_it(vault):
     (vault / "Notes" / "Fresh.md").write_text("# Fresh\n", encoding="utf-8")
 

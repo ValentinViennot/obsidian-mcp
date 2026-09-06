@@ -761,8 +761,11 @@ async def note_blame(
     than at, so a bulk reformat does not become the author of the vault; the
     response says whether that file was present and applied.
 
-    **This reads the note as it stands today**, so it cannot attribute a path
-    that no longer exists — use `note_history` for that.
+    **This reads the note as it stands today** — the working tree, not the
+    last commit — so line numbers match what `read_note` returns, and a line
+    edited since the last commit comes back marked `(not committed yet)`
+    rather than attributed to whoever wrote the line it replaced. It cannot
+    attribute a path that no longer exists; use `note_history` for that.
 
     Scope the call rather than blaming a whole large note: `section` accepts a
     markdown heading (the same selectors `read_note` and `edit_note` take —

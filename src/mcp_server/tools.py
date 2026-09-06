@@ -7101,6 +7101,12 @@ async def note_blame_impl(
         content = line.content
         if len(content) > MAX_BLAME_LINE_CHARS:
             content = content[:MAX_BLAME_LINE_CHARS] + "…"
+        if line.uncommitted:
+            # git's all-zero object name. Rendering it as a sha and a date
+            # would present an edit nobody has committed as a fact about the
+            # history — the one thing this tool must not do.
+            lines.append(f"{line.line_no:>6} | (not committed yet) | {content}")
+            continue
         moved = ""
         if line.origin_path and line.origin_path != repo_path:
             moved = f" [from `{_vault_relative(repo, line.origin_path)}`]"

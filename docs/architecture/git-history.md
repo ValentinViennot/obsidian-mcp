@@ -65,6 +65,15 @@ these three flags are most of the difference between useful attribution and
 - `-C` — text split out of one note into another keeps its original author,
   and the response names the file it came from.
 
+**Blame targets the working tree, not `HEAD`.** The caller resolved its line
+range against the file on disk — that is where a `section` selector's headings
+are, and what `read_note` would have shown — so an uncommitted edit that added
+lines makes `-L 1,<lines on disk>` overrun `HEAD`'s shorter version, and git
+answers a *fatal* to a request that was correct about the file it named. A
+vault an agent writes to always has uncommitted lines; they come back marked
+`(not committed yet)` from git's all-zero object name, which is the true answer
+where blaming `HEAD` would attribute today's text to yesterday's numbering.
+
 `.git-blame-ignore-revs` at the vault root covers what the flags cannot: a bulk
 reformat that really did change content (bullet markers, frontmatter
 normalisation, a `prettier` pass). It is passed as `--ignore-revs-file` only

@@ -207,6 +207,16 @@ class BlameLine:
     #: current path whenever `-C`/`-M` attributed the line to a move or a copy.
     origin_path: str
 
+    @property
+    def uncommitted(self) -> bool:
+        """True for a line that is in the working tree and in no commit.
+
+        git spells this as an all-zero object name. It is an ordinary state in
+        a vault an agent writes to, and it must not be rendered as though some
+        commit authored the line.
+        """
+        return set(self.sha) == {"0"}
+
 
 @dataclass(frozen=True)
 class Repo:
@@ -809,7 +819,19 @@ def blame(
         ]
         if ignore is not None:
             args += ["--ignore-revs-file", str(ignore)]
-        args += ["HEAD", "--", repo_path]
+        # No revision argument: blame the **working tree**, not `HEAD`.
+        #
+        # Two reasons, and the first is a bug rather than a preference. The
+        # caller resolved its line range against the file on disk — that is
+        # where a `section` selector's headings are, and where `read_note`
+        # would have shown them — so an uncommitted edit that added lines
+        # makes `-L 1,<lines on disk>` overrun `HEAD`'s shorter version, and
+        # git answers a *fatal* to a request that was correct about the file
+        # it named. Second: a vault an agent is actively writing to always has
+        # uncommitted lines, and reporting them as "not committed yet" (git's
+        # all-zero sha) is the true answer, where blaming `HEAD` would
+        # silently attribute today's text to yesterday's line numbers.
+        args += ["--", repo_path]
         return _run(repo.root, args)
 
     ignore_state = "absent"

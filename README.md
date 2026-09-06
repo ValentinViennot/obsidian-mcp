@@ -387,7 +387,10 @@ paths validated by the same containment the note tools use.
 - `note_blame(path, section?, start_line?, end_line?)`, per-line
   authorship from `git blame -w -M -C`: whitespace-only changes are
   ignored, a line moved within the file keeps its author, and a line
-  copied out of another file is attributed to where it came from.
+  copied out of another file is attributed to where it came from. It
+  blames the working tree, so line numbers match `read_note` and a line
+  edited since the last commit comes back `(not committed yet)` rather
+  than credited to whoever wrote what it replaced.
   `section=` takes the same heading selectors as `read_note` and blames
   only that section; `start_line`/`end_line` take an explicit range. A
   `.git-blame-ignore-revs` file at the vault root is passed to git, so

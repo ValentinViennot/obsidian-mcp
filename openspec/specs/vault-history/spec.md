@@ -47,6 +47,15 @@ refusal SHALL degrade to a blame without it rather than failing the call.
 `section` SHALL accept the heading selectors the read and write tools accept
 and resolve to the line range that section occupies **in the file**, including
 any frontmatter offset; it SHALL NOT be combinable with an explicit line range.
+Attribution SHALL be taken from the **working tree**, so that line numbers
+agree with what a read of the note returns, and a line present in the working
+tree and in no commit SHALL be reported as uncommitted rather than attributed
+to any commit.
+
+#### Scenario: Uncommitted lines
+- **WHEN** the note on disk has lines that are in no commit
+- **THEN** the blame covers every line of the file on disk, and the
+  uncommitted ones are marked as not committed rather than attributed
 
 #### Scenario: A bulk reformat is looked through
 - **WHEN** a commit listed in `.git-blame-ignore-revs` rewrote a line and the

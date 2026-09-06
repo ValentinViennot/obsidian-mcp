@@ -28,13 +28,19 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
 - `alembic/` — database migrations
 
 ## Infrastructure
-- Container: `obsidian-mcp`, listens on `:8000`
-- Traefik routes: hostname driven by `MCP_HOSTNAME` in `.env`
-  - Panel routes: OAuth protected via `chain-oauth@file`
+- Container: `obsidian-mcp`, listens on `:8000`, runs as uid 1000 (non-root)
+- Compose: one base stack (`docker-compose.yml` — Postgres + app, loopback
+  only) plus two front-door **overrides** that add nothing else,
+  `docker-compose.caddy.yml` (bundled TLS) and `docker-compose.traefik.yml`
+  (labels for an existing Traefik). Never a fourth full stack.
+- Traefik routes (the override): hostname driven by `MCP_HOSTNAME` in `.env`
+  - Panel routes: human auth via `TRAEFIK_PANEL_MIDDLEWARE`
+    (default `chain-oauth@file`)
   - MCP routes (`/mcp/*`): API key auth at app level
   - Transfer routes (`/transfer/*`): same router as `/mcp` (no OAuth chain);
     capability-token auth at app level
-- Registry: `localhost:5000` (or change in `Makefile`)
+- Registry: `localhost:5000` (or change in `Makefile`); CI also publishes to
+  GHCR (`.github/workflows/publish-image.yml`)
 - Deploy: `make deploy` (build → scan → push → backup → migrate → recreate)
 
 ## Public repo — host paths live outside the tree
@@ -47,8 +53,14 @@ hostnames) must stay out of tracked files. The mechanism:
   `$(DEPLOY_DIR)`, not the repo. Always invoke `make` from the repo so
   `Makefile.local` loads — `cd /storage/docker/data/obsidian-mcp && docker
   compose ...` works but skips the build/push pipeline.
-- The repo's `docker-compose.yml` and the deploy-dir copy are kept
-  identical; if you change one, copy it over.
+- **The repo's `docker-compose.yml` is the published, generic stack; the
+  deploy-dir copy is the host's and they are deliberately NOT identical.**
+  Anything host-specific — a second user's vault mount, a certificate
+  resolver, a registry image — belongs in the deploy dir or in a gitignored
+  override, never in the tracked file. That file used to carry the
+  maintainer's Traefik labels and a named user's vault path; the labels now
+  live generically in `docker-compose.traefik.yml`, driven by
+  `TRAEFIK_*` variables.
 
 ## Commands
 - `make init` — first-time setup
@@ -198,6 +210,20 @@ update it in the same change.** What stays here is the short list:
   systemd units, the bare-repo `post-receive` (a flag file, deliberately not a
   `checkout -f` — see the comment there), and the vault `.gitignore` template.
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
+- **The container contract is asserted, not documented.**
+  `tests/test_container_hardening.py` holds it: the image is multi-stage and
+  runs as uid 1000; `--workers 1` lives in the image CMD and **no compose
+  stack may override `command:`** (migrations go through `RUN_MIGRATIONS` in
+  `docker/entrypoint.sh` instead — restating the uvicorn line to prepend
+  `alembic upgrade head` is how the flag got dropped before); every service
+  declares `mem_limit` / `mem_reservation` / `memswap_limit` / `cpus` /
+  `pids_limit`; Postgres publishes nothing and the app publishes loopback
+  only; a proxy override must use `ports: !reset null`, because compose
+  merges `ports` by concatenation and `ports: []` removes nothing. The
+  healthcheck must address `localhost`, not `127.0.0.1` — a literal-IP Host
+  header is a 400 from `TrustedHostMiddleware`, i.e. a healthy container
+  marked unhealthy forever. `docker compose config` itself runs in CI's
+  `compose-config` job, since the test container has no docker CLI.
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
 ## MCP tools

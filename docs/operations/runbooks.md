@@ -50,6 +50,42 @@ First deploy only. Subsequent releases are [Upgrade](#upgrade).
    curl -sf https://obsidian-mcp.unstaticlabs.com/health && echo OK
    ```
 
+6. **Bootstrap the first admin — before the ingress rule exists.**
+
+   This step has an ordering trap. Under `AUTH_MODE=pocketid` the registration
+   route returns 404, deliberately, so there is no way to create the first
+   account through the UI. And federated login **never auto-grants admin** — the
+   provider says who you are, not what you may do — so a first login with no
+   pre-existing row produces a non-admin account with no vault.
+
+   The tempting fix is to boot once under `AUTH_MODE=local`, register, then
+   switch. Do not do that with the ingress rule already live: it puts an open
+   registration page on the public internet for as long as it takes you to
+   notice.
+
+   Instead pre-seed the row and let the first federated login adopt it.
+   Adoption matches on `username` and only proceeds when the row carries no
+   `oidc_subject`, so this is exactly the supported path:
+
+   ```bash
+   ssh odoo 'docker exec obsidian-mcp-db psql -U obsidian -d obsidian_mcp -c "
+     INSERT INTO users (username, password_hash, is_admin, is_active, vault_path)
+     VALUES ('"'"'<email-local-part>'"'"', '"'"'!'"'"', true, true, '"'"'/obsidian'"'"')
+     ON CONFLICT (username) DO NOTHING;"'
+   ```
+
+   `username` must equal the **local part of the email** PocketID asserts
+   (`someone@example.com` → `someone`); that is what the adoption logic derives.
+   The `'!'` password hash is deliberately unusable — there is no local password
+   for this account and none should be invented.
+
+   Verify after your first login that the account came out as admin:
+
+   ```bash
+   ssh odoo 'docker exec obsidian-mcp-db psql -U obsidian -d obsidian_mcp -c \
+     "select username, is_admin, oidc_subject is not null as linked from users;"'
+   ```
+
 6. Confirm the auth boundary actually holds — this is the check people skip:
 
    ```bash

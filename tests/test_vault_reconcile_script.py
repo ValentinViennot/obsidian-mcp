@@ -478,3 +478,114 @@ def test_the_scripts_are_executable():
     """They are invoked by systemd `ExecStart=` and by git as a hook."""
     assert os.access(SCRIPT, os.X_OK)
     assert os.access(HOOK, os.X_OK)
+
+
+# ---------------------------------------------------------------------------
+# deploy/hooks/archive-mirror — the off-site archive push
+# ---------------------------------------------------------------------------
+
+ARCHIVE_MIRROR = Path(__file__).resolve().parent.parent / "deploy" / "hooks" / "archive-mirror"
+
+
+def _archive_env(tmp_path):
+    return {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "ARCHIVE_LOG": str(tmp_path / "arch.log"),
+        "ARCHIVE_LOCK": str(tmp_path / "arch.lock"),
+    }
+
+
+def _mirror_repo(tmp_path):
+    """A source repo with a `github` remote pointing at a local bare repo."""
+    remote = tmp_path / "remote.git"
+    src = tmp_path / "src"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(src)], check=True)
+    for key, value in (("user.email", "t@example.invalid"), ("user.name", "t")):
+        subprocess.run(["git", "-C", str(src), "config", key, value], check=True)
+    (src / "f").write_text("a\n")
+    subprocess.run(["git", "-C", str(src), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(src), "commit", "-qm", "a"], check=True)
+    subprocess.run(["git", "-C", str(src), "remote", "add", "github", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(src), "push", "-q", "github", "main"], check=True)
+    return src, remote
+
+
+def _head(path):
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "main"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def test_a_push_arriving_while_the_lock_is_held_is_not_dropped(tmp_path):
+    """The lost-wakeup that made the archive silently fall behind.
+
+    The first version simply exited when the lock was held, on the reasoning
+    that "the next push carries both sets of commits anyway". That is only true
+    if there *is* a next push. When the raced push was the last one, the archive
+    stayed behind for ever — with an `ok` in its log written by the run that
+    raced it, and no error anywhere. Silently stale is the one failure an
+    off-site archive must not have.
+    """
+    src, remote = _mirror_repo(tmp_path)
+    lock = tmp_path / "arch.lock"
+    lock.mkdir()
+
+    result = subprocess.run(
+        ["sh", str(ARCHIVE_MIRROR)], cwd=src, env=_archive_env(tmp_path),
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "arch.lock.pending").exists(), (
+        "the raced run exited without handing its work to the lock holder"
+    )
+
+
+def test_the_handover_is_actually_picked_up(tmp_path):
+    """A marker nobody reads would be no better than dropping the push."""
+    src, remote = _mirror_repo(tmp_path)
+    lock = tmp_path / "arch.lock"
+
+    lock.mkdir()
+    subprocess.run(["sh", str(ARCHIVE_MIRROR)], cwd=src, env=_archive_env(tmp_path), check=True)
+
+    (src / "f").write_text("b\n")
+    subprocess.run(["git", "-C", str(src), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(src), "commit", "-qm", "b"], check=True)
+    lock.rmdir()
+
+    subprocess.run(["sh", str(ARCHIVE_MIRROR)], cwd=src, env=_archive_env(tmp_path), check=True)
+
+    assert _head(src) == _head(remote), "the archive is behind the source"
+
+
+def test_the_archive_push_is_append_only(tmp_path):
+    """No --force, no --mirror, no +refs — the guard that makes this a backup.
+
+    A mirror push reproduces destruction faithfully: a bad rebase on the server
+    and the archive throws away the only surviving copy of what was lost.
+    """
+    body = ARCHIVE_MIRROR.read_text()
+    pushes = [l for l in body.splitlines() if "git push" in l and not l.strip().startswith("#")]
+    assert pushes
+    for line in pushes:
+        assert "--force" not in line and "-f " not in line, line
+        assert "--mirror" not in line, line
+        assert "+refs" not in line and ':+' not in line, line
+
+
+def test_a_diverged_archive_is_refused_and_says_why(tmp_path):
+    """The refusal is the alarm, so it must be legible in the log."""
+    src, remote = _mirror_repo(tmp_path)
+    # Rewrite history on the source so the push cannot fast-forward.
+    subprocess.run(["git", "-C", str(src), "commit", "-q", "--amend", "-m", "rewritten"], check=True)
+
+    subprocess.run(["sh", str(ARCHIVE_MIRROR)], cwd=src, env=_archive_env(tmp_path), check=True)
+
+    log = (tmp_path / "arch.log").read_text()
+    assert "REFUSED" in log
+    assert "append-only guard" in log
+    assert _head(src) != _head(remote), "the archive must keep what the source discarded"

@@ -39,37 +39,58 @@ log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/n
 
 git remote get-url "$REMOTE" >/dev/null 2>&1 || { log "no '$REMOTE' remote; skipping"; exit 0; }
 
-# mkdir is atomic; a second push arriving mid-flight simply skips, and the next
-# one carries both sets of commits anyway.
+# mkdir is atomic. A second push arriving while the first is still pushing must
+# not simply exit: if it is the *last* push, the archive stays behind for ever,
+# with an "ok" in this log from the run that raced it and no error anywhere.
+# That is the precise failure this archive exists to prevent, so an overlapping
+# run leaves a marker and the holder picks it up before it finishes.
+PENDING="${LOCK}.pending"
+
 if ! mkdir "$LOCK" 2>/dev/null; then
   if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
     log "clearing stale lock"
     rmdir "$LOCK" 2>/dev/null || true
-    mkdir "$LOCK" 2>/dev/null || exit 0
+    mkdir "$LOCK" 2>/dev/null || { : > "$PENDING" 2>/dev/null; exit 0; }
   else
+    # Hand the work to whoever holds the lock rather than dropping it.
+    : > "$PENDING" 2>/dev/null
     exit 0
   fi
 fi
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
 
-if out=$(git push "$REMOTE" "$BRANCH:$BRANCH" 2>&1); then
-  log "ok: branch $BRANCH -> $REMOTE"
-else
-  case "$out" in
-    *non-fast-forward*|*"fetch first"*|*rejected*)
-      log "REFUSED (non-fast-forward): the server's history diverges from the archive."
-      log "  This is the append-only guard doing its job — history was rewritten on"
-      log "  the server. The archive still holds what the server lost. Investigate"
-      log "  before overriding; do not add --force to make the message go away."
-      ;;
-    *) log "push failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)" ;;
-  esac
-fi
+# Coalescing loop: push, then if anyone raced us while we were pushing, push
+# again on their behalf. Bounded, so a pathological write rate cannot spin here.
+attempt=0
+while [ "$attempt" -lt 5 ]; do
+  attempt=$((attempt + 1))
+  rm -f "$PENDING" 2>/dev/null
 
-# Tags carry the import boundary (v0-drive-import), which is what tells a reader
-# which dates were reconstructed. An archive without it is missing the caveat.
-if out=$(git push "$REMOTE" --tags 2>&1); then
-  log "ok: tags -> $REMOTE"
-else
-  log "tag push failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
-fi
+  if out=$(git push "$REMOTE" "$BRANCH:$BRANCH" 2>&1); then
+    log "ok: branch $BRANCH -> $REMOTE"
+  else
+    case "$out" in
+      *non-fast-forward*|*"fetch first"*|*rejected*)
+        log "REFUSED (non-fast-forward): the server's history diverges from the archive."
+        log "  This is the append-only guard doing its job — history was rewritten on"
+        log "  the server. The archive still holds what the server lost. Investigate"
+        log "  before overriding; do not add --force to make the message go away."
+        ;;
+      *)
+        log "push failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
+        ;;
+    esac
+  fi
+
+  # Tags carry the import boundary (v0-drive-import), which is what tells a
+  # reader which dates were reconstructed. An archive without it lacks the caveat.
+  if out=$(git push "$REMOTE" --tags 2>&1); then
+    log "ok: tags -> $REMOTE"
+  else
+    log "tag push failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+  fi
+
+  # Nobody raced us: done. Otherwise go round again to carry their commits.
+  [ -e "$PENDING" ] || break
+  log "another push arrived mid-flight; pushing again for it"
+done

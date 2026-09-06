@@ -25,4 +25,18 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
 # what a bind mount from the host looks like.
 RUN git config --global --add safe.directory '*'
 
+# Run as an unprivileged user, matching CI.
+#
+# As root, every permission-dependent assertion in this suite is vacuous: root
+# ignores file modes, so a test that makes a directory 0500 and expects a write
+# to fail sees it succeed. That is not a hypothetical — a hook test passed here
+# for exactly this reason while failing on GitHub's unprivileged runner, and the
+# runner was right. A gate that cannot reproduce CI's failures is not a gate.
+#
+# uid 1000 matches the typical host user, so a bind-mounted tree stays writable.
+RUN useradd -m -u 1000 -s /bin/bash runner \
+    && git config --system --add safe.directory '*'
+USER runner
+ENV HOME=/home/runner
+
 CMD ["pytest", "-q"]

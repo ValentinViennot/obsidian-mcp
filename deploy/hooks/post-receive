@@ -47,7 +47,13 @@ done
 dir=$(dirname "$FLAG")
 [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || true
 
-if : > "$FLAG" 2>/dev/null; then
+# `touch`, not `: > "$FLAG"`. `:` is a POSIX *special builtin*, and a
+# redirection error on a special builtin makes the shell exit outright — the
+# surrounding `if` never gets to catch it. The hook then exits non-zero, git
+# reports that to whoever pushed, and a hook whose entire contract is "never
+# fail a push" fails the push. `touch` is an external command (or a regular
+# builtin), so a failure is an ordinary non-zero status the `if` can handle.
+if touch "$FLAG" 2>/dev/null; then
     echo "obsidian-mcp: reconcile requested; the server will pull this shortly" >&2
 else
     # Almost always a permissions problem: the pushing user cannot write the

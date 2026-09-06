@@ -46,9 +46,13 @@ LOGGER_NAME = "src.services.indexer"
 
 
 class _Row:
-    def __init__(self, file_path, id):
+    # `aliases` mirrors the `frontmatter -> 'aliases'` column the vault-index
+    # SELECT now carries; None is what Postgres returns for a note with no
+    # such key, which is every note in these fixtures.
+    def __init__(self, file_path, id, aliases=None):
         self.file_path = file_path
         self.id = id
+        self.aliases = aliases
 
 
 class _FakeResult:
@@ -391,7 +395,7 @@ def test_the_backfill_uses_the_bounded_extractor_with_the_cap():
     assert "max_links=MAX_LINKS_PER_NOTE" in source
 
 
-# ── 4. The version-2 bump re-derives links without re-embedding ───────────
+# ── 4. The extraction-version bumps and what each one costs ───────────────
 
 # Bodies that exercise the fence grammar, since that is what the cleaner sees.
 _CORPUS = [
@@ -405,8 +409,8 @@ _CORPUS = [
 ]
 
 
-def test_the_extraction_version_is_two():
-    assert indexer.CURRENT_EXTRACTION_VERSION == 2
+def test_the_extraction_version_is_three():
+    assert indexer.CURRENT_EXTRACTION_VERSION == 3
 
 
 def test_version_two_cleans_identically_to_version_one():
@@ -419,12 +423,26 @@ def test_version_two_cleans_identically_to_version_one():
 
 
 def test_the_bump_re_derives_links_but_re_embeds_nothing():
-    """The scoped-invalidation predicate answers False for every v1-stamped row,
-    so the pass that re-extracts every note's links makes no embedding call on
-    account of the bump — the cost is one link-and-tag pass, not a re-embed of
-    the vault."""
+    """The scoped-invalidation predicate answers False for every v1-stamped row
+    that carries no Obsidian comment, so the pass that re-extracts every note's
+    links makes no embedding call on account of the bump for the overwhelming
+    majority of a vault — the cost is one link-and-tag pass, not a re-embed."""
     for body in _CORPUS:
         assert indexer._grammar_changed_the_embedding_text(1, body) is False, body
+
+
+def test_version_three_re_embeds_exactly_the_notes_with_comments():
+    """Version 3's cleaner additionally removes `%%comments%%`, which DOES move
+    the embedded text — but only for a note that has one. Both directions
+    matter: a note with a comment must be re-embedded (its vector was built
+    from text no reader sees), and a note without one must not (a blanket
+    invalidation would re-embed the whole vault at provider cost for nothing).
+    """
+    with_comment = "prose %%a hidden aside%% more prose"
+    assert clean_at_version(3, with_comment) != clean_at_version(2, with_comment)
+    assert indexer._grammar_changed_the_embedding_text(2, with_comment) is True
+    for body in _CORPUS:
+        assert indexer._grammar_changed_the_embedding_text(2, body) is False, body
 
 
 def test_the_predicate_still_detects_a_real_grammar_difference():

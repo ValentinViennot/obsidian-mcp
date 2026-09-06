@@ -1,0 +1,10 @@
+{
+	"nodes": [
+		{"id": "n1", "type": "file", "file": "Projects/Chimera.md", "x": -280, "y": -120, "width": 400, "height": 400},
+		{"id": "n2", "type": "file", "file": "Projects/Meeting Notes.md", "x": 200, "y": -120, "width": 400, "height": 400},
+		{"id": "n3", "type": "text", "text": "Not a note: [[Chimera]] lives in JSON here.", "x": -280, "y": 340, "width": 400, "height": 60}
+	],
+	"edges": [
+		{"id": "e1", "fromNode": "n1", "fromSide": "right", "toNode": "n2", "toSide": "left"}
+	]
+}

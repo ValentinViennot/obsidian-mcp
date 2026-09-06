@@ -32,9 +32,13 @@ class _FakeResult:
 
 
 class _Row:
-    def __init__(self, file_path, id):
+    # `aliases` mirrors the `frontmatter -> 'aliases'` column the vault-index
+    # SELECT now carries; None is what Postgres returns for a note with no
+    # such key, which is every note in these fixtures.
+    def __init__(self, file_path, id, aliases=None):
         self.file_path = file_path
         self.id = id
+        self.aliases = aliases
 
 
 class _FakeSession:

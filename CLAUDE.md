@@ -202,7 +202,16 @@ update it in the same change.** What stays here is the short list:
   reconcile sweep (out-of-band edits, `pull --rebase --autostash`, `push`), its
   systemd units, the bare-repo `post-receive` (a flag file, deliberately not a
   `checkout -f` — see the comment there), and the vault `.gitignore` template.
-- Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
+- Wikilink graph extracted from note bodies into `note_links`; resolved at
+  index time in Obsidian's own order — exact path, same folder, vault-wide
+  stem, then the same three case-folded, then frontmatter `aliases:` — with an
+  ambiguous basename going to the note nearest the vault root, never the
+  alphabetically first one. `%%comments%%` are masked for link and tag
+  extraction and for the embedding text, and **not** for `mask_code`, section
+  addressing, `move_note` or `content_tsvector`. `move_note` opts out of alias
+  and case-folded resolution (`_MOVE_RESOLUTION`) so widening the graph never
+  widens what a move overwrites. See
+  [Obsidian compatibility](docs/architecture/obsidian-compatibility.md).
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
 ## MCP tools
@@ -244,7 +253,7 @@ re-implementing containment. Bounds live in `src/config.py`
 (`GIT_HISTORY_*`, `MAX_HISTORY_COMMITS`, `MAX_BLAME_*`,
 `MAX_PICKAXE_TEXT_CHARS`).
 
-Link extraction lives in `src/services/links.py`. The extractor strips fenced/inline code before regex matching for `[[wikilink]]`, `![[embed]]`, and `[md](path.md)` forms. Targets are resolved at index time and stored in `note_links`. On startup, if `note_links` is empty the indexer runs a one-shot backfill across all notes (logged with progress and surfaced on the dashboard).
+Link extraction lives in `src/services/links.py`. The extractor strips fenced/inline code **and `%%comments%%`** before matching `[[wikilink]]`, `![[embed]]`, and `[md](path.md)` forms; a wikilink's `#anchor` and `|alias` are parsed onto `ExtractedLink` rather than discarded. Targets are resolved at index time and stored in `note_links`. On startup, if `note_links` is empty the indexer runs a one-shot backfill across all notes (logged with progress and surfaced on the dashboard). `get_links` reports a non-markdown target (`![[diagram.png]]`, `[[Board.canvas]]`) as an **attachment** rather than a dangling link — it can never resolve, because only `.md` is indexed.
 
 **Write** — `create_note`, `edit_note`, `move_note`, `delete_note`,
 `set_frontmatter`. Markdown only, all publishing through
@@ -274,6 +283,7 @@ summaries.
 | [vault-roots-and-tenancy.md](docs/architecture/vault-roots-and-tenancy.md) | `APIKeyMiddleware`, `_vault_root`, owner predicates, publication confirmation, the vault-root overlap guard (`src/services/vault_overlap.py`, the snapshot, the five pass entry points) |
 | [vault-tools.md](docs/architecture/vault-tools.md) | any note or file tool: frontmatter, symlinks, anchored writes, section addressing, size caps |
 | [file-transfer.md](docs/architecture/file-transfer.md) | `src/transfer/`, `src/services/vault_fs.py`, the publish gate, SSRF policy, the write-bucket charge at redemption |
+| [obsidian-compatibility.md](docs/architecture/obsidian-compatibility.md) | `src/services/links.py`, `extract_tags`, `clean_for_embedding`, any graph tool: which Obsidian syntax is read, which is deliberately not, and why `move_note` resolves more narrowly than the indexer |
 | [search.md](docs/architecture/search.md) | `semantic_search` / `keyword_search` / `find_related` and every `SET LOCAL` they issue |
 | [indexing-and-embeddings.md](docs/architecture/indexing-and-embeddings.md) | the indexer loop, the embed pass, tsvector writers, provider abstraction |
 | [security-event-logging.md](docs/architecture/security-event-logging.md) | `src/logging_setup.py`, `src/services/security_events.py`, and any call site that logs a refusal: the field allow-list, the event catalogue, the suppressor |

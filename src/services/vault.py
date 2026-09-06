@@ -3989,15 +3989,208 @@ def extract_tags(body: str, frontmatter: dict) -> list[str]:
     # viewer and the indexer's scan of that note with it. An earlier fix
     # screened *this* branch; the scalar branch below still bypassed it, which
     # is why the screen moved to the parse instead of living here.
-    fm_tags = frontmatter.get("tags", [])
-    if isinstance(fm_tags, list):
-        tags.update(str(t) for t in fm_tags)
-    elif isinstance(fm_tags, str):
-        tags.update(t.strip() for t in fm_tags.split(","))
-    # Inline #tags (not inside code blocks)
-    from src.services.links import BODY, mask_code
+    #
+    # **Both of Obsidian's property keys**, `tags:` and its singular alias
+    # `tag:`. Obsidian's own properties UI writes `tags`, but `tag` is
+    # accepted there and appears in vaults built by templater/dataview users,
+    # where it was silently invisible to `get_tags` and to every `tags=` filter
+    # on this server.
+    for key in ("tags", "tag"):
+        fm_tags = frontmatter.get(key)
+        if isinstance(fm_tags, (list, tuple)):
+            # Flattened one level: a block list of inline lists is what a stray
+            # indent produces, and Obsidian reads it as the tags it holds.
+            for entry in fm_tags:
+                if isinstance(entry, (list, tuple)):
+                    tags.update(_clean_frontmatter_tag(str(t)) for t in entry)
+                else:
+                    tags.update(_clean_frontmatter_tag(str(entry)))
+        elif isinstance(fm_tags, str):
+            # Obsidian accepts both separators in a scalar; splitting only on
+            # commas turned `tags: work project` into one tag named
+            # `work project`, which no filter could ever match.
+            for part in re.split(r"[,\s]+", fm_tags):
+                tags.update(_clean_frontmatter_tag(part))
+    # Inline #tags — outside code, outside `%%comments%%`, and not the several
+    # things that merely look like tags. See `_INLINE_TAG_RE`.
+    from src.services.links import BODY, mask_code_and_comments
 
-    masked = mask_code(body, context=BODY)
-    for match in re.finditer(r"(?:^|\s)#([a-zA-Z][a-zA-Z0-9_/-]*)", masked):
-        tags.add(match.group(1))
+    masked = mask_code_and_comments(body, context=BODY)
+    masked = _mask_indented_code(masked)
+    for match in _INLINE_TAG_RE.finditer(masked):
+        tag = match.group(1).rstrip("/")
+        if _is_tag(tag):
+            tags.add(tag)
     return sorted(tags)
+
+
+def _clean_frontmatter_tag(value: str) -> list[str]:
+    """One frontmatter tag entry, normalised, as a 0-or-1 element list.
+
+    A list so the call sites can `set.update` uniformly whether or not the
+    entry survives. Obsidian tolerates a leading `#` on a frontmatter tag and
+    strips it; a value that keeps it becomes a second, distinct tag in this
+    server's `tags` array and in every `tags=` filter — `#work` and `work`
+    counted separately on the panel, which is the whole failure mode.
+    """
+    tag = value.strip().lstrip("#").rstrip("/")
+    return [tag] if tag else []
+
+
+# ── The inline-tag grammar ──────────────────────────────────────────────────
+#
+# What Obsidian actually accepts: a `#` at a word boundary followed by a run of
+# letters, digits, `_`, `-`, `/` and any non-ASCII letter, which must contain at
+# least one non-numeric character. `#` inside a word (`C#`, a URL fragment) is
+# not a tag, which the leading-boundary requirement already gave us.
+#
+# What this server produced before, from `#([a-zA-Z][a-zA-Z0-9_/-]*)`:
+#
+# * **hex colours as tags.** `#ffe6cc` starts with a letter, so every fill and
+#   stroke in an inline `<span style="…">`, a draw.io export or a mermaid
+#   block that is not fenced landed in the vault's tag vocabulary. Measured on
+#   a real vault, colour codes were the *majority* of the extracted tag set —
+#   a taxonomy where the most common tag is `#d5e8d4` is not a taxonomy.
+# * **no Unicode.** `#projekt/größe` truncated at the `ö` and entered the
+#   vocabulary as `projekt/gr`; `#日本語` was not a tag at all. Obsidian's tags
+#   are Unicode, and a vault that is not written in English lost most of them.
+# * **a trailing `/`.** `#project/` and `#project` are one tag in Obsidian and
+#   were two here.
+#
+# The four exclusions below are each a rule about what a tag *is*, not a
+# blocklist of words:
+_INLINE_TAG_RE = re.compile(
+    # Leading boundary: start of text or whitespace, UNCHANGED from the old
+    # grammar and deliberately not widened. Admitting `(` and `[` would pick up
+    # `(#tag)` — which Obsidian does recognise — at the cost of reading
+    # `[Jump](#heading)`, `[[#Heading]]` and `href="#frag"` as tags, and a
+    # false tag is the error this rewrite exists to remove. The residual is
+    # recorded in `docs/architecture/obsidian-compatibility.md`.
+    r"(?:^|\s)"
+    # The tag body. `\w` under Unicode covers letters, digits and `_` in every
+    # script; `-` and `/` are Obsidian's two extra characters, `/` being what
+    # makes `#parent/child` one nested tag rather than two.
+    r"#([\w/-]+)",
+    re.UNICODE,
+)
+
+# A hex-colour shape: `#RGB`, `#RRGGBB`, `#RRGGBBAA`. Note `#RGBA` (4) is
+# deliberately absent — four hex letters is `#cafe`, `#face`, `#dead`, and the
+# four-digit CSS form is rare enough that keeping those words as tags is the
+# better trade.
+_HEX_COLOUR_RE = re.compile(r"(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\Z")
+_HAS_DIGIT_RE = re.compile(r"[0-9]")
+_HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
+
+
+def _is_tag(tag: str) -> bool:
+    """Is this token a tag, or does it merely start with `#`?
+
+    Four exclusions, in the order they were worth making:
+
+    0. **No word character at all** — `#-`, `#--`, `#/`. The body class admits
+       `-` and `/` anywhere, which is what lets `#a-b/c` through; a token made
+       of nothing else is punctuation, most often a `#--` rule or a truncated
+       flag.
+
+    1. **Purely numeric** — `#1`, `#42`, `#2024`. This is Obsidian's own rule
+       (a tag must contain a non-numeric character), and it is also what keeps
+       every GitHub issue reference in a note out of the vocabulary.
+    2. **Hex colour shapes that carry a digit** — `#ffe6cc`, `#d5e8d4`,
+       `#82b366`. The digit is what separates a colour from a word: `#facade`
+       and `#decade` are six hex characters and are kept, because losing a real
+       tag is the worse error and no palette in the wild is all-alphabetic.
+    3. **Repeated single characters at colour length** — `#fff`, `#ccc`,
+       `#000`, `#eee`, `#aaaaaa`. These carry no digit, so rule 2 misses them,
+       and they are the greys and whites every diagram export is full of. No
+       English word is a run of one repeated letter.
+
+    Everything else is a tag, including `#1password` and `#3d-printing`, which
+    start with a digit and were not tags at all under the old grammar.
+    """
+    if not tag or tag.isdigit() or not _HAS_WORD_RE.search(tag):
+        return False
+    if _HEX_COLOUR_RE.match(tag):
+        if _HAS_DIGIT_RE.search(tag):
+            return False
+        if len(set(tag.lower())) == 1:
+            return False
+    return True
+
+
+# ── Indented code, for tag extraction only ──────────────────────────────────
+#
+# The shared fence recognizer deliberately does not mask 4-space-indented code
+# blocks (a documented divergence: they are ambiguous with indented prose, and
+# masking them would move heading positions the write paths address by). For
+# *tags* the divergence had a cost the write paths do not pay: an indented
+# shell or C or C# block contributed `#include`, `#define`, `#pragma`,
+# `#region`, `#endif` and every `# comment` whose `#` touches a word to the
+# vault's tag vocabulary.
+#
+# This masker is local to `extract_tags`, never shared, and can therefore be
+# wrong in only one direction: it can miss a tag, never move a byte. The one
+# shape it must not eat is the commonest thing in an Obsidian note — a nested
+# list item, which is also indented four spaces:
+#
+#     - parent
+#         - child #tag        ← a list continuation, NOT code
+#
+# CommonMark's rule is that an indented code block cannot interrupt a
+# paragraph and, inside a list, indentation is measured from the item's own
+# content column. Flat scanning cannot compute that column, so this approximates
+# it with a list-context flag: a list marker at column 0–3 turns list context
+# on, a non-blank unindented line that is not a list marker turns it off, and a
+# blank line leaves it alone. An indented run masks only with list context off.
+_LIST_MARKER_RE = re.compile(r"^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)")
+_INDENTED_RE = re.compile(r"^(?: {4}|\t)")
+_BLANK_RE = re.compile(r"^[ \t]*$")
+
+
+def _mask_indented_code(masked: str) -> str:
+    """Blank indented code blocks with same-length spaces.
+
+    Takes text that has already been through `mask_code_and_comments`, so the
+    only indented runs left to consider are the ones the fence grammar
+    declines to touch. Offset-preserving like every other masker here, which
+    is not load-bearing for tags but keeps the invariant uniform.
+    """
+    if "#" not in masked:
+        return masked  # nothing a tag could be hiding in
+    spans: list[tuple[int, int]] = []  # line content spans to blank
+    in_list = False
+    prev_blank = True  # start of text behaves like a preceding blank line
+    cursor = 0
+    n = len(masked)
+    while cursor <= n:
+        terminator = _LINE_BREAK_RE.search(masked, cursor)
+        content_end = terminator.start() if terminator else n
+        line = masked[cursor:content_end]
+        if _BLANK_RE.match(line):
+            prev_blank = True
+        elif not _INDENTED_RE.match(line):
+            in_list = bool(_LIST_MARKER_RE.match(line))
+            prev_blank = False
+        elif not in_list and prev_blank:
+            # Indented, non-blank, no list open, and the run began after a
+            # blank line — CommonMark's "an indented code block cannot
+            # interrupt a paragraph". `prev_blank` stays True through the run
+            # so the second and later lines of one block are masked too.
+            spans.append((cursor, content_end))
+        else:
+            prev_blank = False
+        if terminator is None:
+            break
+        cursor = terminator.end()
+    if not spans:
+        return masked
+    # Same-length substitution, terminators untouched, so every offset into
+    # the result still indexes the original note.
+    out: list[str] = []
+    at = 0
+    for start, end in spans:
+        out.append(masked[at:start])
+        out.append(" " * (end - start))
+        at = end
+    out.append(masked[at:])
+    return "".join(out)

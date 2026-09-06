@@ -1470,6 +1470,36 @@ user until the pass completes, per the existing requirement — which is the
 correct disposition for a grammar change, since the rewrite planner and the
 extractor must agree about what a link is.
 
+### Version 3 is an Obsidian-syntax bump, and it re-embeds a *subset*
+
+Version 3 is the first bump where the two halves of the rule come apart, so it
+is worth stating what each half costs.
+
+The **derivation** half is version 2's story again: `%%comments%%` are now
+excluded from link and tag extraction, the inline tag grammar changed, and
+`resolve_target` learned aliases, case-folding and Obsidian's shortest-path
+tie-break. None of that moves a byte on disk, so `content_hash` cannot see it
+and the marker is again the whole mechanism. The next pass treats every
+stale-marked row as changed and re-derives it. **No `make reindex`, and no
+`make rebuild-tsvectors`** — a marker-stale note is in `to_upsert`, and the
+keyword-vector loop runs over `to_upsert`.
+
+The **embedding** half is new: `clean_for_embedding` now removes comments too,
+so version 3's cleaned output genuinely differs from version 2's — but only for
+a note that contains a comment. That is exactly what
+`_grammar_changed_the_embedding_text`'s per-note comparison is for, and it is
+why the registry freezes the old cleaner as `_v1_clean` rather than re-pointing
+keys 1 and 2 at the current function: re-pointing would compare every stamped
+row against a function it never ran and certify its stale vectors. With the
+freeze in place, `embedded_content_hash` is cleared for the comment-carrying
+notes and nothing else. In a typical vault that is the Excalidraw notes, whose
+whole scene JSON lives inside a `%%` block and was being embedded as prose.
+
+The generalisation, for the next bump: **say which half you are paying.** A
+bump that only changes derivation costs one pass; a bump that moves the cleaned
+output costs provider calls for the notes it moves, and the per-note comparison
+is what keeps "the notes it moves" from becoming "the vault".
+
 ### The frozen v0 cleaner is a line scanner with the regexes as its oracle
 
 `_v0_clean` must keep producing byte-identical output forever — the

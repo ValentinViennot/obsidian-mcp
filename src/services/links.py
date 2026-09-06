@@ -29,6 +29,24 @@ class ExtractedLink:
     link_text: str  # full original text (e.g. "[[Foo|Bar]]")
     kind: str  # "link" | "embed" | "markdown"
     position: int  # byte offset in the (un-stripped) source
+    # The two Obsidian-specific parts of a wikilink, kept as parsed rather than
+    # re-derived by a second consumer splitting `link_text` on `#` and `|` —
+    # which is exactly the kind of second grammar this module exists to
+    # prevent. Both are IN-MEMORY ONLY: `note_links` has no column for either,
+    # and the persisted `link_text` carries them verbatim, so the graph tools
+    # already show an agent `[[Note#Heading|alias]]` in full.
+    #
+    # `anchor` is the fragment WITHOUT its leading `#` — a heading name, or a
+    # block reference still carrying its `^` (`^block-id`), which is how
+    # Obsidian writes the two apart. `display` is the alias text after `|`.
+    # Empty string means "not present"; neither ever affects resolution.
+    anchor: str = ""
+    display: str = ""
+
+    @property
+    def is_block_ref(self) -> bool:
+        """Does this link address a block (`#^id`) rather than a heading?"""
+        return self.anchor.startswith("^")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -672,6 +690,91 @@ def apply_fence_mask(text: str, scan: FenceScan) -> str:
     return _INLINE_CODE_RE.sub(_spaces, text)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Obsidian comments (`%%…%%`)
+# ────────────────────────────────────────────────────────────────────────────
+#
+# `%%` toggles a comment in Obsidian: `%%inline%%` hides the span, and a `%%`
+# on its own line hides everything down to the next `%%`. Commented text is
+# not rendered, so it is not part of what the note *says* — and this server
+# was indexing it as if it were: a link inside a comment produced a
+# `note_links` row, a `#tag` inside one entered the vault's tag vocabulary,
+# and the whole comment body was embedded. The largest single case is
+# Excalidraw, whose plugin parks its entire scene JSON inside a `%%` block:
+# every Excalidraw note contributed a drawing's serialized geometry to vector
+# space.
+#
+# THE GRAMMAR, deliberately narrower than Obsidian's:
+#
+# * Only MATCHED pairs. An unterminated `%%` comments out the rest of the note
+#   in Obsidian; here it hides nothing. A flat scanner that let one stray `%%`
+#   swallow every link and tag below it is the same "one line eats the rest of
+#   the file" failure the unterminated-fence rule refuses, and this one would
+#   silently delete graph edges rather than refuse a write.
+# * `%` is not otherwise special, so a lone `%` never opens anything and the
+#   scan is anchored on the two-character run.
+# * Comments may cross line boundaries (that is the block form).
+# * Applied AFTER code masking, always — see `mask_comments`. A `%%` inside a
+#   fence is already spaces by then and cannot open a comment, which is what
+#   keeps a shell script's `%%` from hiding half a note.
+#
+# Where it applies: link extraction, tag extraction, and the embedding
+# cleaner. Where it deliberately does NOT:
+#
+# * `mask_code` itself, and therefore `_scan_headings`. A heading inside a
+#   comment must stay addressable — section reads and `edit_note(section=…)`
+#   resolve over the same scan, and making a heading invisible to the read
+#   side while the write side still counts it is precisely the destructive
+#   round-trip class #140 closed.
+# * `move_note`'s link rewriter. Rewriting a commented link keeps it pointing
+#   at the note the author meant; leaving it stale would not.
+# * `content_tsvector`. Keyword search answers "which file contains these
+#   bytes", and the bytes are in the file. Narrowing it would also cost a
+#   `make rebuild-tsvectors` for no recall this server wants back.
+_COMMENT_RE = re.compile(r"%%.*?%%", re.DOTALL)
+
+
+def comment_spans(masked: str) -> tuple[tuple[int, int], ...]:
+    """`(start, end)` of every matched `%%…%%` in ALREADY CODE-MASKED text.
+
+    The precondition is not a formality: run against raw text, a `%%` inside a
+    fenced block pairs with a `%%` outside it and hides real content between
+    them. Every caller goes through `mask_comments` or `mask_code_and_comments`
+    rather than calling this with its own idea of what is code.
+    """
+    return tuple((m.start(), m.end()) for m in _COMMENT_RE.finditer(masked))
+
+
+def mask_comments(masked: str) -> str:
+    """Blank every matched `%%…%%` span with same-length spaces.
+
+    Takes and returns code-masked text; the substitution is again exactly as
+    long as what it replaces (in code points), so a `position` reported against
+    the result still indexes the original note.
+    """
+    spans = comment_spans(masked)
+    if not spans:
+        return masked
+    out: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        out.append(masked[cursor:start])
+        out.append(" " * (end - start))
+        cursor = end
+    out.append(masked[cursor:])
+    return "".join(out)
+
+
+def mask_code_and_comments(text: str, *, context: FenceContext) -> str:
+    """`mask_code` followed by `mask_comments`, in that order.
+
+    The one entry point for "the text of this note that a reader actually
+    sees", offset-preserving throughout. The order is the grammar (see above),
+    so no caller gets to choose it.
+    """
+    return mask_comments(_mask_code(text, context=context))
+
+
 def extract_links(
     content: str, *, context: FenceContext = BODY, max_links: int | None = None
 ) -> list[ExtractedLink]:
@@ -710,7 +813,7 @@ def extract_links_bounded(
     so peak memory is bounded at 2N links rather than at the note's true link
     count (one 10 MiB note of `[[a]] ` yields 1.75 M links unbounded).
     """
-    masked = _mask_code(content, context=context)
+    masked = mask_code_and_comments(content, context=context)
     wiki: list[ExtractedLink] = []
     md: list[ExtractedLink] = []
     overflowed = False
@@ -728,6 +831,13 @@ def extract_links_bounded(
             link_text=m.group(0),
             kind=kind,
             position=m.start(),
+            # `[[Note#Heading]]`, `[[Note#^block-id]]` and `[[Note|alias]]`
+            # all resolve to `Note` and always have; what changes here is that
+            # the two discarded groups are now reported rather than thrown
+            # away, so a caller can tell a block reference from a heading
+            # anchor without re-parsing `link_text`.
+            anchor=(m.group("anchor") or "").strip(),
+            display=(m.group("alias") or "").strip(),
         ))
 
     for link in scan_md_links(masked):
@@ -750,6 +860,9 @@ def extract_links_bounded(
             link_text=masked[link.start:link.end],
             kind="markdown",
             position=link.start,
+            # The scanner reports the fragment with its leading `#`; strip it
+            # so `anchor` means the same thing on both link kinds.
+            anchor=link.anchor[1:].strip() if link.anchor else "",
         ))
 
     if max_links is None:
@@ -789,23 +902,91 @@ def _source_dir(source_path: str) -> str:
     return os.path.dirname(source_path)
 
 
+def _shortest_path_first(
+    candidates: list[tuple[str, int]], src_dir: str
+) -> int:
+    """Obsidian's "shortest path that is unique", applied to a tie.
+
+    A vault with two `Meeting Notes.md` under different folders is ordinary,
+    not pathological, so what a bare `[[Meeting Notes]]` resolves to is a real
+    decision and not an edge case. Obsidian resolves the *closest* note: the
+    one beside the link, else the one nearest the vault root.
+
+    This module used to pick the **alphabetically first** path, which is
+    neither Obsidian's answer nor stable under a rename that does not move the
+    file — `Archive/2019/Meeting Notes.md` beat `Meeting Notes.md` because `A`
+    sorts before `M`, so the vault-root note nobody would ever call "the
+    archived one" lost every ambiguous backlink. The order is now:
+
+      1. same folder as the source (Obsidian's first rule, already applied by
+         the caller and re-applied here so this function is total),
+      2. fewest path segments — the note nearer the vault root,
+      3. shortest path string, then alphabetical, purely so the result is
+         deterministic when 1 and 2 tie.
+
+    Only the tie-break changed; a target with exactly one match resolves
+    exactly as it always did.
+    """
+    def _rank(candidate: tuple[str, int]) -> tuple[int, int, int, str]:
+        path = candidate[0]
+        return (
+            0 if os.path.dirname(path) == src_dir else 1,
+            path.count("/"),
+            len(path),
+            path,
+        )
+
+    return min(candidates, key=_rank)[1]
+
+
 def resolve_target(
     target: str,
     source_path: str,
     vault_index: dict,
+    *,
+    follow_aliases: bool = True,
+    case_insensitive: bool = True,
 ) -> int | None:
     """Resolve a raw link target to a `notes_metadata.id`.
 
-    `vault_index` is expected to carry two sub-dicts:
+    `vault_index` is expected to carry (see `build_vault_index`):
       - `vault_index["paths"]`: dict[file_path, id]
       - `vault_index["stems"]`: dict[stem, list[(file_path, id)]]
+      - `vault_index["paths_ci"]` / `["stems_ci"]`: the same, case-folded
+      - `vault_index["aliases"]`: dict[folded alias, list[(file_path, id)]]
 
     Resolution order (mirrors Obsidian defaults):
       1. Path-style: target contains `/` → try `<target>.md`, then `<target>`.
       2. Same-folder: `<source_dir>/<target>.md`.
       3. Bare-name unique: exactly one note in the vault has stem `<target>`.
-      4. Bare-name ambiguous: pick the alphabetically first match.
-      5. Fall through: return None (dangling).
+      4. Bare-name ambiguous: the closest match — see `_shortest_path_first`.
+      5. Case-insensitively, 1–4 again. Obsidian's link resolution ignores
+         case, so `[[project plan]]` finds `Project Plan.md`; this server used
+         to leave that dangling.
+      6. Frontmatter `aliases:` — an alias is a name for the note, and a link
+         written through one is an ordinary edge that this server used to drop
+         on the floor. **After** the filename rules, matching Obsidian: a real
+         file always beats somebody's alias for a different file.
+      7. Fall through: return None (dangling).
+
+    **The two flags exist for `move_note`, and default to the correct
+    behaviour everywhere else.** The rewriter decides which links on disk to
+    mutate by asking this function what they resolve to, so widening
+    resolution widens what a move overwrites. Neither widening should reach
+    it, and for the same reason in both cases — the answer does not move with
+    the file:
+
+    * an alias lives in the *target's* own frontmatter and travels with it, so
+      `[[Alias]]` still resolves after the move and rewriting it to `[[New]]`
+      would destroy an alias the author chose;
+    * a case-differing bare name resolves by stem, and the stem is unchanged
+      by a folder move.
+
+    So `_rewrite_links_in_text` passes both False and `move_note`'s on-disk
+    behaviour is bit-identical to what it was. The residual is named in
+    `docs/architecture/obsidian-compatibility.md`: a move that also *renames*
+    the note leaves a case-differing bare link dangling until it is re-pointed
+    by hand.
     """
     name = _normalize(target)
     if not name:
@@ -822,7 +1003,12 @@ def resolve_target(
     # Path-style attempt — fires whenever the target contains a slash OR
     # already carries a `.md` extension. This catches `[[Folder/Foo]]` and
     # `[label](Folder/Foo.md)` (the .md was stripped by the extractor) alike.
-    if "/" in name_no_ext or has_md:
+    path_style = "/" in name_no_ext or has_md
+    # Hoisted out of the branch so the case-insensitive replay below asks about
+    # the SAME path a case-exact lookup asked about, `./` and `../` resolved
+    # once. A second normalization there would be a second grammar.
+    normalized = name_no_ext
+    if path_style:
         # Normalize `./` and `../` against the source's folder so markdown
         # links like `[label](./Foo.md)` resolve correctly.
         if name_no_ext.startswith("./") or name_no_ext.startswith("../"):
@@ -832,8 +1018,6 @@ def resolve_target(
                 if base else os.path.normpath(name_no_ext)
             )
             normalized = normalized.replace(os.sep, "/")
-        else:
-            normalized = name_no_ext
         candidate_md = f"{normalized}.md"
         if candidate_md in paths:
             return paths[candidate_md]
@@ -850,28 +1034,156 @@ def resolve_target(
     # Bare-name lookup by stem.
     stem_key = os.path.basename(name_no_ext)
     candidates = stems.get(stem_key, [])
-    if not candidates:
-        return None
     if len(candidates) == 1:
         return candidates[0][1]
-    # Multiple — prefer same folder, else alphabetical.
-    same_folder = [c for c in candidates if os.path.dirname(c[0]) == src_dir]
-    if same_folder:
-        same_folder.sort(key=lambda c: c[0])
-        return same_folder[0][1]
-    candidates_sorted = sorted(candidates, key=lambda c: c[0])
-    return candidates_sorted[0][1]
+    if candidates:
+        return _shortest_path_first(candidates, src_dir)
+
+    # ── Case-insensitive replay of everything above ────────────────────────
+    # Obsidian's resolver folds case, so a link written `[[project plan]]` for
+    # `Project Plan.md` is a working link there and was a dangling row here.
+    # It runs only after every case-exact rule has failed, so it can turn a
+    # dangling link into a resolved one and can never re-point a link that
+    # already resolved.
+    if case_insensitive:
+        paths_ci: dict[str, list[tuple[str, int]]] = vault_index.get("paths_ci", {})
+        stems_ci: dict[str, list[tuple[str, int]]] = vault_index.get("stems_ci", {})
+        if paths_ci or stems_ci:
+            folded = normalized.casefold()
+            if path_style:
+                for key in (f"{folded}.md", folded):
+                    hits = paths_ci.get(key)
+                    if hits:
+                        return _shortest_path_first(hits, src_dir)
+            if src_dir:
+                hits = paths_ci.get(f"{src_dir}/{name_no_ext}.md".casefold())
+                if hits:
+                    return _shortest_path_first(hits, src_dir)
+            hits = stems_ci.get(os.path.basename(name_no_ext).casefold())
+            if hits:
+                return _shortest_path_first(hits, src_dir)
+
+    # ── Frontmatter aliases ────────────────────────────────────────────────
+    # Last, so a note actually named `X` always wins over a note that merely
+    # calls itself `X`. Folded for the same reason the filename rules are.
+    if follow_aliases:
+        aliases: dict[str, list[tuple[str, int]]] = vault_index.get("aliases", {})
+        # `name_no_ext` first and `name` after, so `[[Alias]]` and the
+        # `[label](Alias.md)` form the extractor already stripped both land on
+        # the same key, without making an alias that genuinely ends in `.md`
+        # unreachable.
+        for key in (name_no_ext, name):
+            hits = aliases.get(key.casefold())
+            if hits:
+                return _shortest_path_first(hits, src_dir)
+
+    return None
 
 
 def build_vault_index(rows) -> dict:
-    """Build a `vault_index` dict from an iterable of `(file_path, id)` tuples."""
+    """Build a `vault_index` dict from `(file_path, id)` or `(file_path, id,
+    aliases)` tuples.
+
+    The third element is the note's frontmatter `aliases:` value in whatever
+    shape YAML produced it — a list, a comma- or newline-separated scalar, or
+    None. It is optional so the pre-existing two-tuple callers keep working
+    unchanged, and one of them wants exactly that: `move_note` builds its
+    pre-move index without aliases, which is what makes alias resolution
+    unreachable from the rewriter (see `resolve_target`).
+
+    Five maps come out:
+
+    * `paths` / `stems` — exact, as before, and consulted first, so nothing
+      below can change what a link that already resolved resolves to.
+    * `paths_ci` / `stems_ci` — case-folded, each key mapping to EVERY note
+      that folds onto it (two notes may differ only in case), so the tie-break
+      is the same one the exact path takes.
+    * `aliases` — case-folded alias → the notes claiming it.
+    """
     paths: dict[str, int] = {}
     stems: dict[str, list[tuple[str, int]]] = {}
-    for file_path, note_id in rows:
+    paths_ci: dict[str, list[tuple[str, int]]] = {}
+    stems_ci: dict[str, list[tuple[str, int]]] = {}
+    aliases: dict[str, list[tuple[str, int]]] = {}
+    for row in rows:
+        file_path, note_id = row[0], row[1]
+        raw_aliases = row[2] if len(row) > 2 else None
         paths[file_path] = note_id
         stem = os.path.splitext(os.path.basename(file_path))[0]
         stems.setdefault(stem, []).append((file_path, note_id))
-    return {"paths": paths, "stems": stems}
+        paths_ci.setdefault(file_path.casefold(), []).append((file_path, note_id))
+        stems_ci.setdefault(stem.casefold(), []).append((file_path, note_id))
+        for alias in normalize_aliases(raw_aliases):
+            aliases.setdefault(alias.casefold(), []).append((file_path, note_id))
+    return {
+        "paths": paths,
+        "stems": stems,
+        "paths_ci": paths_ci,
+        "stems_ci": stems_ci,
+        "aliases": aliases,
+    }
+
+
+# An alias is a note *name*, so it inherits the filename bounds: `MAX_PATH_CHARS`
+# is 1,024 and a name longer than that can never be one. The count bound is the
+# same idea applied to the list — a frontmatter block is note-controlled input
+# and this map is built once per pass over every note in the vault.
+MAX_ALIAS_CHARS = 1024
+MAX_ALIASES_PER_NOTE = 64
+
+_ALIAS_SCALAR_SPLIT_RE = re.compile(r"[,\r\n]")
+
+
+def normalize_aliases(value) -> list[str]:
+    """The alias names a frontmatter `aliases:` value declares.
+
+    Obsidian accepts three shapes and this accepts all three:
+
+        aliases: [Foo, Bar]        a list
+        aliases:                   a block list
+          - Foo
+        aliases: Foo, Bar          a scalar, comma-separated
+
+    Nested lists are flattened one level (a block list of inline lists is a
+    shape YAML produces from a stray indent, and Obsidian reads it as the
+    names it contains). Everything is `str()`-ed, which is safe because every
+    caller holds a mapping that came through `_scrub_frontmatter`; a value
+    that survived that is renderable by construction.
+
+    Empty names are dropped, `[[Wikilink]]` wrappers are peeled — some plugins
+    write aliases that way — and the result is de-duplicated with its order
+    preserved so a note declaring the same alias twice contributes one entry.
+    """
+    if value is None:
+        return []
+    is_sequence = isinstance(value, (list, tuple))
+    items = list(value) if is_sequence else [value]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if isinstance(item, (list, tuple)):
+            parts = [str(sub) for sub in item]
+        elif is_sequence:
+            # A list element is ONE name, never split: `aliases: ["Smith,
+            # John"]` declares a person, not two people.
+            parts = [str(item)]
+        else:
+            # A scalar carries its own separators. Newlines as well as commas,
+            # so a `|`-style block scalar reads as the list it looks like.
+            parts = _ALIAS_SCALAR_SPLIT_RE.split(str(item))
+        for part in parts:
+            name = part.strip()
+            if name.startswith("[[") and name.endswith("]]"):
+                name = name[2:-2].strip()
+            if not name or len(name) > MAX_ALIAS_CHARS:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+            if len(out) >= MAX_ALIASES_PER_NOTE:
+                return out
+    return out
 
 
 def normalize_target(target: str) -> str:

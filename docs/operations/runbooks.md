@@ -18,9 +18,13 @@ Throughout: `odoo` is the SSH alias for the production host, the stack is
 ## Layout
 
 ```
-/srv/obsidian/vault.git    bare repo — the push target for desktop and server
-/srv/obsidian/vault        working clone — bind-mounted into the container at /obsidian
+/srv/obsidian/repos/<user>.git    bare repo, one per user — the push target
+/srv/obsidian/vaults/<user>/      working clone; the PARENT is mounted as /vaults
 ```
+
+Per-user vaults must be **siblings** under `/srv/obsidian/vaults`, never nested.
+Upstream's tenancy guard cannot see a vault grafted inside another one, and one
+user would then read and overwrite another's notes.
 
 The container mounts **the working clone, never the bare repo**. The server's
 tree carries its own uncommitted agent writes; a `post-receive` checkout into a
@@ -89,7 +93,7 @@ First deploy only. Subsequent releases are [Upgrade](#upgrade).
      "select username, is_admin, oidc_subject is not null as linked from users;"'
    ```
 
-6. Confirm the auth boundary actually holds — this is the check people skip:
+7. Confirm the auth boundary actually holds — this is the check people skip:
 
    ```bash
    curl -so /dev/null -w '%{http_code}\n' https://obsidian-mcp.unstaticlabs.com/mcp     # expect 401
@@ -174,8 +178,8 @@ The vault is git. Nothing is lost, and a bad agent write is reverted like any
 other commit:
 
 ```bash
-ssh odoo 'cd /srv/obsidian/vault && git log --oneline -20'
-ssh odoo 'cd /srv/obsidian/vault && git revert --no-edit <sha> && git push origin main'
+ssh odoo 'cd /srv/obsidian/vaults/<user> && git log --oneline -20'
+ssh odoo 'cd /srv/obsidian/vaults/<user> && git revert --no-edit <sha> && git push origin main'
 ```
 
 Use `git revert`, not `reset --hard`: the desktop clone has the old history and
@@ -316,9 +320,9 @@ abort the rebase and leave a usable tree rather than parking mid-rebase; resolve
 by hand:
 
 ```bash
-ssh odoo 'cd /srv/obsidian/vault && git status'
+ssh odoo 'cd /srv/obsidian/vaults/<user> && git status'
 # resolve, then:
-ssh odoo 'cd /srv/obsidian/vault && git add -A && git rebase --continue && git push origin main'
+ssh odoo 'cd /srv/obsidian/vaults/<user> && git add -A && git rebase --continue && git push origin main'
 ```
 
 Never force-push the vault. The desktop clone and the server clone both hold
@@ -332,7 +336,7 @@ history; a force-push strands one of them.
 curl -sf https://obsidian-mcp.unstaticlabs.com/health
 curl -so /dev/null -w 'mcp=%{http_code}\n'   https://obsidian-mcp.unstaticlabs.com/mcp     # 401
 curl -so /dev/null -w 'admin=%{http_code}\n' https://obsidian-mcp.unstaticlabs.com/admin   # 302
-ssh odoo 'cd /srv/obsidian/vault && git status --porcelain | head'   # should be empty or agent writes only
+ssh odoo 'cd /srv/obsidian/vaults/<user> && git status --porcelain | head'   # should be empty or agent writes only
 ssh odoo 'docker exec obsidian-mcp-db psql -U obsidian -c "select count(*) from note_embeddings where valid_to is null"'
 ```
 

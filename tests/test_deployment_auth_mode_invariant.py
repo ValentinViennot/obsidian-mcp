@@ -33,6 +33,33 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+class _ComposeLoader(yaml.SafeLoader):
+    """SafeLoader that tolerates Compose's own YAML tags.
+
+    Compose defines `!reset` and `!override` for merge control — an override
+    file uses `ports: !reset null` to *remove* a port, because compose merges
+    `ports` by concatenation and `ports: []` removes nothing. PyYAML has no
+    constructor for them and raises, so a test that merely wanted to read the
+    environment block died parsing the file instead, reporting a failure that
+    had nothing to do with what it was asserting.
+    """
+
+
+def _ignore_unknown_tag(loader, tag_suffix, node):
+    if isinstance(node, yaml.ScalarNode):
+        return loader.construct_scalar(node)
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node)
+    return loader.construct_mapping(node)
+
+
+_ComposeLoader.add_multi_constructor("!", _ignore_unknown_tag)
+
+
+def _load_compose(path):
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=_ComposeLoader) or {}
+
+
 from src.config import Settings
 
 
@@ -121,7 +148,7 @@ def _compose_environments(path):
     Values are left as written, including any `${...}` interpolation — an
     interpolated AUTH_MODE is reported rather than guessed at.
     """
-    document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    document = _load_compose(path)
     for service, definition in (document.get("services") or {}).items():
         raw = (definition or {}).get("environment")
         if raw is None:

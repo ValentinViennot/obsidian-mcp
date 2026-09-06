@@ -34,6 +34,7 @@ contributors who do not have the vault — which is everyone but its owner.
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -55,6 +56,47 @@ GENERIC_DIRS = {
     "public", "random", "reading", "resources", "reviews", "scripts", "src",
     "static", "templates", "temp", "tmp", "vendor", "weekly", "work",
 }
+
+#: Any single ordinary English word is a bad detector, whatever its length.
+#: A hand-written stoplist cannot keep up — this check fired on "infrastructure"
+#: and "principle", both of which are folder names in one vault *and* words this
+#: repository's own prose uses constantly. A check that cries wolf is one people
+#: learn to ignore, which is worse than not having it.
+#:
+#: So distinctiveness is decided by the system dictionary rather than by a list
+#: someone has to remember to extend. A name qualifies when it is more than one
+#: word, or carries digits or internal capitals, or simply is not a word.
+_DICTIONARY = pathlib.Path("/usr/share/dict/words")
+
+
+def _load_dictionary() -> frozenset[str]:
+    try:
+        return frozenset(
+            w.strip().casefold() for w in _DICTIONARY.read_text(errors="ignore").splitlines() if w.strip()
+        )
+    except OSError:
+        # No dictionary (most containers): fall back to the hand-written list.
+        return frozenset()
+
+
+_WORDS = _load_dictionary()
+
+
+def _is_distinctive(name: str) -> bool:
+    """Would seeing this string in the repo actually tell you about the vault?"""
+    if " " in name or "-" in name or "_" in name:
+        return True                      # multi-word: nobody writes these by chance
+    if name.isdigit():
+        return False                     # a bare year or month number: "2023", "04"
+    if any(c.isdigit() for c in name):
+        return True
+    if name[1:] != name[1:].lower():
+        return True                      # internal capitals: CamelCase, an acronym
+    if name.casefold() in GENERIC_DIRS:
+        return False
+    if name.casefold() in _WORDS:
+        return False                     # an ordinary English word
+    return len(name) >= MIN_DIR_LEN
 
 SKIP_PATHS = {"scripts/check-vault-leak.py"}
 
@@ -129,8 +171,7 @@ def build_denylist(vault: Path) -> tuple[set[str], set[str]]:
         if any(part.startswith(".") for part in rel.parts[:-1]):
             continue
         if path.is_dir():
-            distinctive = " " in name or len(name) >= MIN_DIR_LEN
-            if distinctive and name.casefold() not in GENERIC_DIRS:
+            if _is_distinctive(name):
                 dirs.add(name)
         elif path.suffix.lower() == ".md":
             stem = path.stem

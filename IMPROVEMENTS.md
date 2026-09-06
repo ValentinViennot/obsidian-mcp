@@ -92,13 +92,50 @@ parallel embeddings to keep it under an hour.
 
 ---
 
-## 5. Vault revision safety (auto-commit + dry-run) — partially shipped
+## 5. Vault revision safety (auto-commit + dry-run) — Option A shipped
 
 **Status.** The `dry_run=True` mode on `edit_note` and the atomic
 tmp-file-then-`os.replace` write path shipped via `vault-write-completion`.
-The git auto-commit and `note_revisions` table options are explicitly NOT
-shipped — daily backups on the file server cover the rollback story for the
-single-user-vault case, and per-tool-call git noise was not worth it.
+**Option A (git auto-commit) shipped via `feat/git-vault`**:
+`src/services/git_vault.py`, the `GIT_VAULT_ENABLED` / `GIT_COMMIT_ON_WRITE`
+settings (default **off**, so nothing changes for an existing deployment), and
+`deploy/` for the reconcile sweep, the systemd units, the bare-repo hook and
+the vault `.gitignore` template. Option B (`note_revisions`) remains NOT
+shipped, and is now less compelling: git history is the same audit trail
+without a schema to maintain.
+
+**Three divergences from the notes below, each deliberate.**
+
+- **The commit message names the tool and the *principal*, not the key
+  prefix.** `key_prefix` is the first twelve characters of a live API key, and
+  a commit message travels into mirrors, hooks and notification payloads. The
+  trailer carries `current_actor`'s label — the key's *name* or the OAuth
+  client's — which is the same value `usage_logs.actor_label` already records.
+- **Git config is never written, `--global` least of all.** The note below
+  suggested `user.name = "obsidian-mcp"`. The same repository is cloned on the
+  owner's desktop, where commits must stay attributable to the human; identity
+  therefore travels in `GIT_AUTHOR_*` / `GIT_COMMITTER_*` on the one `git
+  commit` invocation, which cannot escape the process.
+- **`git add -A && git commit` is wrong and is not what shipped.** `-A` with no
+  pathspec sweeps whatever else is in the tree — an out-of-band Obsidian write,
+  an operator's staged work — into a commit captioned with an agent's tool
+  name, which corrupts the attribution the feature exists to provide. The
+  shipped form stages and commits **exactly** the paths the tool published
+  (`git add -A -- <paths>` then `git commit --only -- <paths>`), and leaves the
+  catch-all `add -A` to the sweep, whose message says out-of-band.
+
+**The failure semantics, which the notes below do not state.** A git failure
+never fails or rolls back a write: the bytes are published by
+`_atomic_write_at` before any commit is attempted, so there is nothing to roll
+back, and an `edit_note` that answered "failed" for a write that stood would
+send an agent into a retry loop over a note it had already changed. Failures
+are logged at WARNING and swallowed, and the sweep commits the change on its
+next tick.
+
+**Not squashed daily.** The note below suggested a cron squash. It would
+destroy the thing the history is for: `git blame` on a squashed day attributes
+every line to the squash, and the whole question is *which* write, by whom,
+when. The commits are cheap; the history stays.
 
 **Intent (original).** Make agent writes recoverable. Either git-commit the
 vault on every write tool call, or save before/after deltas in a new

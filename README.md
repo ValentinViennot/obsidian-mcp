@@ -331,6 +331,52 @@ requires it on the supported destructive calls; enable this only after
 clients supply tokens. Creation is exempt and refuses a supplied token
 as `no_incumbent`. Files above their read cap cannot be guarded.
 
+### Git-backed vault
+
+`expected_hash` stops a write from clobbering something you have not
+seen. Git answers the other half of the same worry, months later: *when*
+did this paragraph appear, and was it you or an agent?
+
+Set `GIT_VAULT_ENABLED=true` on a vault directory that is a git working
+clone, and every write tool makes its own commit as the write lands —
+named for the tool and the calling credential:
+
+```
+mcp(edit_note): update Projects/Roadmap.md
+
+Tool: edit_note
+Principal: laptop-key
+```
+
+`Tool:` and `Principal:` are real git trailers, so
+`git log --format='%(trailers:key=Principal,valueonly)'` and
+`git log --grep '^mcp(delete_note)'` both work, and `git blame` on any
+line tells you which tool wrote it and under which credential. Agent
+commits are authored by `GIT_AGENT_NAME`; the commits you make in your
+own clone of the same repository stay authored by you, because nothing
+here writes git config — the identity travels in `GIT_AUTHOR_*` /
+`GIT_COMMITTER_*` on the one invocation.
+
+Three properties worth knowing before relying on it:
+
+- **Off by default, and a no-op on a vault that is not a git
+  repository.** Nothing changes for an existing deployment.
+- **A git failure never fails or rolls back a write.** The bytes are
+  already published when the commit is attempted; a failure is logged at
+  WARNING and swallowed. History can be a few minutes stale; the vault is
+  never wrong.
+- **`--workers 1` still applies.** The commit lock is process-local, like
+  the rate limiter's buckets.
+
+Out-of-band edits — Obsidian writing straight into the mounted vault, a
+file copied in over ssh — are not commits anybody made through a tool, so
+a reconcile sweep picks them up on a timer and syncs with a bare repo.
+[`deploy/`](deploy/) holds the sweep, its systemd units, a bare-repo
+`post-receive` hook, and a vault `.gitignore` template you should install
+**before** the first commit (Obsidian workspace state conflicts on every
+sync, and plugin caches reach hundreds of megabytes that git keeps for
+ever). Full setup: [DEPLOYMENT.md, Step 4, Option C](DEPLOYMENT.md#option-c-git).
+
 ### File transfer
 No MCP client can hand a tool the bytes of a file the user is looking
 at, so `write_file` is only usable when the agent already has the
@@ -960,6 +1006,11 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `IMPORT_ALLOW_HTTP` | `false` | Let `import_from_url` fetch plain http. Off by default. |
 | `VAULT_ALLOW_NAMED_STAGING_FALLBACK` | `false` | Accept named staging on filesystems without `O_TMPFILE`. One flag, both write paths. See [System requirements](#system-requirements). |
 | `WRITE_PRECONDITION_REQUIRED` | `false` | Require `expected_hash` on supported destructive calls. Creation is exempt; enable after clients adopt read hashes. |
+| `GIT_VAULT_ENABLED` | `false` | Treat the vault directory as a git working clone. A clean no-op on a vault that is not a git repository, and a git failure never fails or rolls back a write. See [Git-backed vault](#git-backed-vault). |
+| `GIT_COMMIT_ON_WRITE` | `true` | Whether each write tool makes its own commit. Off leaves the reconcile sweep as the only committer — useful while first bringing a large vault under version control. Ignored when `GIT_VAULT_ENABLED` is false. |
+| `GIT_AGENT_NAME` | `obsidian-mcp agent` | Author and committer for agent-made commits. Deliberately not the human's: telling the two apart by author in `git log` is the point. Applied per invocation; git config is never written. |
+| `GIT_AGENT_EMAIL` | `agent@obsidian-mcp.invalid` | The address beside it. `.invalid` (RFC 2606) never resolves; set a real one if this history is going somewhere that cares. Neither field may be empty or contain a newline, `<` or `>` — refused at startup. |
+| `GIT_COMMIT_TIMEOUT_SECONDS` | `15` | Wall-clock bound on one git invocation (0 < n ≤ 120). git blocks indefinitely on a held index lock or an unresponsive filesystem, and this runs in a worker thread. |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | — | Used when provider is Ollama |

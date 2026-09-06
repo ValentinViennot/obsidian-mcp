@@ -631,10 +631,16 @@ _MOUNT_CASE = textwrap.dedent(
 
 
 def _can_unshare() -> bool:
-    probe = subprocess.run(
-        ["unshare", "-Ur", "-m", "--propagation", "private", "true"],
-        capture_output=True,
-    )
+    # `unshare` is Linux-only. On macOS (and any host without it) the binary is
+    # absent and subprocess raises instead of returning non-zero, which failed
+    # collection for the whole module rather than skipping this one test.
+    try:
+        probe = subprocess.run(
+            ["unshare", "-Ur", "-m", "--propagation", "private", "true"],
+            capture_output=True,
+        )
+    except (FileNotFoundError, OSError):
+        return False
     return probe.returncode == 0
 
 

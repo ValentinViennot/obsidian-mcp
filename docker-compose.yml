@@ -1,124 +1,247 @@
-# Reference deployment for a Traefik-fronted homelab setup.
+# The self-hosting stack: Postgres + the MCP server. Nothing else.
 #
-# To adapt to your environment, set in `.env`:
-#   MCP_HOSTNAME       -- public hostname Traefik routes to
-#   VAULT_HOST_PATH    -- host path to your Obsidian vault
+#     cp .env.example .env    # then edit — SECRET_KEY and VAULT_HOST_PATH at minimum
+#     docker compose up -d
 #
-# Backups are written host-side by `make db-backup` into $(DATA_DIR)/backups
-# and are deliberately NOT mounted into the container (see
-# docs/architecture/control-panel.md, "Backup recency"); `make deploy`
-# refuses a container that has a mount at /app/backups.
+# This is the base file and it is complete on its own: it brings up a working
+# server on 127.0.0.1:8000 for a reverse proxy (or an SSH tunnel) to reach. TLS
+# is an OVERRIDE, not a fork of this file:
 #
-# The Traefik labels assume an external `t2_proxy` network and a
-# `chain-oauth@file` middleware; adjust the network/middleware names
-# (or strip them) for your reverse-proxy setup.
+#     docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d
+#     docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
+#
+# Both overrides add a front door and change nothing else. The previous layout
+# shipped three whole stacks (`docker-compose.yml`, `.simple.yml`, `.proxy.yml`)
+# that each redefined postgres and the app; the definitions had already drifted
+# apart from one another, which is the failure mode overrides exist to prevent.
+#
+# ── What you must set in `.env` ────────────────────────────────────────────
+#   SECRET_KEY        The app REFUSES TO START on a placeholder. Generate one:
+#                     `openssl rand -hex 32`.
+#   VAULT_HOST_PATH   Absolute host path to your Obsidian vault. Bind-mounted
+#                     read-write at /obsidian; the write tools mutate it.
+#   POSTGRES_PASSWORD Also put the same value in DATABASE_URL — the app reads
+#                     the URL, Postgres reads the password, and nothing
+#                     reconciles them for you.
+#   MCP_HOSTNAME      Your public hostname. base_url / allowed_origins /
+#                     allowed_hosts derive from it, so OAuth discovery breaks
+#                     without it (clients get http://localhost:8000).
+#
+# ── Ownership: the one thing that bites ────────────────────────────────────
+# The image runs as uid:gid 1000:1000, not root, so the vault on the HOST must
+# be writable by that id. Either `sudo chown -R 1000:1000 /path/to/vault`, or
+# set APP_UID/APP_GID in `.env` to the owner you already have
+# (`stat -c '%u:%g' /path/to/vault`). Getting this wrong shows up as every
+# write tool failing with EACCES while reads work fine.
+# Git ownership is already handled: the history tools pass `-c safe.directory`
+# per call, so a vault repo owned by another uid is not "dubious" to them.
 
-networks:
-  t2_proxy:
-    external: true
+name: obsidian-mcp
 
 services:
-  obsidian-mcp:
-    image: localhost:5000/obsidian-mcp:latest
-    pull_policy: always
-    container_name: obsidian-mcp
+  # ---------------------------------------------------------------------
+  # Postgres with pgvector.
+  #
+  # pg16-bookworm rather than the floating `pg16` tag: the Debian suite is
+  # part of what you are running, and a base-OS change arriving under an
+  # unchanged tag is not something a database should do to you silently.
+  # ---------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16-bookworm
     restart: unless-stopped
-    hostname: obsidian-mcp
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-obsidian_mcp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-obsidian_mcp}
+      # Stated rather than inherited. The image's default for host connections
+      # is already scram-sha-256 when a password is set, but `trust` is one
+      # empty POSTGRES_PASSWORD away and this makes that impossible to reach
+      # by accident.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # Creates the vector extension on first init. Runs ONCE, on an empty
+      # data directory — an existing volume ignores it entirely.
+      - ./docker/db-init-vector.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+
+    # No `ports:`. Deliberately, and asserted by tests/test_container_hardening.py:
+    # the only client is the app container on the internal network, so there is
+    # nothing to publish and publishing it would put the vault's entire content
+    # behind one password on the host's public interface. Use
+    # `docker compose exec postgres psql -U obsidian_mcp` to get a shell.
     networks:
-      - t2_proxy
+      - mcp_internal
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-obsidian_mcp} -d ${POSTGRES_DB:-obsidian_mcp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+    # SIGINT is Postgres's *fast* shutdown (roll back, checkpoint, exit).
+    # Docker's default SIGTERM is the *smart* shutdown, which waits for every
+    # client to disconnect and therefore usually ends in a SIGKILL 10s later —
+    # i.e. an unclean shutdown and a recovery on next boot, every time.
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+
     security_opt:
       - no-new-privileges:true
-      - apparmor=docker-default
-    cap_drop:
-      - ALL
-    # memory cap: applied LIVE on 2026-07-07 (docker update) but never written
-    # here, so any recreate silently dropped it -- persisted 2026-07-27.
-    # Peak 378M/2G = 18%, ample headroom.
-    mem_limit: 2g
-    memswap_limit: 2g
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"
-          memory: 2G
-        reservations:
-          memory: 512M
+
+    # ── Resources ────────────────────────────────────────────────────────
+    # Sized for the real workload, which is small: ~1,200 notes producing
+    # ~4,000 embedding rows at 1024 dims. Those vectors are 4 KiB each, so the
+    # embedding table is ~16 MiB of vector data; note metadata and the tsvectors
+    # for the same corpus are a few tens of MiB more. The whole database fits in
+    # RAM several times over, so the limit is not sized to the data — it is
+    # sized to keep a runaway query or an index build from taking the VPS down.
+    #
+    # 1 GiB: shared_buffers defaults to 128 MiB, and the app's pool is at most
+    # 15 backends (pool_size 5 + max_overflow 10, src/database.py) each with
+    # work_mem and its own stack. Measured steady state is far below this; the
+    # headroom is for an HNSW build during a full re-embed.
+    # 256 MiB reservation: enough that the scheduler keeps shared_buffers and
+    # the hot index resident on a busy host.
+    #
+    # These are the SHORT-FORM keys, not `deploy.resources`. Both are honoured
+    # by `docker compose up`, but they cannot be mixed — compose refuses a
+    # project that sets `pids_limit` and `deploy.resources.limits.pids` to
+    # different values, and it treats an unset one as 0. The short form is also
+    # the only one that can express `memswap_limit`, which is the key that
+    # actually forbids swap.
+    mem_limit: 1g
+    mem_reservation: 256m
+    # Swap for a database is worse than an OOM kill: it turns a fast, visible
+    # failure into an unbounded latency cliff. Equal to mem_limit means "this
+    # much RAM and no swap at all".
+    memswap_limit: 1g
+    # ANN search over 4k rows is milliseconds; one core is a ceiling for a
+    # parallel seq scan or an index build, not a target.
+    cpus: 1.0
+    # 15 app connections (one backend each) + checkpointer, walwriter, bgwriter,
+    # autovacuum launcher and its workers, logger, stats collector — call it 30
+    # in steady state. 128 leaves room for a `psql` shell and a pg_dump during
+    # `make db-backup` without leaving room for a fork bomb.
+    pids_limit: 128
+
+  # ---------------------------------------------------------------------
+  # The MCP server.
+  # ---------------------------------------------------------------------
+  obsidian-mcp:
+    # Two ways to get the image, and this covers both:
+    #   - Build from this checkout (the default): `docker compose build`.
+    #   - Pull the published one: set MCP_IMAGE in `.env` to
+    #     ghcr.io/valentinviennot/obsidian-mcp@sha256:… and run
+    #     `docker compose up -d --no-build --pull always`. Pin the DIGEST, not
+    #     a tag, if you want a redeploy to be reproducible and a rollback exact.
+    build: .
+    image: ${MCP_IMAGE:-obsidian-mcp:local}
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
     env_file:
       - .env
+
+    environment:
+      # The container migrates itself on start (docker/entrypoint.sh). Correct
+      # here because this stack has exactly one replica and it owns the schema.
+      # Set it to false if you migrate as a separate ordered step — the
+      # `make deploy` pipeline does, because it backs up BEFORE it migrates.
+      RUN_MIGRATIONS: "true"
+
+    # Note what is NOT here: a `command:`. The uvicorn invocation lives in the
+    # image's CMD, once, with the comment explaining why `--workers 1` is a
+    # contract and not a default (the /mcp rate limiter's state is in-process —
+    # docs/architecture/rate-limits.md). The stacks this file replaces each
+    # restated that invocation to prepend `alembic upgrade head`, and each of
+    # them dropped `--workers 1` in the process. Migrations moved into the
+    # entrypoint precisely so no stack has to override the command again.
+    # tests/test_container_hardening.py holds this.
+
+    # Match this to the owner of your vault on the host. See the header.
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+
     volumes:
-      # Max (admin) — bootstraps to vault_path=/obsidian after the flag flip.
-      - ${VAULT_HOST_PATH:-./vault}:/obsidian
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
+      - ${VAULT_HOST_PATH:?set VAULT_HOST_PATH in .env}:/obsidian
+      # Deliberately absent: any mount at /app/backups. The panel's backup-age
+      # health check reads the `backups_log` table, precisely so the server
+      # never needs to see the dumps — which hold every tenant's note text and
+      # every credential hash. `make check-no-backups-mount` refuses a deploy
+      # that reintroduces it (#186).
 
-      # Multi-user mode (MULTI_USER_MODE=true): mount each user's host
-      # directory under /vaults/<username>. Quote any host path that
-      # contains spaces. Admin assigns the container path on the user
-      # record via /admin/users/<id>/edit.
+    # Loopback only. Your reverse proxy — on this host, or reaching it over a
+    # private network — is the only thing that should be able to open :8000,
+    # because /admin is protected by the proxy's auth in single-user mode.
+    # If the proxy runs in Docker, prefer deleting this and attaching both to a
+    # shared network (see docker-compose.traefik.yml for that shape).
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
 
-      # Second user — assign vault_path=/vaults/oksana in the panel after the
-      # user is created. The host path lives in .env (this file is public).
-      - "${OKSANA_VAULT_HOST_PATH:-./vaults/oksana}:/vaults/oksana"
+    networks:
+      - mcp_internal
 
-      # Additional users — add an entry per user as you invite them.
-      # Example: "/storage/vaults/alice:/vaults/alice"
-    labels:
-      - "traefik.enable=true"
-      # Panel + authorize router (OAuth protected)
-      - "traefik.http.routers.obsidian-mcp-panel-rtr.entrypoints=https"
-      - "traefik.http.routers.obsidian-mcp-panel-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && (PathPrefix(`/admin`) || Path(`/authorize`))"
-      - "traefik.http.routers.obsidian-mcp-panel-rtr.tls=true"
-      - "traefik.http.routers.obsidian-mcp-panel-rtr.tls.certresolver=dns-namecheap"
-      - "traefik.http.routers.obsidian-mcp-panel-rtr.middlewares=chain-oauth@file"
-      - "traefik.http.routers.obsidian-mcp-panel-rtr.service=obsidian-mcp-svc"
-      # API/MCP/OAuth public router (no OAuth — app-level auth)
-      #
-      # NO `ratelimit` middleware here, deliberately (#194). A Traefik
-      # ratelimit was considered and rejected for three reasons. (1) A proxy
-      # cannot condition on the RESPONSE STATUS, so bounding unauthenticated
-      # probing at this layer would mean throttling authenticated agents too;
-      # the failed-authentication budget lives in `APIKeyMiddleware` instead,
-      # where it can count only the 401s. (2) This one router also serves
-      # /transfer, /health and /.well-known, so any label here would throttle
-      # all four surfaces together. (3) The host's Traefik STATIC config lives
-      # outside this repo (see CLAUDE.md, "Public repo — host paths live
-      # outside the tree"), so a control expressed there would not be
-      # reproducible from the tree. The per-principal token buckets and the
-      # per-address auth budget are in-process — see
-      # docs/architecture/rate-limits.md, and note that `--workers 1` in the
-      # Dockerfile is load-bearing for them.
-      - "traefik.http.routers.obsidian-mcp-api-rtr.entrypoints=https"
-      - "traefik.http.routers.obsidian-mcp-api-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && (PathPrefix(`/mcp`) || PathPrefix(`/transfer`) || Path(`/health`) || PathPrefix(`/.well-known`) || Path(`/register`) || Path(`/token`) || Path(`/revoke`))"
-      - "traefik.http.routers.obsidian-mcp-api-rtr.tls=true"
-      - "traefik.http.routers.obsidian-mcp-api-rtr.tls.certresolver=dns-namecheap"
-      - "traefik.http.routers.obsidian-mcp-api-rtr.service=obsidian-mcp-svc"
-      # REST API router (OAuth protected)
-      - "traefik.http.routers.obsidian-mcp-apirest-rtr.entrypoints=https"
-      - "traefik.http.routers.obsidian-mcp-apirest-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && PathPrefix(`/api`)"
-      - "traefik.http.routers.obsidian-mcp-apirest-rtr.tls=true"
-      - "traefik.http.routers.obsidian-mcp-apirest-rtr.tls.certresolver=dns-namecheap"
-      - "traefik.http.routers.obsidian-mcp-apirest-rtr.middlewares=chain-oauth@file"
-      - "traefik.http.routers.obsidian-mcp-apirest-rtr.service=obsidian-mcp-svc"
-      # Root MCP router — bypass OAuth for a bare `/` carrying a Bearer token
-      # (clients like OpenWebUI strip the /mcp prefix; RootMCPProxyMiddleware
-      # rewrites exactly `/` → `/mcp/` and nothing else). The `Path(`/`)` scope
-      # is load-bearing security, not tidiness: without it this rule's
-      # priority=100 outranks the OAuth-protected panel/api routers (whose
-      # default priority is their rule length, ~52–78) for EVERY path, so any
-      # request to `/admin/*` or `/api/*` carrying any `Authorization: Bearer`
-      # header would reach the app with the `chain-oauth@file` middleware
-      # bypassed. Keep the path scope on any future header-matched root rule.
-      - "traefik.http.routers.obsidian-mcp-root-rtr.entrypoints=https"
-      - "traefik.http.routers.obsidian-mcp-root-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && Path(`/`) && HeaderRegexp(`Authorization`, `^Bearer `)"
-      - "traefik.http.routers.obsidian-mcp-root-rtr.tls=true"
-      - "traefik.http.routers.obsidian-mcp-root-rtr.tls.certresolver=dns-namecheap"
-      - "traefik.http.routers.obsidian-mcp-root-rtr.priority=100"
-      - "traefik.http.routers.obsidian-mcp-root-rtr.service=obsidian-mcp-svc"
-      # Shared service
-      - "traefik.http.services.obsidian-mcp-svc.loadbalancer.server.port=8000"
+    # The image already declares a HEALTHCHECK against /health; it is repeated
+    # here only because `depends_on: condition: service_healthy` is what the
+    # overrides use, and an operator reading one file should be able to see the
+    # dependency's terms without inspecting the image.
+    #
+    # `localhost` is load-bearing and 127.0.0.1 does not work: the Host header
+    # must be in `allowed_hosts`, which is [MCP_HOSTNAME, "localhost"], and
+    # TrustedHostMiddleware answers a literal-IP Host with 400 — a container
+    # that is serving perfectly would sit in `unhealthy` forever.
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
-      timeout: 10s
-      retries: 5
+      timeout: 5s
       start_period: 60s
+      retries: 3
+
+    # tini is the image's ENTRYPOINT, so SIGTERM reaches uvicorn directly and
+    # in-flight MCP requests finish. 30s is comfortably more than the longest
+    # bounded call (GIT_HISTORY_TIMEOUT_SECONDS and the embed-batch deadline
+    # are both well under it).
+    stop_grace_period: 30s
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # ── Resources ────────────────────────────────────────────────────────
+    # This process is I/O bound, not compute bound: embeddings are produced by
+    # an EXTERNAL endpoint (Ollama or OpenAI — src/services/embeddings.py), so
+    # an indexer pass is mostly waiting on HTTP and Postgres. There is one
+    # uvicorn worker by contract.
+    #
+    # 1 GiB: the maintainer's own deployment measured a 378 MiB peak against a
+    # 2 GiB cap. 1 GiB is ~2.7x that peak — enough headroom for a full re-embed
+    # (which batches note text and vectors in memory) while still leaving the
+    # rest of a modest shared VPS to everything else on it. Raise it before you
+    # raise INDEX_INTERVAL or the embed batch size, not after.
+    # 256 MiB reservation: roughly the resident set of an idle server, so a
+    # co-tenant's memory spike does not push this one into reclaim.
+    mem_limit: 1g
+    mem_reservation: 256m
+    memswap_limit: 1g
+    # One event loop plus the default asyncio threadpool. More cores cannot be
+    # used by one worker, and the worker count is fixed at 1 by contract.
+    cpus: 1.0
+    # One event loop, uvloop's helpers, the asyncio default threadpool
+    # (min(32, cpu+4)) and the git subprocesses the three history tools spawn —
+    # tens of threads at peak. 256 is generous for that and still a hard stop
+    # on a runaway subprocess loop, which matters because this is the only
+    # place in the codebase that forks (src/services/git_history.py).
+    pids_limit: 256
+
+networks:
+  mcp_internal:
+    driver: bridge
+
+volumes:
+  pg_data:

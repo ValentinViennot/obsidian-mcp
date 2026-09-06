@@ -12,8 +12,8 @@ FULL_IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
 DEPLOY_DIR ?= .
 DATA_DIR ?= ./data
 # Container running PostgreSQL, for db-backup / db-restore. The bundled
-# compose stacks (docker-compose.simple.yml / .proxy.yml) name it
-# `obsidian-mcp-postgres`; a shared host instance is usually just `postgres`.
+# compose stack names it `<project>-postgres-1`; a shared host instance is
+# usually just `postgres`.
 # Override in Makefile.local to match the deployment.
 DB_CONTAINER ?= postgres
 # The application container, as named in docker-compose.yml.
@@ -118,8 +118,7 @@ push:
 	@echo "$(GREEN)Pushed: $(FULL_IMAGE)$(NC)"
 
 # Defaults to what `make build` produces (obsidian-mcp:latest). The bundled
-# docker-compose.simple.yml / docker-compose.proxy.yml stacks build their own
-# tag instead, so scan those with:
+# docker-compose.yml stack builds its own tag instead, so scan that with:
 #     make trivy SCAN_IMAGE=obsidian-mcp:local
 SCAN_IMAGE ?= $(IMAGE_NAME):$(IMAGE_TAG)
 

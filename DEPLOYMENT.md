@@ -18,10 +18,22 @@ together:
    already run it, or your own external proxy (Nginx Proxy Manager,
    nginx, …) if you already terminate TLS elsewhere.
 
-The included `docker-compose.simple.yml` bundles 1, 2, and 5 plus the
-MCP server itself. You handle 3 and 4 separately. If you already run a
-reverse proxy, use `docker-compose.proxy.yml` instead — see
-[Already have a reverse proxy?](#already-have-a-reverse-proxy) below.
+The included `docker-compose.yml` bundles 1 and 2 plus the MCP server
+itself, and publishes it on `127.0.0.1:8000` for a proxy to reach. You
+handle 3 and 4 separately. For 5, layer one override on top:
+
+| You have | Command |
+| --- | --- |
+| Nothing terminating TLS yet | `docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d` |
+| Traefik already running | `docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d` |
+| Your own proxy (NPM, nginx, …) | `docker compose up -d` and point it at `127.0.0.1:8000` |
+
+The overrides add a front door and change nothing else; there is one
+definition of Postgres and one of the app, in the base file. (Earlier
+releases shipped three whole stacks — `docker-compose.simple.yml` and
+`docker-compose.proxy.yml` alongside the main file — which had drifted
+apart from one another. They are gone; the base file plus an override
+covers every case they did.)
 
 ## What you need before starting
 
@@ -46,8 +58,8 @@ reverse proxy, use `docker-compose.proxy.yml` instead — see
   publish across a mount boundary.
 - **PostgreSQL 16 with pgvector 0.8.0 or newer.** Older pgvector
   silently loses recall on filtered semantic search, so the server exits
-  rather than run on it. `pgvector/pgvector:pg16` (what the bundled
-  compose files use) is fine.
+  rather than run on it. `pgvector/pgvector:pg16-bookworm` (what the
+  bundled compose file uses) is fine.
 - A domain or subdomain (e.g. `obsidian.example.com`) with an A record
   pointed at the VPS's public IP. DNS propagation takes a few minutes.
 - Ports 80 and 443 open on the VPS firewall, plus 22 for SSH.
@@ -87,7 +99,7 @@ Minimum values you need to set in `.env`:
 # Public hostname Caddy/Traefik will route to
 MCP_HOSTNAME=obsidian.example.com
 
-# Database. Match what docker-compose.simple.yml will create.
+# Database. Match what docker-compose.yml will create.
 DATABASE_URL=postgresql+asyncpg://obsidian_mcp:CHANGE_ME@postgres:5432/obsidian_mcp
 
 # itsdangerous signer. Generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
@@ -103,8 +115,10 @@ EMBEDDING_DIMENSIONS=1024
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 ```
 
-Generate a strong DB password and use it in both `DATABASE_URL` and
-the Postgres service env in the compose file (Step 3).
+Generate a strong DB password and set it as `POSTGRES_PASSWORD` in
+`.env` as well as inside `DATABASE_URL`. The compose file reads the
+first, the app reads the second, and nothing reconciles them for you —
+a mismatch is an authentication failure on every start.
 
 Before starting Caddy, generate a password hash and replace the
 `$2a$14$REPLACE_WITH_BCRYPT_HASH` placeholder in `Caddyfile.example`:
@@ -126,58 +140,102 @@ keep them out of the basic-auth block.
 > the vault, and `/mcp` auth so introspection can complete. Setting it
 > in production disables every external dependency.
 
-## Step 3. Bring up Postgres, MCP, and Caddy
+## Step 3. Bring up Postgres and the MCP server
 
-The repo ships a `docker-compose.simple.yml` designed for fresh VPS
-deployments. It runs:
+`docker-compose.yml` runs two services:
 
-- `pgvector/pgvector:pg16` (Postgres with pgvector preinstalled)
-- The MCP server itself
-- Caddy as the TLS-terminating reverse proxy. It auto-issues Let's
-  Encrypt certs from the hostname in your `.env`.
+- `pgvector/pgvector:pg16-bookworm` (Postgres with pgvector preinstalled),
+  reachable only from the app — it publishes no port at all.
+- The MCP server itself, on `127.0.0.1:${MCP_PORT:-8000}`.
 
-Build the MCP image and bring everything up:
+Both carry memory, CPU and PID limits chosen for a modest shared VPS;
+the reasoning for each number is in the file's comments, and the totals
+are 2 GB of limit against 512 MB of reservation. Raise them there if
+your vault is much larger than the ~1,200 notes they were sized for.
+
+### Vault ownership — the one thing that bites
+
+The image runs as **uid:gid 1000:1000**, not root, and the vault is a
+bind mount the write tools mutate. So the vault directory on the host
+must be writable by that id:
 
 ```bash
-docker compose -f docker-compose.simple.yml build
-docker compose -f docker-compose.simple.yml up -d
+sudo chown -R 1000:1000 /path/to/your/vault
 ```
 
-The first start does a database init: it creates the `obsidian_mcp`
-database, the `vector` extension, and runs alembic migrations. Watch
-the logs:
+…or, if it already belongs to some other account, tell the container to
+be that account instead — no rebuild needed:
 
 ```bash
-docker compose -f docker-compose.simple.yml logs -f obsidian-mcp
+stat -c '%u:%g' /path/to/your/vault   # e.g. 1001:1001
+# then in .env:
+APP_UID=1001
+APP_GID=1001
+```
+
+Getting this wrong looks like every write tool failing with a permission
+error while reads work perfectly. Git ownership is *not* part of this
+problem: the history tools pass `-c safe.directory` per call, so a vault
+repository owned by another uid is not "dubious" to them.
+
+### Start it
+
+```bash
+docker compose build
+docker compose up -d
+```
+
+The first start creates the `obsidian_mcp` database and the `vector`
+extension, then runs alembic migrations — the container migrates itself
+because `RUN_MIGRATIONS=true` is set for this stack. Watch the logs:
+
+```bash
+docker compose logs -f obsidian-mcp
 ```
 
 You should see "Application startup complete" within ~30 seconds, then
-"Starting vault index scan..." (which will report 0 files until Step
-4). The control panel is at `https://your-hostname/admin` and uses the
-Caddy credentials configured above.
+"Starting vault index scan..." (which will report 0 files until Step 4).
 
-### Already have a reverse proxy?
+### Add a TLS front door
 
-If you already run Nginx Proxy Manager (NPM), a standalone nginx, or
-another external proxy that terminates TLS, use
-`docker-compose.proxy.yml` instead. It brings up Postgres and the MCP
-server on plain HTTP — no bundled Caddy — and lets your existing proxy
-own certificates and HTTPS:
+**No proxy yet — bundled Caddy.** Auto-issues Let's Encrypt certificates
+for `MCP_HOSTNAME`, which must already resolve to this host, with 80 and
+443 free:
 
 ```bash
-docker compose -f docker-compose.proxy.yml build
-docker compose -f docker-compose.proxy.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d
 ```
 
-Set `MCP_HOSTNAME` in `.env` to the public hostname your proxy serves
-— the app derives `base_url` (and the OAuth discovery URLs) from it.
-Then wire your proxy to the container via one of two paths:
+The control panel is then at `https://your-hostname/admin`, behind the
+Caddy credentials configured in Step 6.
+
+**Traefik already running.** Set `TRAEFIK_NETWORK`,
+`TRAEFIK_CERTRESOLVER` and `TRAEFIK_PANEL_MIDDLEWARE` in `.env` to match
+your setup, then:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
+```
+
+Both overrides remove the published host port — Traefik and Caddy reach
+the app over the compose network — so nothing is left listening beside
+the proxy.
+
+### Already have a different reverse proxy?
+
+If you run Nginx Proxy Manager (NPM), a standalone nginx, or anything
+else that terminates TLS, use the base file alone. It is already the
+"external proxy" shape: no bundled TLS, plain HTTP on loopback.
+
+Set `MCP_HOSTNAME` in `.env` to the public hostname your proxy serves —
+the app derives `base_url` (and the OAuth discovery URLs) from it. Then
+wire your proxy to the container via one of two paths:
 
 - **Proxy in Docker (e.g. NPM):** put the proxy and this stack on a
-  shared Docker network — in `docker-compose.proxy.yml`, uncomment the
-  `proxy_net` blocks (under the service and under `networks:`) and
-  **remove the `ports:` mapping** — then forward your proxy to
-  `http://obsidian-mcp:8000`. Nothing is published to the host.
+  shared Docker network and forward to `http://obsidian-mcp:8000`.
+  `docker-compose.traefik.yml` is a worked example of that shape —
+  an `external: true` network on the service, and `ports: !reset null`
+  to drop the host publication. Nothing is published to the host.
 - **Proxy on the host / another machine:** keep the default
   loopback-bound `ports:` mapping and forward to
   `http://127.0.0.1:${MCP_PORT:-8000}` (same host) or widen the bind and
@@ -197,7 +255,7 @@ keep header logging **off** (Traefik's default is `drop`) and don't let
 an APM capture request headers, or you will log live capabilities.
 
 > [!WARNING]
-> `docker-compose.proxy.yml` trusts proxy headers and, in single-user
+> The app trusts proxy headers from private ranges and, in single-user
 > mode, relies on your reverse proxy to protect `/admin`. Keep the app's
 > upstream private to the proxy (shared Docker network, or a
 > loopback/firewalled published port). Do not expose the MCP container
@@ -395,11 +453,11 @@ rsync -avz ~/Obsidian/MyVault/ youruser@vps.example.com:/home/youruser/vault/
 
 ## Step 5. Initialize the database and verify
 
-If you used `docker-compose.simple.yml`, the database is created and
-migrated automatically on first start. Verify:
+The database is created and migrated automatically on first start.
+Verify:
 
 ```bash
-docker compose -f docker-compose.simple.yml exec postgres \
+docker compose exec postgres \
   psql -U obsidian_mcp -d obsidian_mcp -c '\dt'
 ```
 
@@ -423,14 +481,14 @@ hash. Keep that protection or replace it with one of the options below.
 
 ### Caddy basic auth (simplest)
 
-In `Caddyfile.example` (which `docker-compose.simple.yml` uses by
-default), replace the placeholder bcrypt hash. Generate a hash with:
+In `Caddyfile.example` (which `docker-compose.caddy.yml` mounts),
+replace the placeholder bcrypt hash. Generate a hash with:
 
 ```bash
 docker run --rm caddy:2 caddy hash-password --plaintext 'your-password'
 ```
 
-Restart Caddy: `docker compose -f docker-compose.simple.yml restart caddy`.
+Restart Caddy: `docker compose -f docker-compose.yml -f docker-compose.caddy.yml restart caddy`.
 
 ### IP allowlist
 
@@ -441,9 +499,11 @@ hostname.
 ### OAuth via traefik-forward-auth
 
 If you already run Traefik with `traefik-forward-auth` (Google or
-Authelia), use the included `docker-compose.yml` instead of
-`docker-compose.simple.yml`. The Traefik labels are pre-wired for a
-`chain-oauth@file` middleware.
+Authelia), layer `docker-compose.traefik.yml` on the base file. Its
+labels put `TRAEFIK_PANEL_MIDDLEWARE` (default `chain-oauth@file`) in
+front of `/admin`, `/api` and `/authorize`, and deliberately leave
+`/mcp`, `/transfer` and the OAuth endpoints outside it — those are
+authenticated by the application.
 
 The `/mcp` endpoint itself is *always* API-key protected at the
 application layer regardless of which option you pick. The auth above
@@ -572,7 +632,7 @@ deployment; on a compose-file deployment the equivalents are plain
 - **Upgrades.** Pull, rebuild, and bring the stack up again; migrations
   run on start. After a release that carries one, confirm the schema
   agrees with the models:
-  `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`
+  `docker compose exec obsidian-mcp alembic check`
   should print "No new upgrade operations detected."
 - **Backups.** `pg_dump` the database on a schedule; the vault itself is
   covered by whatever sync you chose in Step 4. Note that a soft delete

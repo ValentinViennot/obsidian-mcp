@@ -4,8 +4,11 @@ Deploy, upgrade, reindex, rotate keys, back up, restore, roll back. Written for
 the person who has to do this at an awkward hour, so every step is a command
 that can be pasted, and every step that can destroy something says so first.
 
-Related: [`rebase-on-upstream.md`](rebase-on-upstream.md) covers taking changes
-from the upstream project, which is a different problem and the harder one.
+Related: [`continuous-deployment.md`](continuous-deployment.md) covers the
+pipeline that does most of this automatically on a merge to `main`, and the
+secrets it needs. [`rebase-on-upstream.md`](rebase-on-upstream.md) covers taking
+changes from the upstream project, which is a different problem and the harder
+one.
 
 Throughout: `odoo` is the SSH alias for the production host, the stack is
 `obsidian-mcp`, and the vault lives at `/srv/obsidian`.
@@ -96,6 +99,13 @@ First deploy only. Subsequent releases are [Upgrade](#upgrade).
 ---
 
 ## Upgrade
+
+**A merge to `main` does all of this by itself** — see
+[`continuous-deployment.md`](continuous-deployment.md). `deploy.yml` takes the
+same backup, runs the same migration, waits for the same health check, and
+rolls the image back if it does not come up. What follows is the manual
+equivalent, for when the pipeline is what is broken, or when you are deploying
+something that never went through `main`.
 
 ```bash
 # 1. Know what you are shipping.

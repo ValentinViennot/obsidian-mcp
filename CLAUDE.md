@@ -42,6 +42,13 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
 - Registry: `localhost:5000` (or change in `Makefile`); CI also publishes to
   GHCR (`.github/workflows/publish-image.yml`)
 - Deploy: `make deploy` (build → scan → push → backup → migrate → recreate)
+- **CI/CD:** a merge to `main` publishes the image and rolls production onto
+  its digest — backup, `alembic upgrade head`, `up -d`, wait for `/health`,
+  **roll the image back if health does not come up**. `pr.yml` is the pre-merge
+  gate (`pr-gate` is the one required check) and `scripts/vps-deploy.sh` is the
+  half that runs on the host. See
+  [continuous deployment](docs/operations/continuous-deployment.md), including
+  the three things a rollback does *not* fix.
 
 ## Public repo — host paths live outside the tree
 This repo is published on GitHub. Anything host-specific (paths, secrets,

@@ -1,0 +1,212 @@
+# Turn a green publish on `main` into a live upgrade.
+#
+# WHY `workflow_run` AND NOT A JOB INSIDE publish-image.yml
+#
+# Three reasons, in order of how much they matter.
+#
+#   1. A deploy failure must not make the image publish look red. The image is
+#      good and pinnable whether or not the host took it; conflating the two
+#      makes "did the build work?" unanswerable at a glance.
+#   2. Deployment secrets stay out of the build job. `publish-image.yml` runs
+#      `docker build` on a checkout — the one job in this repo that executes
+#      arbitrary code from the tree. Handing it an SSH key into production
+#      widens that blast radius for no benefit.
+#   3. This workflow can be re-run on its own, from the Actions UI, without
+#      rebuilding. `workflow_dispatch` below takes a commit SHA, so redeploying
+#      a known-good release is one click and no new image.
+#
+# The cost of `workflow_run` is that GitHub always runs the copy of this file
+# that is on the default branch, and the checkout defaults to the default
+# branch too — so the SHA being deployed is read from the event and passed to
+# `actions/checkout` explicitly, ensuring the deploy script that runs matches
+# the image that is going out.
+#
+# REQUIRED SECRETS — see docs/operations/continuous-deployment.md for how to
+# generate them. Nothing here creates a key; the workflow fails with a named
+# list if any are missing.
+#
+#   VPS_SSH_KEY        private half of a deploy-only ed25519 keypair
+#   VPS_HOST           hostname or IP of the VPS, REACHABLE FROM A GITHUB RUNNER
+#
+# Optional:
+#   VPS_SSH_KNOWN_HOSTS   the host's public SSH key line; without it the
+#                         workflow trusts the first key it sees
+#   vars.VPS_SSH_USER     SSH user (default: root)
+#   vars.VPS_SSH_PORT     SSH port (default: 22)
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["Publish image"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA to deploy (must already be published). Defaults to the head of main."
+        required: false
+        type: string
+      skip_backup:
+        description: "Migrate without taking a fresh backup first. Only when the backup path is what is broken."
+        required: false
+        default: false
+        type: boolean
+
+# Never cancel a deploy in flight: the dangerous moment is between `up -d` and
+# the health verdict, and cancelling there is precisely how a stack is left
+# down unattended. A second deploy queues instead.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # A deployment record and a place to scope the secrets. Referencing an
+    # environment that does not exist creates it, unprotected — add required
+    # reviewers there if a deploy should ever need a human first.
+    environment: production
+    # `workflow_run` fires on failure and cancellation too; only success may
+    # deploy. Without this guard a red build would ship its (nonexistent) image
+    # and the deploy would fail confusingly at the pull instead of clearly here.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Resolve the commit being deployed
+        id: target
+        env:
+          EVENT_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          sha="${INPUT_SHA:-$EVENT_SHA}"
+          if [ -z "$sha" ]; then
+            sha="${{ github.sha }}"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Deploying commit $sha"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+
+      # Fail here, named, rather than 40 lines later inside ssh with a
+      # permission error nobody can read. This is the whole "clear message if
+      # the secret is absent" contract.
+      - name: Require the deployment secrets
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          missing=""
+          [ -n "$VPS_SSH_KEY" ] || missing="$missing VPS_SSH_KEY"
+          [ -n "$VPS_HOST" ] || missing="$missing VPS_HOST"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing"
+            echo "::error::Set them under Settings → Secrets and variables → Actions."
+            echo "::error::Generate the keypair as described in docs/operations/continuous-deployment.md."
+            exit 1
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `publish-image.yml` tags every build `sha-<full sha>`; that tag is
+      # resolved to the immutable digest here so the host is told exactly one
+      # thing and a rollback has an exact target. GHCR rejects an uppercase
+      # path, and `github.repository` is mixed case.
+      - name: Resolve the image digest
+        id: image
+        env:
+          SHA: ${{ steps.target.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          name="$REGISTRY/$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          tag="$name:sha-$SHA"
+          if ! digest="$(docker buildx imagetools inspect "$tag" --format '{{.Manifest.Digest}}' 2>/dev/null)"; then
+            echo "::error::No published image for $tag."
+            echo "::error::Publish it first (the Publish image workflow), then re-run this deploy."
+            exit 1
+          fi
+          echo "ref=$name@$digest" >> "$GITHUB_OUTPUT"
+          echo "Deploying $name@$digest"
+
+      - name: Configure SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+          VPS_SSH_PORT: ${{ vars.VPS_SSH_PORT || '22' }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if [ -n "$VPS_SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            # Trust-on-first-use. Acceptable only because the alternative is
+            # StrictHostKeyChecking=no, which is worse; set VPS_SSH_KNOWN_HOSTS
+            # to pin the host key properly.
+            echo "::warning::VPS_SSH_KNOWN_HOSTS is not set — accepting whatever host key answers."
+            ssh-keyscan -p "$VPS_SSH_PORT" -H "$VPS_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+          [ -s ~/.ssh/known_hosts ] || { echo "::error::No host key for $VPS_HOST."; exit 1; }
+
+      # The script is piped in over stdin rather than copied: nothing is left on
+      # the host, and the code that runs is unambiguously the code from the
+      # commit being deployed. It does everything that needs to happen on the
+      # far side — discover the compose project, back up, migrate, roll, verify
+      # health, roll back — so that the interesting logic is a reviewable,
+      # shell-checkable file instead of a heredoc inside YAML.
+      - name: Roll the stack
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_SSH_USER: ${{ vars.VPS_SSH_USER || 'root' }}
+          VPS_SSH_PORT: ${{ vars.VPS_SSH_PORT || '22' }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          SKIP_BACKUP: ${{ inputs.skip_backup && '--skip-backup' || '' }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=yes \
+              -o ConnectTimeout=15 \
+              -p "$VPS_SSH_PORT" \
+              "$VPS_SSH_USER@$VPS_HOST" \
+              "bash -s -- '$IMAGE_REF' $SKIP_BACKUP" < scripts/vps-deploy.sh
+
+      - name: Summary
+        if: always()
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          SHA: ${{ steps.target.outputs.sha }}
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            echo "### Deploy $RESULT"
+            echo ''
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`$SHA\` |"
+            echo "| image | \`${IMAGE_REF:-unresolved}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

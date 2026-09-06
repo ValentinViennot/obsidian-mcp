@@ -11,6 +11,10 @@
 #   scripts/test-in-docker.sh                  # whole suite
 #   scripts/test-in-docker.sh tests/test_x.py  # any pytest arguments
 #   REBUILD=1 scripts/test-in-docker.sh        # force the image to rebuild
+#   SKIP_BUILD=1 scripts/test-in-docker.sh     # never build; use the image as-is
+#   OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1 scripts/test-in-docker.sh
+#                                              # let the Postgres-only transfer
+#                                              # module skip instead of failing
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,7 +23,19 @@ IMAGE="obsidian-mcp-test:local"
 cd "$REPO_ROOT"
 
 needs_build=0
-if [ "${REBUILD:-0}" = "1" ]; then
+if [ "${SKIP_BUILD:-0}" = "1" ]; then
+  # CI builds the image itself, with a registry-backed layer cache, and then
+  # runs this script so that local and CI execute the same command against the
+  # same image definition. The staleness check below would defeat that: a
+  # cache-restored image carries its ORIGINAL creation timestamp, which is
+  # older than the mtimes a fresh checkout stamps on the manifests, so every
+  # run would discard the cache and rebuild from scratch.
+  needs_build=0
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "SKIP_BUILD=1 but $IMAGE does not exist — build it first." >&2
+    exit 1
+  fi
+elif [ "${REBUILD:-0}" = "1" ]; then
   needs_build=1
 elif ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   needs_build=1
@@ -52,6 +68,18 @@ if [ -n "${PGVECTOR_TEST_ADMIN_URL:-}" ]; then
   # host.docker.internal reaches a Postgres published on the host's loopback.
   env_args=(-e "PGVECTOR_TEST_ADMIN_URL=${PGVECTOR_TEST_ADMIN_URL}"
             --add-host=host.docker.internal:host-gateway)
+fi
+
+# tests/integration/test_transfer_pg.py FAILS rather than skips without a
+# database, on purpose — it is the mandatory Postgres gate for claim
+# linearizability and the publish barrier, and a silent skip there would be a
+# gate that is not a gate. That makes a database-less run exit non-zero even
+# when every offline test passed, which is fine for a human reading the summary
+# and fatal for a CI job reading the exit code. The module defines its own
+# explicit opt-out; it is forwarded rather than set here, so opting out stays a
+# deliberate act by the caller.
+if [ -n "${OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION:-}" ]; then
+  env_args+=(-e "OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=${OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION}")
 fi
 
 # The `${arr[@]+...}` guard is required: under `set -u`, expanding an empty

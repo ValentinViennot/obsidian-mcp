@@ -1,0 +1,191 @@
+# Pre-merge gate.
+#
+# `ci.yml` is upstream's workflow and stays upstream's: it runs the suite on a
+# bare runner with a real Postgres service, so the `tests/integration/` modules
+# actually execute, plus the schema gate, trivy and openspec. This workflow is
+# the *fork's* gate, and it exists for four things upstream's does not do:
+#
+#   1. Run the suite in `docker/test.Dockerfile` — the same image
+#      `scripts/test-in-docker.sh` runs locally. The vault containment layer is
+#      built on openat2(2), so "the tests pass" only means anything on Linux;
+#      sharing one image definition between the local runner and CI is what
+#      stops the two from drifting into different verdicts.
+#   2. gitleaks, against the `.gitleaksignore` baseline at the repo root.
+#   3. `scripts/check-vault-leak.py` — this fork is public and the vault is not.
+#   4. `docker compose config` on the three compose files this repo ships, so a
+#      YAML or interpolation mistake is caught here rather than on a host.
+#
+# Everything is a separate job so a failure names itself, and `pr-gate`
+# aggregates them into the one status check branch protection requires (see
+# scripts/setup-branch-protection.sh). Adding a job here does NOT require
+# touching branch protection, as long as it is listed in `pr-gate.needs`.
+name: PR
+
+on:
+  pull_request:
+    branches: [main]
+
+# `github.ref` is the PR's merge ref, so a push to a PR supersedes its own
+# in-flight run and never another PR's.
+concurrency:
+  group: pr-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned, not `latest`: a scanner that changes under us turns an unrelated PR
+  # red for reasons nobody in the PR can act on.
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.24.0
+
+jobs:
+  # The offline suite, in the image the maintainer runs locally.
+  #
+  # `scripts/test-in-docker.sh` denies the container network unless
+  # PGVECTOR_TEST_ADMIN_URL is set, which is deliberate and kept here: the
+  # `tests/integration/` modules skip themselves without it, and ci.yml is
+  # where they run for real. What this job proves is that the *offline* suite —
+  # the ~5,000 tests that gate every change — passes on a Linux kernel.
+  tests:
+    name: tests (container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built here rather than letting the script build it, so the dependency
+      # layer comes from the Actions cache instead of a cold `pip install` on
+      # every PR. `load: true` puts it in the local daemon under exactly the
+      # tag the script expects.
+      - name: Build the test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/test.Dockerfile
+          tags: obsidian-mcp-test:local
+          load: true
+          cache-from: type=gha,scope=test-image
+          cache-to: type=gha,mode=max,scope=test-image
+
+      # SKIP_BUILD=1 because the image was just built above. Without it the
+      # script's staleness check compares the image's *creation* timestamp —
+      # which comes from the cache and can predate the checkout — against the
+      # manifests' mtimes, and rebuilds from scratch on every run.
+      #
+      # OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1 is the opt-out
+      # tests/integration/test_transfer_pg.py defines for itself. That module
+      # FAILS rather than skips without a database, deliberately, so a run with
+      # no Postgres exits non-zero however green the offline suite was. Opting
+      # out here is not weakening the gate: ci.yml runs that module for real,
+      # against a pgvector service, on this same pull request. Taking it here
+      # too would mean standing up a second Postgres to run the same tests
+      # twice.
+      - name: Run the suite
+        env:
+          SKIP_BUILD: "1"
+          OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION: "1"
+        run: scripts/test-in-docker.sh -q -rs
+
+  # Secret scan over the full history, against the reviewed `.gitleaksignore`
+  # fingerprints. fetch-depth: 0 is load-bearing — those fingerprints are
+  # commit-scoped, and a shallow clone would scan a handful of commits and
+  # report a clean tree it never looked at.
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Two flags carry weight here.
+      #
+      # `-v` prints the finding — file, line, rule and fingerprint. Without it
+      # a failure is the single line "leaks found: 1", which tells whoever
+      # opened the PR nothing they can act on and nothing they could paste into
+      # `.gitleaksignore` if it turns out to be a false positive.
+      #
+      # `--redact` keeps the secret itself out of a public build log, which is
+      # the one place a real finding must not be republished.
+      #
+      # And gitleaks exits 0 when the scan itself *fails* (a bad repo path makes
+      # it log "partial scan completed" and report no leaks), so the exit code
+      # alone is not a gate either. The log is checked for the line that only a
+      # completed scan prints. House rule: a gate that silently skips is not a
+      # gate.
+      - name: Scan
+        run: |
+          set -o pipefail
+          docker run --rm -v "$PWD:/repo" "$GITLEAKS_IMAGE" \
+            detect --source /repo --redact --no-banner -v --exit-code 1 \
+            2>&1 | tee gitleaks.log
+          if ! grep -qE '[0-9]+ commits scanned' gitleaks.log; then
+            echo "::error::gitleaks did not complete a scan — treating as a failure."
+            exit 1
+          fi
+
+  # No-ops without VAULT_LEAK_CHECK_PATH, which is correct: the denylist is
+  # built from the live vault and nobody but its owner has one. It is wired up
+  # anyway so the script cannot rot unnoticed — an import error or a rename
+  # fails here, months before the maintainer next runs it by hand.
+  vault-leak:
+    name: vault-leak
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: scripts/check-vault-leak.py
+        run: python3 scripts/check-vault-leak.py
+
+  # `docker compose config` resolves and validates every interpolation. All
+  # three files declare `env_file: .env`, and compose refuses outright when it
+  # is missing — so `.env.example` is copied into place, which validates the
+  # shipped example at the same time.
+  compose-config:
+    name: compose-config
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate the compose files
+        run: |
+          cp .env.example .env
+          for file in docker-compose.yml docker-compose.simple.yml docker-compose.proxy.yml; do
+            echo "==> $file"
+            docker compose -f "$file" config --quiet
+          done
+
+  # The single required status check. `if: always()` so it runs even when a
+  # dependency failed — a skipped job reports no status at all, which branch
+  # protection reads as "still pending" and waits on forever.
+  pr-gate:
+    name: pr-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs: [tests, gitleaks, vault-leak, compose-config]
+    steps:
+      - name: Check the results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            if [ "$result" != "success" ]; then
+              echo "::error::A required PR check did not succeed ($RESULTS)."
+              exit 1
+            fi
+          done
+          echo "All PR checks passed."

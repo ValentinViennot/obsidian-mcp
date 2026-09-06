@@ -49,6 +49,8 @@ to a logger because **a caller drives it through the login form**: one corrupted
 column plus a scripted login loop is an unbounded flood channel, and every
 caller-triggerable refusal in this server is bounded by the same suppressor.
 """
+import secrets
+
 import bcrypt
 
 from src.services import security_events
@@ -121,6 +123,33 @@ def hash_password(plain: str) -> str:
     if "\x00" in plain:
         raise ValueError("password must not contain NUL bytes")
     return bcrypt.hashpw(_prepare(plain), bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)).decode("ascii")
+
+
+def unusable_password_hash() -> str:
+    """A well-formed bcrypt hash of a secret nobody holds — for a federated row.
+
+    `users.password_hash` is `NOT NULL`, and a user created by the OIDC
+    callback (`AUTH_MODE=pocketid`) has no local password at all. Three ways to
+    fill that column were considered and two are worse:
+
+    * A **sentinel string** like `"!"` or `""`. `verify_password` hands it to
+      `checkpw`, which raises on anything that is not a bcrypt hash, so every
+      attempt against such a row would emit `password_hash_malformed` — an
+      event that is supposed to mean "this column is corrupt, go fix that one
+      account" and would instead fire routinely for rows that are exactly as
+      intended. A real alarm turned into noise is a real alarm lost.
+    * A **fixed** hash shared by every federated row. One offline crack, once,
+      and every such account has a working password the moment an operator
+      switches back to `AUTH_MODE=local`.
+
+    So: a fresh 48-byte CSPRNG secret, hashed at the module's own cost factor
+    and immediately discarded. The column is well-formed, `verify_password`
+    returns False without raising and without a record, and there is no
+    preimage for anybody to find — including us. If such a user ever needs a
+    local password, an administrator sets one through the existing reset path,
+    which is the same answer as for any account whose password is unknown.
+    """
+    return hash_password(secrets.token_urlsafe(48))
 
 
 def verify_password(plain: str, hashed: str, *, user_id: int | None = None) -> bool:

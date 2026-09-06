@@ -57,7 +57,7 @@ from src.mcp_server.read_result import (
     screen_unrenderable,
 )
 from src.models.db import UsageLog
-from src.services import rate_limits, refusals, security_events, timing
+from src.services import git_vault, rate_limits, refusals, security_events, timing
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
@@ -167,6 +167,52 @@ def _actor_columns() -> dict:
     `tools._ACTOR_LABEL_MAX` has to learn where they moved.
     """
     return actor_columns()
+
+
+def _git_principal() -> str | None:
+    """Who a vault commit names as the principal, or `None`.
+
+    The API key's name or the OAuth client's name — the same
+    `current_actor` label `usage_logs` already denormalises, read through the
+    one reader that owns it (`actor_columns`) so the commit trailer and the
+    usage row can never disagree about who the caller was.
+
+    Falls back to the *kind* (`api_key` / `oauth`) when the credential carries
+    no label, and to `None` for a caller with no request context at all — a
+    direct in-process call, a test. `build_message` renders that as `unknown`,
+    which is the honest answer and is still better than omitting the trailer:
+    an absent `Principal:` reads as "this commit predates the scheme".
+    """
+    actor = _actor_columns()
+    return actor.get("actor_label") or actor.get("actor_kind")
+
+
+async def _commit_vault_writes(tool_name: str) -> None:
+    """Commit whatever this call published. **Never raises, never delays a failure.**
+
+    Awaited by `_tracked` after the body has completed and its result is
+    already decided. That ordering is the whole contract: by the time this
+    runs, `_atomic_write_at` has published bytes through an `fsync`ed staging
+    inode and the caller's answer is fixed, so there is nothing here that can
+    fail the write and nothing that may try.
+
+    It is awaited *before* the result is returned rather than scheduled as a
+    background task, because "the commit exists by the time the agent is told
+    the write succeeded" is a property worth a few tens of milliseconds — a
+    fire-and-forget task would reorder against the next call's commit and could
+    be dropped entirely at shutdown, which is exactly when a partial history is
+    most confusing.
+
+    **There is no `try` here, deliberately.** `git_vault.commit_recorded`
+    guards its own whole body and answers False rather than raising, so a
+    second handler at this call site would be belt-and-braces over a guarantee
+    the callee already makes — and its `except` would need a bare
+    `logger.warning` in this module, which D18 forbids for a record a caller
+    can drive (`tests/test_issue_190_field_allowlist.py`). One guard, in the
+    module that owns the operation, is also what keeps the *reason* for the
+    swallow beside the code that swallows.
+    """
+    await git_vault.commit_recorded(tool_name, _git_principal())
 
 
 # PostgreSQL SQLSTATE for foreign_key_violation — the only insert failure
@@ -1350,6 +1396,23 @@ def _tracked(
             # above all (#192). Same lifecycle as the timing holder, reset in
             # the same `finally`.
             name_token = _current_tool_name.set(tool_name)
+            # The vault-commit accumulator, on the same lifecycle and for the
+            # same reason. Only a write-class tool opens one — a read tool can
+            # publish nothing, so a holder there would be a per-call ContextVar
+            # set that no code path could ever fill.
+            #
+            # **This is why the commit hook is here and not in
+            # `vault._atomic_write_at`.** The primitive knows a descriptor and
+            # some bytes and nothing else: not which tool is running, not who
+            # is calling, and not whether this particular publication is one an
+            # agent asked for — it is also the write path for internal
+            # machinery (`move_note`'s own rollback, the transfer publication)
+            # that must not mint an `mcp(...)` commit. This decorator already
+            # resolves the tool and the principal for the rate limiter and the
+            # usage row, so each tool body contributes only what it alone knows
+            # — which path it just published — and the decorator contributes
+            # the identity, once, after the body has finished.
+            git_token = git_vault.begin() if write_class else None
 
             def named_params() -> dict:
                 """The row's named arguments, truncated. No outcome markers.
@@ -1621,10 +1684,26 @@ def _tracked(
                         tool=tool_name,
                         error_type=type(tail_exc).__name__,
                     )
+                # **After the usage row, before the result goes back.** After,
+                # so `duration_ms` measures the tool and not the commit — a
+                # latency view that folded git into `edit_note` would report a
+                # slow filesystem as a slow tool. Before the return, because
+                # "the commit exists by the time the agent is told the write
+                # succeeded" is the property that makes the history usable, and
+                # a background task would reorder against the next call's
+                # commit and be dropped outright at shutdown.
+                #
+                # Nothing was recorded unless a publication actually succeeded,
+                # so a refusal, a `dry_run` and a `No changes` result all reach
+                # this line and do nothing.
+                if git_token is not None:
+                    await _commit_vault_writes(tool_name)
                 return result
             finally:
                 timing.clear(token)
                 _current_tool_name.reset(name_token)
+                if git_token is not None:
+                    git_vault.clear(git_token)
 
         # Structural marker. `tests/test_issue_66_*` asserts that every tool
         # registered on the MCP server delegates to something carrying it, so
@@ -3004,6 +3083,12 @@ async def create_note_impl(
             )
             if err:
                 return err
+            # The publication stood. `target.rel` and not `path`: the caller's
+            # string is normalised by `open_mutable` (empty and `.`
+            # components dropped, the `.md` suffix appended above), and the
+            # only path git may be handed is the one the bytes actually landed
+            # on — the same reason `_write_cap_for` reads `target.rel`.
+            git_vault.record_write(target.root, target.rel)
             # D9: the bytes this call published, which `_atomic_write_at`
             # encoded exactly this way.
             return f"Created note: {path}" + _published_hash_clause(
@@ -4021,6 +4106,7 @@ async def edit_note_impl(
             return str(e)
         except OSError as e:
             return f"Failed to write {path}: {e}"
+        git_vault.record_write(target.root, target.rel)
         return success_message + _published_hash_clause(
             new_content.encode("utf-8")
         )
@@ -4990,6 +5076,16 @@ async def _move_note_locked(
             return err
         if verify_error:
             return verify_error
+        # The rename has stood — and it is *both* ends of it that git has to
+        # be told about, because a rename is a deletion at one path and a
+        # creation at the other. Recorded here rather than at the end of the
+        # tool: every branch below this line is a **post-rename partial
+        # outcome** (a failed metadata update, a failed link rewrite, a
+        # reassignment that stops the loop) which returns early, and the move
+        # itself stands in all of them. A record placed after them would omit
+        # the commit precisely when the history is most needed.
+        git_vault.record_write(src_target.root, from_rel)
+        git_vault.record_write(dst_target.root, to_rel)
         # The root the move completed in, for the partial-outcome report. It
         # is the target's own canonical assignment string, which is exactly
         # what the confirmation was checked against — no second source of
@@ -5222,6 +5318,13 @@ async def _move_note_locked(
             if outcome == "failed":
                 failed_rewrite_sources.append(write_path)
             else:
+                # This source's rewrite published. Recorded per source rather
+                # than as one list at the end, so a loop that stops half way
+                # (a reassignment, a confirmation outage) commits exactly the
+                # sources that were actually rewritten and none of the ones it
+                # never reached. The moved note's own rewrite records
+                # `to_rel` a second time; `commit_recorded` dedupes.
+                git_vault.record_write(write_target.root, write_target.rel)
                 rewrites_done += n
                 files_modified += 1
                 if is_moved_note:
@@ -5370,6 +5473,13 @@ async def delete_note_impl(
                     return err
             except OSError as e:
                 return f"Permanent delete failed: {e}"
+            # A deletion is a commit like any other: `git add -A -- <path>` on
+            # a path that no longer exists stages the removal, so the same
+            # helper covers it and there is no second code path to keep in
+            # step. Without it a deleted note would sit as an uncommitted
+            # removal until the sweep, and `git log -- <path>` would place the
+            # deletion minutes after it happened and attribute it to nobody.
+            git_vault.record_write(target.root, target.rel)
             return f"Permanently deleted: {path}"
 
         # One `renameat2(RENAME_NOREPLACE)` from the note's own parent
@@ -5413,6 +5523,14 @@ async def delete_note_impl(
             return str(e)
         except OSError as e:
             return f"Soft-delete failed: {e}"
+        # Only the source path. The `.trash/` destination is ignored by
+        # `deploy/vault.gitignore` on purpose — a trash directory is a
+        # recycle bin, not history, and committing it would keep every deleted
+        # note's bytes in the repository for ever under a timestamped name,
+        # which is the opposite of what a soft delete is for. So from git's
+        # point of view a soft delete is a deletion, and the bytes remain
+        # recoverable from both `.trash/` and the commit's parent.
+        git_vault.record_write(target.root, target.rel)
         return f"Soft-deleted: {path} → {dest}"
 
 
@@ -5687,6 +5805,7 @@ async def set_frontmatter_impl(
         except OSError as e:
             return f"Failed to write {path}: {e}"
 
+        git_vault.record_write(target.root, target.rel)
         summary: list[str] = []
         if set_keys:
             summary.append(f"set: {', '.join(set_keys)}")
@@ -5956,6 +6075,7 @@ async def write_file_impl(
             return str(e)
         except OSError as e:
             return f"Failed to write {path}: {e}"
+        git_vault.record_write(target.root, target.rel)
         result = f"Wrote {len(data):,} bytes to {path}"
         if over_cap or len(data) > read_cap:
             return result + (
@@ -6573,6 +6693,11 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
         # "could not write" retries, and a retry of an import that already
         # landed is either a redundant fetch or — with overwrite — a second
         # write over the first. Say what is actually true instead.
+        # The bytes ARE at `rel`, so they are committed like any other write.
+        # Recording here and not only on the success path is the same
+        # reasoning the message itself carries: "the bookkeeping did not
+        # finish" must not become "and the history says nothing happened".
+        git_vault.record_write(root, rel)
         return (
             f"Imported the file to {rel}, but the server could not finish "
             f"recording the import: {e}\n"
@@ -6591,6 +6716,15 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
     except OSError as e:
         return f"Could not write {rel}: {e}"
 
+    # `import_from_url` is the eighth write-class tool and publishes vault
+    # bytes through an authenticated MCP call like the other seven, so it
+    # commits like them. (`PUT /transfer/upload` also publishes vault bytes,
+    # and deliberately does **not** commit here: it is not a tool call, runs
+    # under a capability rather than in a `_tracked` body, and has no
+    # accumulator to record into. Its writes are the reconcile sweep's, which
+    # is the honest attribution — the capability's minter chose the path, not
+    # the party that streamed the bytes.)
+    git_vault.record_write(root, rel)
     return (
         f"Imported {written['size']:,} bytes to {rel}\n"
         f"sha256: {written['sha256']}\n"
@@ -6727,7 +6861,13 @@ async def delete_file_impl(
     except OSError as e:
         return f"Failed to delete {rel}: {e}"
     if precondition_refusal is not None:
+        # The delete did not happen: `_delete` returns before any destructive
+        # step when the precondition fails. Nothing to record — and the check
+        # has to stay above the record, not below it.
         return precondition_refusal
+    # Both forms remove `rel` from the visible tree, and `.trash/` is ignored
+    # (see `delete_note_impl`), so git sees one deletion either way.
+    git_vault.record_write(root, rel)
     if permanent:
         return f"Permanently deleted {rel}"
     return (

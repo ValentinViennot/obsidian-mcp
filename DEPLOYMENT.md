@@ -273,22 +273,114 @@ handles the VPS side, Obsidian Sync handles cross-device.
 
 ### Option C. Git
 
-Treat the vault as a git repo. Agents commit their writes, you pull on
-your laptop. This works *only* if you're disciplined about commit
-hygiene and don't mind merging. It's the most fragile option for
-real-time use, but the simplest to set up.
+Treat the vault as a git repo: a bare repo somewhere both machines can
+reach, a working clone on the VPS, and a working clone on your laptop
+that Obsidian opens directly. The server commits every agent write as
+it happens, a timer sweeps up anything edited out of band, and the two
+clones stay in step by ordinary pull/push.
+
+The point of doing it this way is attribution. Six months later you
+will want to know *when* a paragraph appeared and whether you or an
+agent wrote it, and `git blame` is the only thing that answers that —
+which it can only do if the commits exist and carry an identity. Agent
+commits are authored by `GIT_AGENT_NAME`; yours are authored by you.
+
+The pieces live in [`deploy/`](deploy/).
+
+**1. The ignore file, first.** Copy
+[`deploy/vault.gitignore`](deploy/vault.gitignore) to the vault root as
+`.gitignore` and commit it *before* the first `git add -A`. Obsidian's
+`workspace.json` churns many times a minute and conflicts on every
+sync; plugin caches and generated indexes reach hundreds of megabytes
+and do not delta-compress. Git keeps every version of every blob it has
+ever tracked, so the cheap moment to exclude them is the one before the
+first commit.
 
 ```bash
-# On the VPS
-cd /path/to/vault
-git init
+# On the VPS, in the vault
+cd /srv/obsidian-vault
+cp /opt/obsidian-mcp/deploy/vault.gitignore .gitignore
+git init -b main
+git add -A && git commit -m "vault: initial import"
 git remote add origin git@github.com:you/private-vault.git
+git push -u origin main
 ```
 
-Wire the MCP server to commit after each write. See `IMPROVEMENTS.md`
-"Vault revision safety" for the rationale (it was deferred because
-daily backups covered the maintainer's needs, but the design notes are
-there).
+**2. Turn on commit-on-write** in `.env`:
+
+```bash
+GIT_VAULT_ENABLED=true
+GIT_COMMIT_ON_WRITE=true
+GIT_AGENT_NAME=obsidian-mcp agent
+GIT_AGENT_EMAIL=agent@obsidian-mcp.invalid
+```
+
+Every `create_note` / `edit_note` / `move_note` / `set_frontmatter` /
+`write_file` / `delete_note` / `delete_file` / `import_from_url` then
+makes its own commit, named for the tool and the credential:
+
+```
+mcp(edit_note): update Projects/Roadmap.md
+
+Tool: edit_note
+Principal: laptop-key
+```
+
+Those are real git trailers, so
+`git log --format='%(trailers:key=Principal,valueonly)'` and
+`git log --grep '^mcp(delete_note)'` both work.
+
+Two properties worth knowing before you rely on this:
+
+- **A git failure never fails or rolls back a write.** The bytes are
+  already on disk when the commit is attempted; a failure is logged at
+  WARNING and swallowed, and the sweep picks the change up on its next
+  tick. `git blame` can be a few minutes stale; the vault is never
+  wrong.
+- **Nothing here writes git config.** The identity travels in
+  `GIT_AUTHOR_*` / `GIT_COMMITTER_*` on the one `git commit`
+  invocation, precisely so your laptop's clone of the same repository
+  keeps attributing your commits to you.
+
+**3. Install the sweep.** Copy
+[`deploy/vault-reconcile.sh`](deploy/vault-reconcile.sh) and the units
+in [`deploy/systemd/`](deploy/systemd/), edit `VAULT_DIR`, `User=` and
+the two `GIT_AGENT_*` values in the `.service` to match your `.env`,
+then:
+
+```bash
+sudo cp deploy/systemd/obsidian-vault-reconcile.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now obsidian-vault-reconcile.timer
+sudo systemctl enable --now obsidian-vault-reconcile.path
+```
+
+Every two minutes it commits anything edited out of band (Obsidian
+writing straight into the mount, a file copied in over ssh), then
+`git pull --rebase --autostash` and `git push`. On a genuine conflict —
+the same note changed in both clones — it aborts the rebase, leaves the
+tree usable, and exits non-zero, so the unit shows up in
+`systemctl --failed` instead of the divergence going unnoticed. It does
+not attempt to resolve anything itself.
+
+**4. Optional: make a push land immediately.** Install
+[`deploy/hooks/post-receive`](deploy/hooks/post-receive) in the *bare*
+repo. It touches a flag file that the `.path` unit watches, so a push
+from your laptop reaches the server's clone in about a second instead
+of at the next tick.
+
+It is deliberately **not** a `checkout -f` hook, which is the usual
+bare-repo pattern. The server's working tree carries its own
+uncommitted agent writes, and `checkout -f` means "destroy whatever
+disagrees with this commit" — a push from the laptop would silently
+delete an agent's work from your single source of truth, with no error
+anywhere. The sweep commits the local work first and rebases on top of
+it instead.
+
+**Conflicts.** This option's conflicts are git conflicts, which are
+loud and resolvable, rather than Nextcloud's silent conflict-copy
+files. The same practical advice applies: don't run agent writes on a
+note you have open in Obsidian.
 
 ### Option D. rsync from local
 

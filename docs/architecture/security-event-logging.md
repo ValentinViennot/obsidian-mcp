@@ -341,11 +341,45 @@ note, to bound records that tell the caller nothing it can act on. If the
 volume matters before that bucket lands, the answer is a counter at the flush
 helpers rather than an event inside the publish.
 
+The third shape is **the vault-commit failure notices** in
+`src/services/git_vault.py`, added with the git-backed vault. Every one of them
+fires after an MCP write has already published its bytes, and every one says
+the same thing: the write stands and its commit did not happen. They are
+reachable only from a write-class tool, so `MCP_WRITE_RATE_LIMIT_PER_MINUTE`
+already bounds the rate at which a credential can produce them — the same bound
+R10 relies on — and in practice a broken repository yields one line per write
+rather than a burst per write.
+
+What makes them a distinct entry rather than a reuse of R10's wording is the
+second reason. **Commit-on-write is an audit mechanism, and these lines are the
+only statement anywhere that its trail has a gap in it.** A suppressor that
+withheld the ninth of them would be hiding exactly the fact an operator needs —
+"nothing has been committed since 14:02" — in order to protect a log sink from
+a message that only appears when something is already wrong. None of them is a
+refusal, none is reachable by an unauthenticated caller, and none can carry
+credential material: `git add`, `git commit` and `git reset` involve no network
+and no credentials, and only git's first stderr line is quoted, control-stripped
+and bounded to 200 characters. The decision is quoted verbatim at each entry:
+
+> post-publication vault-commit failure on a successful write; reachable only
+> from a write-class tool and therefore already bounded by the write bucket,
+> and deliberately not routed through the suppressor because commit-on-write is
+> an audit mechanism and these lines are the only statement that its trail has
+> a gap — a bound that withheld them would hide the very fact it exists to
+> preserve
+
+`src/mcp_server/tools.py` gains **no** bare logger from that change:
+`git_vault.commit_recorded` guards its own whole body and answers `False`
+rather than raising, so the decorator's call site needs no handler of its own
+and therefore no message of its own.
+
 Each entry carries its justification in the test, and the list itself is
 asserted — a new exemption is a decision somebody has to write down, not a
 line somebody can add. So is the *scope*: round 2's three findings and round
 3's two were all "a sibling change added a call to a module the list did not
-name", so the guarded-module list is asserted too.
+name", so the guarded-module list is asserted too — and
+`src/services/git_vault.py` was added to it in the same change that created the
+module, rather than after somebody noticed.
 
 ## The suppressor: one allowance check, on a subject a caller cannot mint
 

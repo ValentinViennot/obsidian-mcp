@@ -1,55 +1,124 @@
-# .gitignore for a git-backed Obsidian vault.
+# .gitignore template for an Obsidian vault kept in git.
 #
-# Copy this to the root of the vault repository. Two things drive every rule
-# here: keeping per-machine state out of a repo that two machines push to, and
-# keeping plugin caches out of a repo that is meant to stay small enough to
-# clone quickly. On the vault this was written for, plugin caches were 91% of
-# the directory and a single cache file was 236 MB — committed once, that file
-# is in the history forever.
+# Copy to the vault root as `.gitignore` and commit it FIRST — before the first
+# `git add -A`. Git stores every version of every blob it has ever tracked, for
+# ever: a plugin cache added once and ignored afterwards still lives in the pack
+# files, and getting it out means rewriting history in both clones. The cheap
+# moment is the one before the first commit.
+#
+# What follows is grouped by *why*, because the reasons are different and an
+# operator adapting this needs to know which rules are taste and which are load
+# bearing.
 
-# --- Obsidian per-machine state -------------------------------------------
-# Which panes are open, where the cursor is, which file is focused. Changes
-# constantly, means nothing to anyone else, and conflicts on every sync.
+
+# ── 1. Editor state that is per-machine, not per-vault ───────────────────────
+#
+# `workspace.json` records which panes are open, their sizes, the active file
+# and the recent-files list. Obsidian rewrites it constantly — on every pane
+# change, so many times a minute while somebody is working — and its content is
+# meaningless on the other machine.
+#
+# Tracked, it is the single worst rule in this file: it produces a conflicting
+# commit almost every sweep, on both clones, and those conflicts are what make
+# people give up on syncing a vault with git. Everything else in `.obsidian/`
+# (settings, hotkeys, themes, plugin configuration) is genuinely shared and
+# genuinely worth versioning, so the exclusion is these two files by name
+# rather than the whole directory.
 .obsidian/workspace.json
 .obsidian/workspace-mobile.json
 
-# Settings themselves (appearance, hotkeys, enabled plugins) ARE tracked, so
-# configuration follows the vault to a new machine.
 
-# --- Plugin caches and generated indexes ----------------------------------
-# Semantic-search and AI plugins build large local indexes beside the notes.
-# They are derived data: regenerable, machine-specific, and enormous.
-.smart-env/
-.obsidian/plugins/*/data.json.bak
-.obsidian/plugins/*/*.log
-
-# Embedding/index shards, whatever plugin emits them.
-*.ajson
-
-# Copilot-style conversation indexes, which can reach hundreds of megabytes.
-.obsidian/copilot-index*.json
-.obsidian/**/copilot-index*.json
-copilot-index*.json
-
-# --- Nested vaults ---------------------------------------------------------
-# A subdirectory with its own .obsidian/ is a separate vault. Track its notes,
-# but not its own per-machine state.
-**/.obsidian/workspace.json
-**/.obsidian/workspace-mobile.json
-
-# --- Obsidian soft-delete --------------------------------------------------
-# Deleted notes land here. Git is the undo mechanism now.
+# ── 2. The soft-delete bin ───────────────────────────────────────────────────
+#
+# `delete_note` and `delete_file` rename into `.trash/` under a timestamped
+# name rather than unlinking, and Obsidian's own "move to trash" does the same.
+# Tracking it would keep every deleted note's bytes in the repository for ever
+# under a name nobody will ever look up — while the deletion commit's parent
+# already holds those bytes, addressable by path and by date. A recycle bin is
+# not history.
 .trash/
 
-# --- OS and sync artefacts -------------------------------------------------
+
+# ── 3. Filesystem litter ─────────────────────────────────────────────────────
 .DS_Store
-**/.DS_Store
-Icon?
 ._*
 .Spotlight-V100
 .Trashes
 Thumbs.db
+desktop.ini
 
-# --- Editor / tooling ------------------------------------------------------
-*.swp
-*~
+
+# ── 4. Plugin caches and generated indexes — the size rule ───────────────────
+#
+# This is the section that decides whether the repository stays a few hundred
+# megabytes or becomes tens of gigabytes.
+#
+# Several popular plugins keep a derived index *inside the vault*: embeddings,
+# full-text indexes, link graphs, transcription caches. In a real vault these
+# reach hundreds of megabytes, they are rewritten wholesale rather than
+# incrementally, and they are pure functions of content that is tracked anyway —
+# so every sweep commits a fresh copy of the whole thing, and `git gc` cannot
+# help because consecutive versions of a binary or line-shuffled index do not
+# delta well. A vault that would have been 300 MB of markdown becomes an
+# unclonable repository within weeks.
+#
+# The patterns are written by *shape* rather than by plugin name, because the
+# plugin list changes and an operator will not revisit this file. Two named
+# examples are called out where the shape alone would not catch them.
+
+# Any cache-shaped directory under a plugin, at any depth.
+.obsidian/plugins/**/cache/
+.obsidian/plugins/**/.cache/
+.obsidian/plugins/**/caches/
+.obsidian/plugins/**/tmp/
+.obsidian/plugins/**/temp/
+
+# Any index-shaped directory or file under a plugin. `.obsidian/plugins/*/data.json`
+# is deliberately NOT here: that is a plugin's *settings*, which are small and
+# worth versioning.
+.obsidian/plugins/**/index/
+.obsidian/plugins/**/indexes/
+.obsidian/plugins/**/*.index
+.obsidian/plugins/**/*.idx
+.obsidian/plugins/**/*.db
+.obsidian/plugins/**/*.sqlite
+.obsidian/plugins/**/*.sqlite3
+
+# Embedding and vector stores, wherever a plugin decided to put them.
+**/*.ajson
+**/embeddings/
+**/*.embeddings.json
+**/*.vectors.json
+
+# Smart Connections (`.smart-env/`) and Copilot (`copilot-index/`) write outside
+# `.obsidian/`, at the vault root, in shard files that a shape-based rule above
+# would otherwise miss entirely. `*.ajson` above is Smart Connections' shard
+# format; these cover the directories themselves.
+.smart-env/
+.smart-connections/
+copilot-index/
+
+# Obsidian's own generated caches.
+.obsidian/cache
+.obsidian/graph.json.bak
+
+# Excalidraw and similar plugins download scripts and fonts into the vault.
+# They are third-party code, restored by the plugin on demand, and large.
+**/Excalidraw/Scripts/Downloaded/
+
+
+# ── 5. A nested vault's own configuration ────────────────────────────────────
+#
+# A vault often contains another vault as a subdirectory — an archive opened
+# separately, a shared folder somebody else's Obsidian also points at. Its
+# `.obsidian/` is that vault's configuration, not this one's: it has its own
+# `workspace.json` churning on its own machine, its own plugin caches (which the
+# rules above are anchored at `.obsidian/…` and therefore do NOT reach at a
+# nested path), and versioning it here means two vaults fighting over one file.
+#
+# The pattern excludes `.obsidian/` at every depth and then re-includes this
+# vault's own, at the root. Order matters: the negation must come after the
+# exclusion, and the leading `/` is what makes it mean "the root one, and only
+# that one".
+**/.obsidian/
+!/.obsidian/

@@ -1,0 +1,30 @@
+[Unit]
+Description=Reconcile the Obsidian vault working clone every two minutes
+Documentation=file:///opt/obsidian-mcp/deploy/vault-reconcile.sh
+
+[Timer]
+Unit=obsidian-vault-reconcile.service
+
+# Two minutes. The bound this sets is how long an out-of-band edit — an Obsidian
+# client writing straight into the mounted vault — stays uncommitted, and
+# therefore how much work a `git blame` places at the wrong moment. It is not
+# the latency of an agent write, which commits immediately in-process, nor of a
+# desktop push, which triggers a run through the `.path` unit beside this file.
+OnBootSec=2min
+OnUnitActiveSec=2min
+
+# **`Persistent=true` earns its place here.** The server is a container host
+# that gets rebooted for kernel updates, and without this a reboot spanning a
+# tick simply skips it: whatever an Obsidian client wrote before the shutdown
+# stays uncommitted, and the next `git add -A` will attribute it to whenever the
+# timer next happens to fire. With it, the missed run happens at boot and the
+# out-of-band edits are committed close to when they were made.
+Persistent=true
+
+# Two minutes is short enough that an exactly-periodic timer is just noise
+# against the other periodic work on the box. Spread it.
+RandomizedDelaySec=15
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

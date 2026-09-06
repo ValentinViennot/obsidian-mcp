@@ -174,6 +174,29 @@ update it in the same change.** What stays here is the short list:
   grants and pre-existing NULL-limit keys therefore have **velocity bounds
   only**, owner-accepted. **Concurrency is not bounded at all** — deferred to
   `mcp-concurrency-slots`, which ships in shadow mode first.
+- **The vault may be a git working clone, and every MCP write then makes its
+  own commit.** `GIT_VAULT_ENABLED` (default **false** — a non-git vault is
+  fully supported and stays the default) plus `GIT_COMMIT_ON_WRITE`.
+  `src/services/git_vault.py` carries the whole rationale; the four rules that
+  must not be silently reversed are: **a git failure never fails or rolls back
+  a write** (the bytes are published before any commit is attempted, so there
+  is nothing to roll back — the failure is logged at WARNING and swallowed);
+  **global and repo git config are never touched** (the same repository is
+  cloned on the owner's desktop where commits must stay attributable to the
+  human, so identity travels in `GIT_AUTHOR_*`/`GIT_COMMITTER_*` per
+  invocation); **the index is never left half-staged** (a failed commit
+  unstages exactly the paths it staged, or the sweep would later commit them
+  under "changed outside the MCP server"); and **one git process at a time**,
+  behind a process-local `asyncio.Lock` — which is sound for the same
+  `--workers 1` reason the rate limiter is, and breaks the same way with a
+  second worker. The hook is at the eight write-class `_impl` call sites, which
+  know the path, feeding a per-call ContextVar that `_tracked` — which already
+  resolves the tool and the principal — flushes into one commit; **not** in
+  `vault._atomic_write_at`, which knows neither and is also the write path for
+  internal machinery that must produce no commits. `deploy/` holds the
+  reconcile sweep (out-of-band edits, `pull --rebase --autostash`, `push`), its
+  systemd units, the bare-repo `post-receive` (a flag file, deliberately not a
+  `checkout -f` — see the comment there), and the vault `.gitignore` template.
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 

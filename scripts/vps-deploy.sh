@@ -87,12 +87,12 @@ esac
 # Discover the compose project from the live container
 # ---------------------------------------------------------------------------
 
-docker inspect "$CONTAINER" >/dev/null 2>&1 || die \
+docker container inspect "$CONTAINER" >/dev/null 2>&1 || die \
   "no container named '$CONTAINER' on this host. The stack has never been
   deployed here, and this script rolls an existing stack rather than creating
   one. Run DeployStack in Komodo once, then re-run the deploy workflow."
 
-label() { docker inspect -f "{{index .Config.Labels \"$1\"}}" "$CONTAINER"; }
+label() { docker container inspect -f "{{index .Config.Labels \"$1\"}}" "$CONTAINER"; }
 
 PROJECT="$(label com.docker.compose.project)"
 WORKDIR="$(label com.docker.compose.project.working_dir)"
@@ -134,13 +134,13 @@ fi
 # under more than one name, so the one belonging to the repository we are
 # deploying is preferred over whatever happens to be first.
 NEW_REPO="${NEW_REF%@*}"
-CURRENT_IMAGE_ID="$(docker inspect -f '{{.Image}}' "$CONTAINER")"
+CURRENT_IMAGE_ID="$(docker container inspect -f '{{.Image}}' "$CONTAINER")"
 PREVIOUS_REF="$(
-  docker inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$CURRENT_IMAGE_ID" 2>/dev/null \
+  docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$CURRENT_IMAGE_ID" 2>/dev/null \
     | grep -x -- "$NEW_REPO@sha256:[0-9a-f]*" | head -n 1 || true
 )"
 if [ -z "$PREVIOUS_REF" ]; then
-  PREVIOUS_REF="$(docker inspect -f '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' \
+  PREVIOUS_REF="$(docker image inspect -f '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' \
     "$CURRENT_IMAGE_ID" 2>/dev/null || true)"
 fi
 
@@ -239,9 +239,9 @@ fi
 # Roll the service
 # ---------------------------------------------------------------------------
 
-restart_count() { docker inspect -f '{{.RestartCount}}' "$CONTAINER" 2>/dev/null || echo 0; }
+restart_count() { docker container inspect -f '{{.RestartCount}}' "$CONTAINER" 2>/dev/null || echo 0; }
 health_status() {
-  docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+  docker container inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
     "$CONTAINER" 2>/dev/null || echo missing
 }
 

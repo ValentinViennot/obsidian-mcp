@@ -1,0 +1,55 @@
+# .gitignore for a git-backed Obsidian vault.
+#
+# Copy this to the root of the vault repository. Two things drive every rule
+# here: keeping per-machine state out of a repo that two machines push to, and
+# keeping plugin caches out of a repo that is meant to stay small enough to
+# clone quickly. On the vault this was written for, plugin caches were 91% of
+# the directory and a single cache file was 236 MB — committed once, that file
+# is in the history forever.
+
+# --- Obsidian per-machine state -------------------------------------------
+# Which panes are open, where the cursor is, which file is focused. Changes
+# constantly, means nothing to anyone else, and conflicts on every sync.
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+
+# Settings themselves (appearance, hotkeys, enabled plugins) ARE tracked, so
+# configuration follows the vault to a new machine.
+
+# --- Plugin caches and generated indexes ----------------------------------
+# Semantic-search and AI plugins build large local indexes beside the notes.
+# They are derived data: regenerable, machine-specific, and enormous.
+.smart-env/
+.obsidian/plugins/*/data.json.bak
+.obsidian/plugins/*/*.log
+
+# Embedding/index shards, whatever plugin emits them.
+*.ajson
+
+# Copilot-style conversation indexes, which can reach hundreds of megabytes.
+.obsidian/copilot-index*.json
+.obsidian/**/copilot-index*.json
+copilot-index*.json
+
+# --- Nested vaults ---------------------------------------------------------
+# A subdirectory with its own .obsidian/ is a separate vault. Track its notes,
+# but not its own per-machine state.
+**/.obsidian/workspace.json
+**/.obsidian/workspace-mobile.json
+
+# --- Obsidian soft-delete --------------------------------------------------
+# Deleted notes land here. Git is the undo mechanism now.
+.trash/
+
+# --- OS and sync artefacts -------------------------------------------------
+.DS_Store
+**/.DS_Store
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# --- Editor / tooling ------------------------------------------------------
+*.swp
+*~

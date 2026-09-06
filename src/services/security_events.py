@@ -98,6 +98,34 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "panel_logout": frozenset({"user_id_session", "username_session", "client_ip"}),
     "panel_bootstrap_admin_created": frozenset({"user_id", "username", "client_ip"}),
     "panel_bootstrap_refused": frozenset({"reason", "client_ip"}),
+    # ── Federated panel login (AUTH_MODE=pocketid) ──
+    #
+    # A *successful* federated login emits `panel_login_succeeded`, the same
+    # event a password login does, on purpose: an operator asking "who signed
+    # in" must find both without knowing which mechanism was configured when.
+    # These three are the outcomes that mechanism adds.
+    #
+    # **No token, no code, no `state`, no `nonce`, no PKCE verifier, and no
+    # `sub`.** Nothing in the allow-list could carry them, which is the point;
+    # `reason` is a closed vocabulary and every one of its values is a
+    # classification this server chose, never a string the provider or the
+    # caller supplied. The subject is the client address for the refusal,
+    # because a refused login resolved no credential.
+    "panel_oidc_login_refused": frozenset(
+        {"reason", "user_id", "client_ip", "route"}
+    ),
+    # The first login through the provider for an identity that had no local
+    # row. `username` is the derived local name, which is a value read from the
+    # row that was just committed. INFO and after the commit: it asserts an
+    # account exists.
+    "panel_oidc_user_created": frozenset({"user_id", "username", "client_ip"}),
+    # The first login through the provider for an identity whose derived
+    # username already named a local account carrying no `oidc_subject`. Its
+    # own event rather than a `reason` on the one above, because the two are
+    # different facts an operator audits differently: a creation is a new
+    # account, an adoption binds an *existing* account — with whatever vault,
+    # keys and admin flag it already had — to a provider identity.
+    "panel_oidc_user_linked": frozenset({"user_id", "username", "client_ip"}),
     "panel_password_reset": frozenset(
         {"actor_user_id", "user_id", "username", "client_ip", "route"}
     ),

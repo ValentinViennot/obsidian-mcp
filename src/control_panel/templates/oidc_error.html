@@ -1,0 +1,27 @@
+{# The one page every federated-login refusal renders.
+
+   It deliberately names no reason. A person whose provider is briefly down, a
+   person an operator has not yet added to OIDC_REQUIRED_GROUP, and a person
+   replaying a forged callback all land here, and telling them apart is the
+   security log's job — the same rule the password form's constant "Invalid
+   credentials" already follows. The only affordance is a link that starts a
+   fresh authorization request, because a retry is the right answer to most of
+   the reasons behind this page. #}
+{% extends "auth_base.html" %}
+
+{% block title %}Sign-in failed — Obsidian MCP{% endblock %}
+{% block tagline %}Sign in{% endblock %}
+
+{% block content %}
+    <div class="auth-heading">Sign-in failed</div>
+    <div class="auth-sub">
+        We could not complete sign-in with your identity provider. This can
+        happen if the sign-in took too long, if it was started in another
+        browser tab, or if your account does not have access to this server.
+    </div>
+
+    <div class="alert">Sign-in was not completed.</div>
+
+    <a class="btn-submit" style="display:block;text-align:center;text-decoration:none;"
+       href="/admin/auth/login">Try again</a>
+{% endblock %}

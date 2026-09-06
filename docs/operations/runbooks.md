@@ -97,6 +97,13 @@ First deploy only. Subsequent releases are [Upgrade](#upgrade).
 
 ## Upgrade
 
+**A merge to `main` does all of this by itself** — see
+[`continuous-deployment.md`](continuous-deployment.md). `deploy.yml` takes the
+same backup, runs the same migration, waits for the same health check, and
+rolls the image back if it does not come up. What follows is the manual
+equivalent, for when the pipeline is what is broken, or when you are deploying
+something that never went through `main`.
+
 ```bash
 # 1. Know what you are shipping.
 git log --oneline <deployed-sha>..main

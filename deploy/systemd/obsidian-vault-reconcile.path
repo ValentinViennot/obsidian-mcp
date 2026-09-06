@@ -1,0 +1,21 @@
+[Unit]
+Description=Run the vault reconcile as soon as a push requests it
+Documentation=file:///opt/obsidian-mcp/deploy/hooks/post-receive
+
+[Path]
+# `deploy/hooks/post-receive` touches this file when the desktop pushes to the
+# bare repo. Without this unit the flag would only shorten nothing: the sweep
+# already runs on a timer, and a push would wait up to two minutes to appear on
+# the server. With it, the push is on disk in the working clone in about a
+# second — which is what makes the round trip (edit on the laptop, ask the agent
+# about it) feel like one system rather than two.
+#
+# **`PathExists=`, not `PathChanged=`.** The service's first act is to delete the
+# flag, and a "changed" trigger fires on the deletion too — a unit that restarts
+# itself for ever. `PathExists=` activates while the file is there and
+# deactivates when it is gone, so deleting it is how the trigger is armed again.
+PathExists=/run/obsidian-vault-reconcile/requested
+Unit=obsidian-vault-reconcile.service
+
+[Install]
+WantedBy=multi-user.target

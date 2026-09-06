@@ -1,0 +1,65 @@
+[Unit]
+Description=Reconcile the Obsidian vault working clone with its bare repo
+Documentation=file:///opt/obsidian-mcp/deploy/vault-reconcile.sh
+# The vault lives on a mount; without this the first boot-time run fires against
+# an empty directory and commits the whole vault as deleted.
+RequiresMountsFor=/srv/obsidian-vault
+
+[Service]
+Type=oneshot
+
+# ── What to edit ────────────────────────────────────────────────────────────
+# VAULT_DIR is the server's working clone — the same directory the container
+# bind-mounts as the vault. GIT_AGENT_NAME / GIT_AGENT_EMAIL must match
+# GIT_AGENT_NAME / GIT_AGENT_EMAIL in the server's `.env`, or `git log` shows
+# the same actor under two identities and neither `--author` filter finds all
+# of it.
+Environment=VAULT_DIR=/srv/obsidian-vault
+Environment=GIT_AGENT_NAME=obsidian-mcp agent
+Environment=GIT_AGENT_EMAIL=agent@obsidian-mcp.invalid
+
+# `/run/obsidian-vault-reconcile/` is created and torn down by systemd, and both
+# the lock and the flag live in it so a reboot cannot leave a stale lock or a
+# stale request behind. The bare repo's `post-receive` hook writes the flag, so
+# whatever user pushes must be able to write this directory — either run both as
+# the same user, or set RuntimeDirectoryMode=0775 and a shared group.
+RuntimeDirectory=obsidian-vault-reconcile
+RuntimeDirectoryPreserve=no
+Environment=VAULT_RECONCILE_LOCK=/run/obsidian-vault-reconcile/lock
+Environment=VAULT_RECONCILE_FLAG=/run/obsidian-vault-reconcile/requested
+
+# The user that owns the working clone. Running this as root while the vault is
+# owned by somebody else gives git "dubious ownership" and a sweep that fails
+# every two minutes.
+User=obsidian
+Group=obsidian
+
+ExecStart=/opt/obsidian-mcp/deploy/vault-reconcile.sh
+
+# Bounded, and comfortably above the script's own network timeouts (2 × 120 s)
+# so a slow remote is reported by the script — with its own exit code and its
+# own log line — rather than killed by systemd with neither.
+TimeoutStartSec=300
+
+# **No Restart=.** The failures this can have are a divergence needing a human
+# and an unreachable remote; retrying either in a tight loop turns one problem
+# into a log full of the same problem. The timer is the retry, every two
+# minutes, which is soon enough.
+
+# Ordinary hardening. The script needs the working clone, the runtime directory
+# and the network, and nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/obsidian-vault
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

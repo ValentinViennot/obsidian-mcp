@@ -1,0 +1,61 @@
+#!/bin/sh
+#
+# post-receive — for the BARE repo the desktop pushes to.
+#
+# Install as `<bare-repo>/hooks/post-receive`, `chmod +x`.
+#
+# All it does is touch a flag file. `deploy/systemd/obsidian-vault-reconcile.path`
+# is watching that file and starts the reconcile service, which pulls the push
+# into the server's working clone within a second or so instead of at the next
+# two-minute tick.
+#
+# ── Why this is NOT a checkout ───────────────────────────────────────────────
+#
+# The usual bare-repo pattern is `git --work-tree=… checkout -f` right here. It
+# would corrupt this deployment, and the reason is not stylistic:
+#
+# **The server's working tree carries its own uncommitted writes.** An agent's
+# `edit_note` publishes bytes to disk and then commits them, and between those
+# two steps — and for however long a failed commit leaves them uncommitted,
+# which is a state the server deliberately tolerates rather than failing the
+# write for — the tree holds content that exists nowhere else. `checkout -f`
+# means "make the tree match this commit, destroying whatever disagrees", so a
+# push from the laptop would silently delete an agent's work from the user's
+# single source of truth. The failure would be invisible: no error anywhere, and
+# the note simply reverts.
+#
+# `vault-reconcile.sh` instead commits the local work FIRST and then rebases the
+# incoming commits onto it, stopping and shouting if the two genuinely conflict.
+# It can only do that because it runs in the working clone and knows about those
+# writes. This hook runs in the bare repo and knows nothing about them, so the
+# only correct thing it can do is ask.
+#
+# It must also never fail a push. A hook that exits non-zero after the refs are
+# updated does not undo anything; it just reports an error for a push that
+# succeeded. Every failure below is swallowed.
+#
+set -u
+
+FLAG="${VAULT_RECONCILE_FLAG:-/run/obsidian-vault-reconcile/requested}"
+
+# Drain stdin. git writes one `<old> <new> <ref>` line per updated ref and a
+# hook that does not read them can leave git writing into a closed pipe.
+while read -r _old _new _ref; do
+    :
+done
+
+dir=$(dirname "$FLAG")
+[ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || true
+
+if : > "$FLAG" 2>/dev/null; then
+    echo "obsidian-mcp: reconcile requested; the server will pull this shortly" >&2
+else
+    # Almost always a permissions problem: the pushing user cannot write the
+    # runtime directory the reconcile service owns. Say so — and say that the
+    # push is fine — rather than leaving the operator to wonder why the server
+    # takes two minutes to notice.
+    echo "obsidian-mcp: could not touch $FLAG (permissions?)." >&2
+    echo "obsidian-mcp: the push is fine; the server will pick it up at the next timer tick." >&2
+fi
+
+exit 0

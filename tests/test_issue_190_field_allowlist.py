@@ -490,6 +490,12 @@ _GUARDED_MODULES = (
     "src/services/vault_overlap.py",
     "src/services/vault_fs.py",
     "src/services/vault.py",
+    # Added with `feat/git-vault`. Every line it logs is reached from a write
+    # tool's body, so a credential CAN drive them — which is exactly the shape
+    # this list exists to catch before it ships, rather than after ("a sibling
+    # change added a call to a module the list did not name" was all three of
+    # round 2's findings).
+    "src/services/git_vault.py",
 )
 
 _GUARDED_METHODS = {"warning", "error", "exception", "critical"}
@@ -535,7 +541,51 @@ _STAGING_CLEANUP = (
     "the destructive publication path stays unchanged"
 )
 
+#: The vault-commit half. Every one of these fires **after** an MCP write has
+#: already published its bytes, and every one of them says the same thing: the
+#: write stands and its commit did not happen. Two reasons they stay on the
+#: bare logger rather than joining the catalogue.
+#:
+#: First, the bound is already there and is the same one `_POST_PUBLICATION`
+#: relies on: only a write-class tool can reach `src/services/git_vault.py` at
+#: all, so `MCP_WRITE_RATE_LIMIT_PER_MINUTE` (60) caps the rate at which a
+#: credential can produce these — and in practice a broken repository produces
+#: exactly one line per write, not a burst per write.
+#:
+#: Second, and this is the specific one: **commit-on-write is an audit
+#: mechanism**, and these lines are the only statement anywhere that the audit
+#: trail has a hole in it. A suppressor that withheld the ninth of them would
+#: be hiding precisely the fact an operator needs — "since 14:02 nothing has
+#: been committed" — in order to protect a log sink from a message that only
+#: appears when something is already wrong. That is D18's own stated
+#: exception (background/operational failure, never a refusal), not an escape
+#: from it: none of these is a refusal, none is reachable by an unauthenticated
+#: caller, and none carries credential material — git's stderr on `add`,
+#: `commit` and `reset` involves no network and no credentials, and the first
+#: line only is quoted, control-stripped and bounded to 200 characters.
+_VAULT_COMMIT = (
+    "post-publication vault-commit failure on a successful write; reachable "
+    "only from a write-class tool and therefore already bounded by the write "
+    "bucket, and deliberately not routed through the suppressor because "
+    "commit-on-write is an audit mechanism and these lines are the only "
+    "statement that its trail has a gap — a bound that withheld them would "
+    "hide the very fact it exists to preserve"
+)
+
 _BARE_LOGGER_EXEMPTIONS: dict[str, dict[str, str]] = {
+    "src/services/git_vault.py": {
+        "Could not record": _VAULT_COMMIT,
+        "git %s in the vault timed out": _VAULT_COMMIT,
+        "Could not run git": _VAULT_COMMIT,
+        "Found a %.0fs-old .git/index.lock": _VAULT_COMMIT,
+        "Removed a stale .git/index.lock": _VAULT_COMMIT,
+        "GIT_VAULT_ENABLED is set but no git binary": _VAULT_COMMIT,
+        "git add failed in the vault": _VAULT_COMMIT,
+        "git commit failed in the vault": _VAULT_COMMIT,
+        "Could not unstage after a failed vault commit": _VAULT_COMMIT,
+        "A single %s call published under %d vault roots": _VAULT_COMMIT,
+        "Vault commit for %s failed unexpectedly": _VAULT_COMMIT,
+    },
     "src/control_panel/routes.py": {
         "Skipping HNSW index": (
             "Admin-triggered and once per action, not caller-triggerable: it "
@@ -718,6 +768,14 @@ def test_the_exemption_list_is_exactly_what_the_design_says_it_is():
         "src/services/vault_overlap.py",
         "src/services/vault_fs.py",
         "src/services/vault.py",
+        "src/services/git_vault.py",
+    }
+    # The third shape, added with `feat/git-vault`: a post-publication failure
+    # whose *record* is the audit trail's own gap notice. Every entry quotes
+    # `_VAULT_COMMIT` by reference, so the decision is one string.
+    assert len(_BARE_LOGGER_EXEMPTIONS["src/services/git_vault.py"]) == 11
+    assert set(_BARE_LOGGER_EXEMPTIONS["src/services/git_vault.py"].values()) == {
+        _VAULT_COMMIT
     }
     assert set(_BARE_LOGGER_EXEMPTIONS["src/control_panel/routes.py"]) == {
         "Skipping HNSW index",

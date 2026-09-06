@@ -48,6 +48,15 @@ SETTINGS_ENV_KEYS = (
     "MAX_FILE_WRITE_BYTES",
     "MAX_READ_RESPONSE_CHARS",
     "WRITE_PRECONDITION_REQUIRED",
+    # The git-backed vault. `GIT_VAULT_ENABLED` above all: a developer with it
+    # exported would make every write tool in the suite try to commit into
+    # whatever `tmp_path` happened to be, and the ones that run inside a real
+    # checkout would commit into *this* repository.
+    "GIT_VAULT_ENABLED",
+    "GIT_COMMIT_ON_WRITE",
+    "GIT_AGENT_NAME",
+    "GIT_AGENT_EMAIL",
+    "GIT_COMMIT_TIMEOUT_SECONDS",
     "TRANSFER_TOKEN_TTL_SECONDS",
     "TRANSFER_MAX_UPLOAD_SECONDS",
     "TRANSFER_MAX_CONCURRENT_UPLOADS",

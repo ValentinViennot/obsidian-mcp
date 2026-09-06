@@ -495,6 +495,62 @@ class Settings(BaseSettings):
             + _MCP_ENVELOPE_ALLOWANCE_BYTES
         )
 
+    # ── The vault as a git working clone ───────────────────────────────────
+    #
+    # The vault is cloned on the server *and* on the owner's desktop, and both
+    # write to it. `git blame` is the only thing that can later answer "when did
+    # this appear, and was it me or an agent?", and it can only answer it if the
+    # commit exists — so every MCP write makes its own, immediately, naming the
+    # tool and the calling principal. See `src/services/git_vault.py` for the
+    # failure semantics (a git failure never fails a write) and `deploy/` for
+    # the sweep that catches out-of-band edits.
+    #
+    # **Default off, so nothing changes for an existing deployment.** A vault
+    # that is not a git repository is fully supported and stays the default;
+    # turning this on against a non-repository is a clean no-op rather than an
+    # error, because the alternative — refusing to boot — would make an
+    # operator's exploratory setting an outage.
+    # Env: GIT_VAULT_ENABLED.
+    git_vault_enabled: bool = False
+
+    # The commit-on-write half specifically. Separate from the switch above so
+    # a deployment can keep the reconcile sweep (which is a shell script and
+    # reads no setting) as its only committer — useful while first bringing a
+    # large vault under version control, where a first `git add -A` of tens of
+    # thousands of files is a very different operation from an incremental
+    # commit and an operator may want it to happen exactly once, on a timer,
+    # under their eye. Ignored entirely when `GIT_VAULT_ENABLED` is false.
+    # Env: GIT_COMMIT_ON_WRITE.
+    git_commit_on_write: bool = True
+
+    # The identity every agent-made commit carries. **Not** the human's: that
+    # is the whole point — a `git log` in which the desktop's commits and the
+    # server's are told apart by author is the artifact this feature exists to
+    # produce. Applied per invocation through `GIT_AUTHOR_*`/`GIT_COMMITTER_*`,
+    # never written to any git config (`git_vault` explains why at length).
+    #
+    # The default address is under `.invalid` (RFC 2606), which is guaranteed
+    # never to resolve: a plausible-looking address on a real domain in every
+    # commit of a repository that may later be pushed anywhere is a small,
+    # permanent lie. Set it to something real if the history is going somewhere
+    # that cares.
+    # Env: GIT_AGENT_NAME / GIT_AGENT_EMAIL.
+    git_agent_name: str = "obsidian-mcp agent"
+    git_agent_email: str = "agent@obsidian-mcp.invalid"
+
+    # Wall-clock bound on ONE git invocation (`add`, `commit`, or the `reset`
+    # that undoes a failed commit). git blocks indefinitely on a held index
+    # lock, an unresponsive network filesystem or a credential prompt, and this
+    # runs in a worker thread that a stalled git would occupy for the life of
+    # the process. Fifteen seconds is far beyond a local commit of a handful of
+    # markdown files and still short enough that a hung one is over before the
+    # next write arrives.
+    #
+    # Bounded above as well as below: a several-minute timeout is not a longer
+    # grace period, it is a thread pool this feature can exhaust on its own.
+    # Env: GIT_COMMIT_TIMEOUT_SECONDS.
+    git_commit_timeout_seconds: float = Field(15.0, gt=0, le=120)
+
     # ── The write precondition (#205) ──────────────────────────────────────
     #
     # `expected_hash` is optional on every write tool, which is what keeps
@@ -712,6 +768,41 @@ class Settings(BaseSettings):
                 )
             return name
         return v
+
+    @field_validator("git_agent_name", "git_agent_email")
+    @classmethod
+    def _reject_unusable_git_identity(cls, v, info):
+        """Refuse an empty or control-character-bearing git identity.
+
+        Both values become `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` on a real
+        `git commit`, and git's commit-object grammar is line-oriented: a
+        newline in either field makes git either refuse the commit outright or
+        — depending on where it lands — accept an author line the operator did
+        not write. A `<`, `>` or a stray null does the same thing to the
+        `Name <email>` form.
+
+        Refused at startup rather than sanitised at commit time, for the reason
+        every other setting here is: a value quietly rewritten is a value the
+        operator believes they set. The failure they get instead is a container
+        that will not start with a message naming the variable.
+        """
+        text = str(v)
+        if not text.strip():
+            raise ValueError(
+                f"{info.field_name.upper()} must not be empty: it is the "
+                "identity every agent-made vault commit is attributed to."
+            )
+        bad = [c for c in ("\n", "\r", "\0", "<", ">") if c in text]
+        if any(ord(c) < 0x20 for c in text):
+            bad.append("a control character")
+        if bad:
+            raise ValueError(
+                f"{info.field_name.upper()} must not contain "
+                f"{', '.join(repr(c) for c in bad)}. It is passed to git as an "
+                "author/committer field, and git's commit-object grammar is "
+                "line-oriented — a newline there forges an author line."
+            )
+        return text.strip()
 
     @field_validator("fts_configs", mode="before")
     @classmethod

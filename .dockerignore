@@ -1,0 +1,36 @@
+# Build context allow-list.
+#
+# Deny everything, then name what a build actually reads. The alternative — a
+# deny-list — is the one that rots: `screenshots/`, `openspec/`, `tests/` and
+# `deploy/` were all in the context of every build of this repo — 17.33 MB
+# across 776 files, against the 3.21 MB / 120 files a build actually reads —
+# and every new directory would have joined them by default. An allow-list
+# makes a forgotten entry a loud build failure ("file not found") instead of a
+# silently fatter context and a slower build.
+#
+# Two Dockerfiles read this context and both are covered:
+#   Dockerfile              — requirements.txt, alembic{.ini,/}, src/, scripts/,
+#                             docker/entrypoint.sh
+#   docker/test.Dockerfile  — requirements.txt, requirements-dev.txt (the suite
+#                             itself is bind-mounted at run time, not copied)
+#
+# Note that `.git/` is excluded here, so nothing in the image can carry the
+# repository's history. That matters more than the size: this is a public fork
+# of a private-vault server, and the image is published to GHCR.
+
+*
+
+!alembic/
+!alembic.ini
+!docker/entrypoint.sh
+!requirements-dev.txt
+!requirements.txt
+!scripts/
+!src/
+
+# Re-excluded after the allow-list, because these live *inside* the directories
+# above. Host-built bytecode is for the host's interpreter and platform; the
+# image compiles its own (see the Dockerfile's compileall).
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/

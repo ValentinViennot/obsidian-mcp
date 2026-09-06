@@ -4,13 +4,20 @@ WORKDIR /app
 
 # Install system dependencies.
 #
-# `git` is a hard runtime requirement for this fork, not a convenience: the
-# vault is a git repository, commit-on-write shells out to git after every
-# write-class tool call, and note_history / note_blame / find_when_written are
-# nothing but git plumbing. Without the binary all four degrade *silently* —
-# the write still lands and the tools still answer, they just stop recording
-# and reporting history, which is the one failure nobody notices until they
-# need the history. tests/test_runtime_dependencies.py keeps this honest.
+# `git` is a hard runtime requirement for this fork, not a convenience, and for
+# two independent reasons:
+#
+# 1. The vault is a git repository. Commit-on-write shells out to git after
+#    every write-class tool call, and note_history / note_blame /
+#    find_when_written are nothing but git plumbing. Without the binary all four
+#    degrade *silently* — the write still lands and the tools still answer, they
+#    just stop recording and reporting history, which is the one failure nobody
+#    notices until they need the history.
+# 2. `scripts/backfill_history.py` (`make backfill-history`) walks the mounted
+#    vault's history to embed versions of a note that no longer exist on disk.
+#    It runs as a `docker compose run --rm` against this same image.
+#
+# tests/test_runtime_dependencies.py keeps this honest.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     curl \
     git \

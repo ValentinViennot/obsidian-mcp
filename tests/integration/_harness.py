@@ -170,7 +170,16 @@ def throwaway_database(prefix: str, dimensions: int, revision: str = "head"):
             "docstring); this harness creates and drops databases."
         )
 
-    dbname = f"test_{prefix}_{uuid.uuid4().hex}"
+    # Postgres truncates an identifier over 63 bytes *silently*: CREATE DATABASE
+    # succeeds under the shortened name, and the connection that follows asks
+    # for the full one and gets InvalidCatalogNameError — an error that says
+    # "database does not exist" and points nowhere near the real cause, which is
+    # a test label a few characters too long. Budget the prefix instead, so a
+    # long label costs readability rather than a baffling failure.
+    _MAX_IDENTIFIER = 63
+    suffix = uuid.uuid4().hex
+    budget = _MAX_IDENTIFIER - len("test_") - len("_") - len(suffix)
+    dbname = f"test_{prefix[:budget]}_{suffix}"
     try:
         # CREATE sits inside the try so the DROP below runs even if creation is
         # interrupted: the name is generated, `IF EXISTS` makes the drop a

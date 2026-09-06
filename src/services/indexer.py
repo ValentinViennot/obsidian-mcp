@@ -3243,6 +3243,14 @@ async def _embed_vault_pinned(
                     await certify_embedded(
                         session, row.id, row.content_hash, row.file_path
                     )
+                    # **Unscoped by validity, deliberately** (migration 025).
+                    # Everywhere else a delete of a note's vectors means "the
+                    # current ones"; here it means what the operator asked for.
+                    # `EMBEDDING_EXCLUDE_PATTERNS` says this note's text must
+                    # not be searchable, and a backfilled historical vector is
+                    # that text — leaving it would keep an excluded note
+                    # findable through its own history. The backfill applies
+                    # the same patterns, so it will not put them back.
                     await session.execute(
                         delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
                     )
@@ -3521,7 +3529,8 @@ async def _reconcile_exclusions(
     rows = (await session.execute(text(f"""
         SELECT nm.id, nm.file_path, nm.content_hash, nm.chunks_truncated,
                EXISTS (
-                   SELECT 1 FROM note_embeddings ne WHERE ne.note_id = nm.id
+                   SELECT 1 FROM note_embeddings ne
+                   WHERE ne.note_id = nm.id AND ne.valid_to IS NULL
                ) AS has_vectors
         FROM notes_metadata nm
         WHERE {owner_clause}
@@ -3583,6 +3592,9 @@ async def _reconcile_exclusions(
                 await certify_embedded(
                     session, row.id, row.content_hash, row.file_path
                 )
+                # Unscoped by validity for the backlog exclusion branch's
+                # reason (migration 025): an excluded note must not be
+                # searchable through its history either.
                 await session.execute(
                     delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
                 )

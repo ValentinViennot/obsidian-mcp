@@ -21,7 +21,7 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
 - `src/database.py` — async SQLAlchemy engine/session
 - `src/models/db.py` — ORM models (api_keys, usage_logs, notes_metadata, note_embeddings, note_links, indexer_runs, transfer_tokens, oauth_clients/codes/tokens)
 - `src/mcp_server/` — MCP server, tools, auth middleware
-- `src/services/` — vault ops, search, embeddings, indexer, transfer, anchored FS
+- `src/services/` — vault ops, search, embeddings, indexer, history indexer (temporal embeddings), transfer, anchored FS
 - `src/transfer/` — public `/transfer/*` capability-redemption routes
 - `src/api/` — control panel REST endpoints
 - `src/control_panel/` — Jinja2 templates + static assets
@@ -61,6 +61,11 @@ hostnames) must stay out of tracked files. The mechanism:
 - `make audit` — pip-audit dependency scan
 - `make reindex` / `make reset-embeddings` / `make rebuild-tsvectors` — index
   maintenance (see [indexing and embeddings](docs/architecture/indexing-and-embeddings.md))
+- `make backfill-history-dry` / `make backfill-history` — embed the vault's
+  *superseded* note versions from its git history (migration 025). Ordinary
+  search is unchanged: every current-state reader filters on `valid_to IS NULL`.
+  Run the dry form first — a vault's history is much larger than its present and
+  every version is a call to a shared embedding endpoint.
 - `make db-backup` / `make db-restore` — database dump and restore
 - `make logs` — tail container logs
 - `make status` — check health

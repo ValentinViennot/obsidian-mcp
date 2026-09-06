@@ -58,4 +58,17 @@ else
     echo "obsidian-mcp: the push is fine; the server will pick it up at the next timer tick." >&2
 fi
 
+# ── Off-site archive ─────────────────────────────────────────────────────────
+#
+# Detached, so a slow or unreachable remote can neither block nor fail the push
+# that triggered it: the vault's authority is this server, and the archive being
+# briefly behind is not worth interrupting someone's writing for.
+#
+# This must come BEFORE the `exit 0` below. It was appended after it once, which
+# made it unreachable — the hook reported success, the archive silently never
+# updated, and nothing surfaced until the remote was inspected by hand.
+if [ -x "$(dirname "$0")/archive-mirror" ]; then
+    setsid "$(dirname "$0")/archive-mirror" >/dev/null 2>&1 &
+fi
+
 exit 0

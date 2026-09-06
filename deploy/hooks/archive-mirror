@@ -1,0 +1,75 @@
+#!/bin/sh
+#
+# archive-mirror — push the vault's history to an off-site archive.
+#
+# Invoked from the bare repo's `post-receive`, so every push that lands on the
+# server — from the laptop, or from the server's own reconcile — is copied to
+# the archive without anyone remembering to do it.
+#
+# ── Append-only, deliberately ────────────────────────────────────────────────
+#
+# This is a plain `git push`. Not `--mirror`, not `--force`, not `+refs/*`.
+#
+# The distinction is the entire point of the archive. A mirror push makes the
+# remote *match* the local repository, which means it faithfully reproduces
+# destruction: a bad rebase, an `--amend` on a shared branch, a rogue
+# `reset --hard` followed by a sync, and the archive dutifully throws away the
+# only surviving copy of what was lost. An append-only push refuses instead —
+# the remote rejects a non-fast-forward, this script reports it, and the archive
+# still holds the history that the server no longer does.
+#
+# That refusal is a feature and should be read as an alarm, not a nuisance. If
+# it fires, something rewrote history on the server; resolve it there, and only
+# then decide deliberately whether the archive should follow.
+#
+# ── Never blocks, never fails the push ───────────────────────────────────────
+#
+# Runs detached with its own lock. A push from the laptop must not hang on
+# GitHub being slow, and must not fail because the network is down: the vault's
+# authority is the server, the archive is a copy, and a copy being briefly
+# behind is not an error worth interrupting someone's writing for.
+set -u
+
+REMOTE="${ARCHIVE_REMOTE:-github}"
+BRANCH="${ARCHIVE_BRANCH:-main}"
+LOG="${ARCHIVE_LOG:-/var/log/obsidian-vault-archive.log}"
+LOCK="${ARCHIVE_LOCK:-/tmp/obsidian-vault-archive.lock}"
+
+log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null; }
+
+git remote get-url "$REMOTE" >/dev/null 2>&1 || { log "no '$REMOTE' remote; skipping"; exit 0; }
+
+# mkdir is atomic; a second push arriving mid-flight simply skips, and the next
+# one carries both sets of commits anyway.
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+    log "clearing stale lock"
+    rmdir "$LOCK" 2>/dev/null || true
+    mkdir "$LOCK" 2>/dev/null || exit 0
+  else
+    exit 0
+  fi
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+
+if out=$(git push "$REMOTE" "$BRANCH:$BRANCH" 2>&1); then
+  log "ok: branch $BRANCH -> $REMOTE"
+else
+  case "$out" in
+    *non-fast-forward*|*"fetch first"*|*rejected*)
+      log "REFUSED (non-fast-forward): the server's history diverges from the archive."
+      log "  This is the append-only guard doing its job — history was rewritten on"
+      log "  the server. The archive still holds what the server lost. Investigate"
+      log "  before overriding; do not add --force to make the message go away."
+      ;;
+    *) log "push failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)" ;;
+  esac
+fi
+
+# Tags carry the import boundary (v0-drive-import), which is what tells a reader
+# which dates were reconstructed. An archive without it is missing the caveat.
+if out=$(git push "$REMOTE" --tags 2>&1); then
+  log "ok: tags -> $REMOTE"
+else
+  log "tag push failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+fi

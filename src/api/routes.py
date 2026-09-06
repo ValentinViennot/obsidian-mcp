@@ -316,9 +316,14 @@ async def get_usage(
 @router.get("/stats", dependencies=[Depends(require_admin_panel)])
 async def get_stats(session: AsyncSession = Depends(get_session)):
     from src.models.db import NoteMetadata, NoteEmbedding
+    from src.services.filters import current_embedding_predicate
     notes_count = (await session.execute(select(func.count(NoteMetadata.id)))).scalar()
     keys_count = (await session.execute(select(func.count(APIKey.id)).where(APIKey.is_active == True))).scalar()
-    embeddings_count = (await session.execute(select(func.count(NoteEmbedding.id)))).scalar()
+    # Current vectors only (migration 025): this is an index-coverage stat, and
+    # backfilled history is not coverage of anything the vault currently says.
+    embeddings_count = (await session.execute(
+        select(func.count(NoteEmbedding.id)).where(current_embedding_predicate())
+    )).scalar()
     return {
         "notes_indexed": notes_count,
         "active_keys": keys_count,

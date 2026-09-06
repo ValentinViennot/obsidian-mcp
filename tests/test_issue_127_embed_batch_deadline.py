@@ -1,11 +1,17 @@
 """#127 / D5 — the Ollama batch has no aggregate deadline.
 
 The old `OllamaProvider.embed_batch` carried a fixed 300 s budget over the
-whole batch. A hung provider trips the 30 s per-call `wait_for` long before
-that, so the only thing the aggregate ever caught was a note with more chunks
-than 300 s of *healthy* latency covers: it raised, `embed_note` returned 0, the
-row was never certified, and the next pass selected it again — a permanent
-300 s burn per tick under `index_pass_lock` that could never complete.
+whole batch. A hung provider trips the per-request `wait_for` long before that,
+so the only thing the aggregate ever caught was a note with more chunks than
+300 s of *healthy* latency covers: it raised, `embed_note` returned 0, the row
+was never certified, and the next pass selected it again — a permanent 300 s
+burn per tick under `index_pass_lock` that could never complete.
+
+The property survives native batching: `embed_batch` now issues one request per
+`OLLAMA_BATCH_LIMIT` chunks, and every deadline belongs to exactly one of those
+bounded requests. These cases are written against `_post` — the single HTTP
+round trip — rather than `embed_one`, precisely so they keep asserting the
+*property* (no budget spans the batch) and not the retired mechanism.
 
 Fully offline: the provider's HTTP call is replaced.
 """
@@ -44,36 +50,47 @@ def test_embed_batch_takes_no_timeout_argument():
 @pytest.mark.asyncio
 async def test_a_batch_past_the_old_aggregate_budget_completes(monkeypatch):
     """Many chunks, each individually healthy, at a simulated latency whose
-    sum exceeds the retired 300 s budget."""
-    calls = {"n": 0}
-    # 400 chunks × a nominal 1 s each = 400 simulated seconds, well past 300.
-    # The clock is faked rather than slept through: this must stay a unit test.
+    sum exceeds the retired 300 s budget.
+
+    400 chunks is 13 requests at `OLLAMA_BATCH_LIMIT`; none of them may inherit
+    a deadline from the ones before it.
+    """
+    requests: list[int] = []
+    # 400 chunks at a nominal 30 simulated seconds per request = 390 simulated
+    # seconds, well past the retired 300 s. The clock is faked rather than
+    # slept through: this must stay a unit test.
     fake_now = {"t": 0.0}
     monkeypatch.setattr(embeddings.time, "monotonic", lambda: fake_now["t"])
 
-    async def _one(_text):
-        calls["n"] += 1
-        fake_now["t"] += 1.0
-        return [0.1, 0.2, 0.3]
+    async def _post(payload_input, *, timeout):  # noqa: ARG001
+        requests.append(len(payload_input))
+        fake_now["t"] += 30.0
+        return [[0.1, 0.2, 0.3]] * len(payload_input)
 
     provider = embeddings.OllamaProvider()
-    monkeypatch.setattr(provider, "embed_one", _one)
+    monkeypatch.setattr(provider, "_post", _post)
 
     out = await provider.embed_batch([f"chunk {i}" for i in range(400)])
 
     assert len(out) == 400
-    assert calls["n"] == 400
+    assert sum(requests) == 400
+    assert max(requests) <= embeddings.OLLAMA_BATCH_LIMIT
+    assert fake_now["t"] > 300.0, "the run must exceed the retired budget"
 
 
 @pytest.mark.asyncio
-async def test_a_hung_chunk_still_fails_at_the_per_call_timeout(monkeypatch):
-    """The per-call bound is the liveness guarantee that replaces the
-    aggregate — and it is the *only* one, so it must still fire."""
-    async def _hangs(_text):
+async def test_a_hung_request_still_fails_at_the_per_request_timeout(monkeypatch):
+    """The per-request bound is the liveness guarantee that replaces the
+    aggregate — and it is the *only* one, so it must still fire.
+
+    A one-chunk batch must still ask for exactly 30 s: that is the call this
+    provider made before batching existed, and its deadline may not drift.
+    """
+    async def _hangs(_payload_input, *, timeout):  # noqa: ARG001
         await asyncio.sleep(3600)
 
     provider = embeddings.OllamaProvider()
-    monkeypatch.setattr(provider, "embed_one", _hangs)
+    monkeypatch.setattr(provider, "_post", _hangs)
 
     real_wait_for = asyncio.wait_for
     seen: list[float] = []
@@ -89,7 +106,7 @@ async def test_a_hung_chunk_still_fails_at_the_per_call_timeout(monkeypatch):
     with pytest.raises((asyncio.TimeoutError, TimeoutError)):
         await provider.embed_batch(["a"])
 
-    assert seen == [30.0], "the per-chunk timeout must stay at 30 s"
+    assert seen == [30.0], "the one-chunk request timeout must stay at 30 s"
 
 
 @pytest.mark.asyncio

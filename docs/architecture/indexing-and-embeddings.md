@@ -4,7 +4,11 @@
 
 ## Embedding providers
 - `EMBEDDING_PROVIDER=ollama` (default) — uses `OLLAMA_URL` and
-  `EMBEDDING_MODEL`; serial single-input HTTP per chunk.
+  `EMBEDDING_MODEL`. Native batching: up to `OLLAMA_BATCH_LIMIT` (32) inputs
+  per `/api/embed` POST, with sub-batching for larger lists, positional order
+  preservation checked against the response length, and per-chunk degradation
+  when a batched request fails. `embed_one` (the `semantic_search` query path)
+  still sends a bare string.
 - `EMBEDDING_PROVIDER=openai` — requires `OPENAI_API_KEY` (validated at
   startup). Uses `OPENAI_BASE_URL` (default `https://api.openai.com/v1`)
   and `OPENAI_EMBEDDING_MODEL` (default `text-embedding-3-small`). Native
@@ -104,17 +108,43 @@
   `MAX_REBUILD_REREADS`, and still recording the same path and hash →
   `TsvectorRebuildAborted`, rolling the single transaction back rather than
   committing around it.
-- **`OllamaProvider.embed_batch` has no aggregate deadline** (#127); the 30 s
-  per-call `wait_for` is the only liveness bound. The old fixed 300 s
-  whole-batch budget could fire only when every chunk was individually healthy
-  — i.e. exactly on a note with more chunks than 300 s of normal latency
-  covers, which then never certified and was re-selected every tick: a
-  permanent 300 s burn under `index_pass_lock` that could never finish. A
-  *proportional* replacement re-introduces the same boundary one size class up
-  and was rejected. `OpenAIProvider` is untouched. The cost is a giant note
-  holding the pass for 30 s × chunks once; the pause is honoured at the next
-  note boundary, as always. `embed_note` still refuses to certify partial chunk
-  coverage.
+- **`OllamaProvider.embed_batch` has no aggregate deadline** (#127); the only
+  liveness bound is per **request**, and a request carries at most
+  `OLLAMA_BATCH_LIMIT` chunks. The old fixed 300 s whole-batch budget could
+  fire only when every chunk was individually healthy — i.e. exactly on a note
+  with more chunks than 300 s of normal latency covers, which then never
+  certified and was re-selected every tick: a permanent 300 s burn under
+  `index_pass_lock` that could never finish. A *proportional* replacement
+  spanning the whole note re-introduces the same boundary one size class up
+  and was rejected then, and is still rejected.
+  `_ollama_batch_timeout(n) = 30 + 10·(n−1)` is not that: it bounds **one**
+  request over at most 32 chunks, so a note of any size gets one deadline per
+  request instead of one deadline for the note, and no quantity of healthy work
+  can exhaust any of them. It is also never larger than what the same chunks
+  were allowed as serial calls (30·n), so liveness is strictly better than the
+  #127 baseline — a hung provider is caught in ≤ 340 s where 32 serial calls
+  took up to 960 s. `embed_note` still refuses to certify partial chunk
+  coverage, and the pause is honoured at the next note boundary, as always.
+- **Batched results are checked, not trusted.** `/api/embed` answers with a
+  bare positional array and no `index` field, so the response length is the
+  only evidence that vector *i* describes input *i*. A length disagreement
+  raises `ProviderBatchSizeMismatch` and is deliberately **not** retried
+  per-chunk: it is the provider contradicting the contract, and papering over
+  it would hide a broken model or gateway behind a slow green pass. A
+  *timeout* is likewise not retried per-chunk — that would multiply exactly the
+  burn the deadline exists to stop. Every other failure (5xx, dropped
+  connection, `ProviderInputTooLarge` on one over-long chunk) degrades to one
+  request per chunk at the plain 30 s deadline, which does not rescue a note
+  with a genuinely unembeddable chunk (coverage must still be exact) but does
+  make a batch-only fault free and attributes a chunk-specific fault to the
+  chunk that caused it.
+- **Why batch at all.** Measured against the production endpoint: 0.092
+  s/chunk unbatched, 0.0233 at 8, 0.0169 at 32, 0.0170 at 50 — a 5.4x speedup
+  that flattens by 50, which is why the limit is 32. The larger reason is
+  contention: the Ollama instance is shared with other services, so 32x fewer
+  requests is 32x less queueing imposed on somebody else's latency. On the
+  production corpus (~14,000 chunks) that is ~21 minutes of load turned into
+  ~4. `OpenAIProvider` batched natively from the start and is untouched.
 - Indexer runs on startup then every 5 minutes, hash-based change detection.
   Each periodic tick ends with `prewarm_search_caches()` **inside**
   `index_pass_lock`: one `get_embedding("warmup")` (Ollama only — a remote API
@@ -1485,3 +1515,113 @@ and (span-diff-scoped, direction-aware) its embeddings, under the restored
 grammar, without touching `content_hash`. Comparing legacy-to-legacy instead —
 which is what a registry without the frozen v1 entry would do — would certify
 the stale vectors for ever.
+
+## Temporal embeddings: the vault's past is searchable, but only on request (migration 025)
+
+`note_embeddings` used to describe HEAD and nothing else, so a paragraph the
+author rewrote or a note they deleted was gone from `semantic_search` the
+moment the next pass ran. Migration 025 gives each row a validity interval and
+`src/services/history_indexer.py` fills it in from the vault's git history.
+The schema half is in
+[schema and migrations](schema-and-migrations.md#025-valid_from--valid_to-and-why-both-are-nullable);
+this is the behaviour half.
+
+### `valid_to IS NULL` is the read path's most load-bearing predicate
+
+A vector over deleted text is indistinguishable from a live one — same column,
+same index, same distance metric — except by `valid_to`. A reader that forgets
+the predicate does not fail; it ranks, quotes and returns the deleted paragraph
+exactly like a current one, to an agent that acts on it without a human ever
+seeing the query. That is the failure this server ranks above every expensive
+one, so the predicate is written **once**, in `src/services/filters.py`
+(`current_embedding_predicate`, `embedding_valid_at_predicate`,
+`apply_embedding_validity`), and every reader calls it:
+
+- `semantic_search` — which gains an `as_of` parameter that *replaces* the
+  current-only predicate. `as_of=None` is a scoping decision, not the absence
+  of one, exactly as `user_id=None` is in `apply_note_filters`. **No MCP tool
+  forwards `as_of`**, so nothing reaches historical rows by accident.
+- `find_related`, on both its statements: the neighbour scan and the source
+  note's chunk average. Averaging a note's history into its query vector would
+  describe what it used to say as much as what it says, weighted by how often
+  it happened to be edited.
+- The panel's and the API's coverage counts. These answer "how much of the
+  vault is indexed *now*"; a backfilled history would show an operator 140%
+  coverage and a pending count that never falls.
+- The indexer's "does this note have vectors" probe.
+
+`embed_note`'s two DELETEs are scoped the same way, and that is a correctness
+requirement rather than an optimisation: an edit replaces a note's present, and
+the note's past is precisely what the edit *creates*. An unscoped DELETE would
+make every ordinary edit silently erase that note's backfilled history.
+
+**The exclusion branches are deliberately left unscoped.** When
+`EMBEDDING_EXCLUDE_PATTERNS` matches a note the operator has said its text must
+not be searchable, and a historical vector is that text — so those deletes take
+every row. The backfill applies the same patterns, so it does not put them back.
+
+### What the walker does, and what it refuses to guess
+
+`walk_note_versions` runs **one** `git log --reverse --first-parent --raw
+--no-renames -z` for the whole repository (a per-path `--follow` would be
+O(paths) process spawns over O(history) each) and turns it into, per path, a
+list of distinct content states with chained half-open intervals.
+
+- **`--first-parent`** linearises the DAG. A validity interval cannot express a
+  branch, so side-branch work enters the timeline at the merge, dated by the
+  merge's authored date. Any other choice produces overlapping intervals — two
+  versions both claiming to be the note's text at one instant.
+- **`--no-renames`** because the vault addresses notes by path: after a rename
+  the old path genuinely had no content, and following content across would
+  claim it did.
+- **Deduplication is by git's own blob id.** Git already omits commits that did
+  not touch a path; what it does not collapse is a change *back* to content the
+  path already had (a revert, a round-tripped formatter), and those would
+  otherwise store the same bytes twice under two intervals.
+- **Authored dates are clamped monotonic.** `%aI` is rebase- and
+  forgery-controlled and can run backwards along the mainline; an interval that
+  ends before it starts is meaningless. Each start is clamped to its
+  predecessor's, and a version whose interval then collapses to zero length is
+  dropped and counted — it was the note's text at no queryable instant, so a row
+  for it could never be returned.
+- **A `D` entry is not a row.** It exists to close the preceding interval. A
+  delete-then-re-add therefore leaves a genuine gap, which is right: no vector
+  was valid while the note did not exist.
+
+### The current version is stamped, never re-embedded
+
+The ordinary embed pass is the **only** writer of rows with `valid_to IS NULL`.
+The backfill inserts closed intervals and, for the current version, only
+`UPDATE`s `valid_from` on the rows that already exist — conditional on
+`valid_to IS NULL`, so it can never overwrite a historical row's interval. Two
+writers of the current slice would double every current vector and every search
+hit for that note, and leave two sets that drift apart at the next edit. The
+runner (`scripts/backfill_history.py`) counts current rows before and after and
+shouts if the number moved.
+
+### Resumability with no cursor
+
+A version is skipped when the database already holds rows for its exact
+`(note_id, valid_from, valid_to)`. Work commits one note at a time, so an
+interrupted run repeats only the note it was inside and a completed run is a
+no-op. A cursor would have needed a key in `indexer_state`, whose CHECK
+constraint pins the admitted key set in migration 023 — a schema change to
+record something the data already says.
+
+### Known gaps
+
+- **A note that no longer exists at HEAD is not backfilled.** Its versions are
+  walked and counted, but a vector row hangs off `notes_metadata.id` and a
+  deleted note has no such row. Inventing one would put a deleted note into
+  `list_notes`, `keyword_search` and every graph tool — a worse regression than
+  a missing slice of history. Reported as `no_metadata=` in the run's stats.
+- **The backfill is not incremental.** An ordinary edit after a backfill
+  replaces the note's current vectors and so clears the `valid_from` this
+  stamped; re-running the backfill re-stamps it. Making `embed_note` close the
+  outgoing interval itself would turn every edit in the vault into permanent
+  history growth — a product decision, not a mechanical one.
+- **Nothing exposes point-in-time search over MCP.** `semantic_search(as_of=…)`
+  exists and is tested; no tool passes it.
+- **`git` is required in the image.** Added to the production `Dockerfile` for
+  `make backfill-history` only; nothing on the request path shells out to it and
+  the server runs identically without it.

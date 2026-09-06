@@ -234,7 +234,7 @@ looks the way it does.
 
 ## What's in the box
 
-The server exposes 25 MCP tools across five families, plus the auth
+The server exposes 28 MCP tools across six families, plus the auth
 and ops layer around them.
 
 ### Search and discovery
@@ -370,6 +370,42 @@ origin the mint tools refuse rather than emit a localhost link.
   chunk embeddings and pgvector cosine distance, deduped per note
 - `find_orphans(folder?, limit=50)`, notes with zero in or out
   resolved links
+
+### Git history
+When the vault is a git repository, three read-only tools answer the
+question the index cannot: *when*, and *by whom*, was this written.
+They shell out to `git` with an explicit argv list — never a shell —
+under a per-invocation timeout and a byte cap, on a worker thread, with
+paths validated by the same containment the note tools use.
+- `note_history(path, limit=50)`, `git log --follow` over one note.
+  Reports the note's **birth commit** — its creation date, original
+  path and author — separately from the list, so a `limit` short of the
+  whole history never costs the creation date. Each commit carries
+  short and full sha, author name and email, authored *and* committed
+  timestamps as ISO 8601 with the original offset, the subject, and
+  whether the note was added, modified, renamed or deleted.
+- `note_blame(path, section?, start_line?, end_line?)`, per-line
+  authorship from `git blame -w -M -C`: whitespace-only changes are
+  ignored, a line moved within the file keeps its author, and a line
+  copied out of another file is attributed to where it came from.
+  `section=` takes the same heading selectors as `read_note` and blames
+  only that section; `start_line`/`end_line` take an explicit range. A
+  `.git-blame-ignore-revs` file at the vault root is passed to git, so
+  a bulk reformat does not become the author of the vault — the
+  response says whether it was present and applied. Capped at 2,000
+  lines and 200 characters per line, and it says when it capped.
+- `find_when_written(text, limit=20, path?, regex=False)`, the pickaxe
+  (`git log -S`): the commit that **introduced** a given string. It
+  returns only commits that changed the *number of occurrences* of the
+  text, so a later commit that merely edits around it is not reported
+  and the oldest result is the one that wrote it. This is the tool that
+  answers "on `<datetime>` you wrote `<text>`". `regex=True` switches
+  to `--pickaxe-regex`.
+
+The authored and committed timestamps are both reported because on a
+history reconstructed from file timestamps they differ: the authored
+time is when the note was written, the committed time is when the
+import ran.
 
 ### Auth and ops
 - API keys with the `omcp_` prefix, stored as SHA-256 hashes, with
@@ -1326,7 +1362,7 @@ The rationale lives in
 │ MCP clients  │   HTTP + Bearer key   │   FastAPI app        │
 │  Claude Desk │ ────────────────────▶ │  ┌────────────────┐  │
 │  Claude Code │                       │  │  MCP server    │  │
-│  n8n agents  │                       │  │  (25 tools)    │  │
+│  n8n agents  │                       │  │  (28 tools)    │  │
 │  OpenWebUI   │                       │  └─────┬──────────┘  │
 └──────────────┘                       │        ▼             │
                                        │  ┌────────────────┐  │

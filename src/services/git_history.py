@@ -395,16 +395,28 @@ def _run(
     with tempfile.TemporaryFile() as err_file:
         # Explicit argv, never a shell: no element of `argv` is ever built by
         # concatenating a caller's value into a string.
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(root),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=err_file,
-            env=_git_env(),
-            close_fds=True,
-            start_new_session=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(root),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=err_file,
+                env=_git_env(),
+                close_fds=True,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            # The git binary was found, so this is the *working directory* —
+            # a `VAULT_PATH` naming something that is not a readable
+            # directory. An uncaught `OSError` here would leave the tool
+            # layer nothing to catch and reach the agent as a protocol error
+            # rather than as the in-band refusal every other misconfiguration
+            # gets.
+            raise GitFailed(
+                "The vault root could not be opened to run git in "
+                f"({exc.strerror or exc}). Check the server's vault path."
+            ) from exc
         try:
             fd = proc.stdout.fileno()
             while True:
@@ -423,7 +435,12 @@ def _run(
                 if not chunk:
                     break
                 room = max_bytes - len(out)
-                if len(chunk) >= room:
+                # Strictly greater: a chunk that *exactly* fills the budget
+                # may still be the end of git's output, and the next read
+                # settles it. Flagging it here would report a truncation that
+                # did not happen, in a response whose whole value is that its
+                # caveats are true.
+                if len(chunk) > room:
                     out += chunk[:room]
                     truncated = True
                     killed = True

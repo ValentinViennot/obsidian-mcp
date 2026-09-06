@@ -699,6 +699,35 @@ def test_a_git_invocation_is_bounded_by_a_byte_cap(vault):
     assert len(out.stdout) <= 16
 
 
+def test_output_that_fits_the_cap_is_not_flagged_as_truncated(vault):
+    """The cap must not claim a truncation it did not perform.
+
+    A response whose value is its caveats cannot afford a false one, and the
+    boundary — output exactly the size of the budget — is where an off-by-one
+    would produce exactly that.
+    """
+    repo = git_history.resolve_repo(vault)
+    args = [*git_history._base_args(vault, repo.toplevel), "log", "--format=%H"]
+
+    whole = git_history._run(vault, args)
+    assert not whole.truncated
+
+    exact = git_history._run(vault, args, max_bytes=len(whole.stdout.encode()))
+    assert not exact.truncated
+    assert exact.stdout == whole.stdout
+
+
+async def test_a_vault_root_that_cannot_be_opened_is_an_in_band_refusal(
+    monkeypatch, tmp_path
+):
+    """A misconfigured `VAULT_PATH` must not reach the agent as a protocol error."""
+    monkeypatch.setattr(tools.settings, "vault_path", str(tmp_path / "nowhere"))
+
+    result = await tools.find_when_written_impl("anything")
+
+    assert "vault root could not be opened" in result
+
+
 async def test_every_tool_reports_a_missing_git_executable(vault, monkeypatch):
     monkeypatch.setattr(git_history.shutil, "which", lambda name: None)
 

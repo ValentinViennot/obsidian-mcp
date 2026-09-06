@@ -54,6 +54,18 @@ SETTINGS_ENV_KEYS = (
     "IMPORT_ALLOW_HTTP",
     "VAULT_ALLOW_NAMED_STAGING_FALLBACK",
     "MULTI_USER_MODE",
+    # Federated panel login (`AUTH_MODE=pocketid`). Every one is a `Settings`
+    # field, and the whole point of the default is that the suite measures the
+    # `local` path: a developer with `AUTH_MODE` exported would otherwise run
+    # the entire pre-existing body of login/bootstrap tests against a mode in
+    # which those routes 404.
+    "AUTH_MODE",
+    "OIDC_ISSUER",
+    "OIDC_CLIENT_ID",
+    "OIDC_CLIENT_SECRET",
+    "OIDC_REDIRECT_URI",
+    "OIDC_REQUIRED_GROUP",
+    "OIDC_SCOPES",
     "SESSION_MAX_AGE",
     "SESSION_COOKIE_NAME",
     "SESSION_TOUCH_INTERVAL_SECONDS",

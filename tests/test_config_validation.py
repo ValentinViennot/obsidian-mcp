@@ -270,3 +270,154 @@ def test_sandbox_mode_still_refuses_a_capitalised_public_hostname():
             _env_file=None,
         )
     assert "MCP_HOSTNAME" in str(exc.value)
+
+
+# ── Federated login (`AUTH_MODE=pocketid`) ──────────────────────────────────
+#
+# Every case below is a **startup** refusal, and they all defend one thing: in
+# `pocketid` mode the local password form and self-registration are withdrawn,
+# so a configuration this validator lets through and the request path then
+# cannot use is a deployment nobody can sign in to, with no way back except
+# shell access. A locked door is not a degraded mode.
+
+_OIDC = {
+    "auth_mode": "pocketid",
+    "multi_user_mode": True,
+    "oidc_issuer": "https://auth.example.com",
+    "oidc_client_id": "obsidian-mcp",
+    "oidc_client_secret": "s3cr3t",
+    "oidc_redirect_uri": "https://mcp.example.com/admin/auth/oidc/callback",
+}
+
+
+def _oidc_settings(**overrides):
+    return Settings(**{**_OIDC, **overrides}, secret_key=_SECRET, _env_file=None)
+
+
+def test_auth_mode_defaults_to_local_and_needs_no_oidc_settings():
+    """The default is what keeps every pre-existing deployment, and every
+    pre-existing test, on exactly the path it was on."""
+    settings = Settings(secret_key=_SECRET, _env_file=None)
+    assert settings.auth_mode == "local"
+    assert settings.oidc_issuer is None
+
+
+def test_an_unknown_auth_mode_is_refused():
+    with pytest.raises(ValidationError):
+        Settings(auth_mode="ldap", secret_key=_SECRET, _env_file=None)
+
+
+def test_a_complete_pocketid_configuration_is_accepted():
+    settings = _oidc_settings()
+    assert settings.auth_mode == "pocketid"
+    assert settings.oidc_issuer == "https://auth.example.com"
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["oidc_issuer", "oidc_client_id", "oidc_client_secret", "oidc_redirect_uri"],
+)
+def test_pocketid_refuses_a_missing_required_field(missing):
+    with pytest.raises(ValidationError) as exc:
+        _oidc_settings(**{missing: None})
+    assert missing.upper() in str(exc.value)
+
+
+def test_pocketid_refuses_a_blank_required_field():
+    """A blank is a missing value that reads as a set one in a `.env`."""
+    with pytest.raises(ValidationError) as exc:
+        _oidc_settings(oidc_client_secret="   ")
+    assert "OIDC_CLIENT_SECRET" in str(exc.value)
+
+
+def test_pocketid_requires_multi_user_mode():
+    # The auth router that owns the login and callback routes is mounted only
+    # in multi-user mode, so this combination is configured-and-unreachable —
+    # a setting that reads as applied and changes nothing, which is worse than
+    # a refusal because it looks like it worked.
+    with pytest.raises(ValidationError) as exc:
+        _oidc_settings(multi_user_mode=False)
+    assert "MULTI_USER_MODE" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "http://auth.example.com",
+        # No loopback exemption, deliberately: unlike BASE_URL this names
+        # somebody else's origin across a network the operator does not own,
+        # and everything the flow trusts arrives over it.
+        "http://localhost:8080",
+        "https://user:pass@auth.example.com",
+        "https://auth.example.com?x=1",
+        "https://auth.example.com#frag",
+        "not-a-url",
+    ],
+)
+def test_pocketid_refuses_an_unusable_issuer(issuer):
+    with pytest.raises(ValidationError) as exc:
+        _oidc_settings(oidc_issuer=issuer)
+    assert "OIDC_ISSUER" in str(exc.value)
+
+
+def test_a_trailing_slash_on_the_issuer_is_normalised_away():
+    # Discovery appends a path to it and the `iss` claim is compared to it as a
+    # string, so the two spellings must not be two configurations.
+    assert (
+        _oidc_settings(oidc_issuer="https://auth.example.com/").oidc_issuer
+        == "https://auth.example.com"
+    )
+
+
+@pytest.mark.parametrize(
+    "redirect",
+    [
+        "http://mcp.example.com/admin/auth/oidc/callback",
+        "/admin/auth/oidc/callback",
+        "https://mcp.example.com/cb#frag",
+    ],
+)
+def test_pocketid_refuses_an_unusable_redirect_uri(redirect):
+    with pytest.raises(ValidationError) as exc:
+        _oidc_settings(oidc_redirect_uri=redirect)
+    assert "OIDC_REDIRECT_URI" in str(exc.value)
+
+
+def test_a_loopback_redirect_uri_may_use_http():
+    # Unlike the issuer: this one is a browser destination on the developer's
+    # own machine, and every OAuth profile permits plaintext there.
+    settings = _oidc_settings(
+        oidc_redirect_uri="http://localhost:8000/admin/auth/oidc/callback"
+    )
+    assert settings.oidc_redirect_uri.startswith("http://localhost:8000")
+
+
+def test_openid_is_added_back_to_the_scopes_rather_than_refused():
+    # An operator who trimmed it made a mistake with exactly one correct
+    # repair, and refusing to start over a repair the validator can perform is
+    # not fail-fast, it is just a stop. Without `openid` the provider owes us
+    # no ID token at all, and the ID token is the whole identity assertion.
+    settings = _oidc_settings(oidc_scopes="profile email")
+    assert settings.oidc_scopes.split()[0] == "openid"
+    assert "profile" in settings.oidc_scopes
+
+
+def test_a_blank_required_group_means_no_group_requirement():
+    assert _oidc_settings(oidc_required_group="   ").oidc_required_group is None
+    assert _oidc_settings(oidc_required_group="admins").oidc_required_group == "admins"
+
+
+def test_local_mode_ignores_an_incomplete_oidc_configuration():
+    """Half-configured OIDC settings must not stop a `local` deployment booting.
+
+    An operator who tried federated login, backed it out by flipping
+    `AUTH_MODE` and left the rest in `.env` has a working deployment, not a
+    container that will not start.
+    """
+    settings = Settings(
+        auth_mode="local",
+        oidc_issuer="http://not-https",
+        secret_key=_SECRET,
+        _env_file=None,
+    )
+    assert settings.auth_mode == "local"

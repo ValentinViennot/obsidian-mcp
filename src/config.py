@@ -647,6 +647,48 @@ class Settings(BaseSettings):
     session_max_age: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "omcp_session"
 
+    # ── How the *human* behind the consent screen proves who they are ───────
+    #
+    # **This setting governs one thing and nothing else: the panel login.** The
+    # server's own OAuth 2.0 authorization server (`src/oauth/routes.py`) is
+    # untouched by it — MCP clients keep getting dynamic client registration,
+    # PKCE, the consent screen, tokens, refresh and revocation exactly as
+    # before, because PocketID has no `registration_endpoint` and those clients
+    # require one. What changes is only who `GET /authorize`'s
+    # `/admin/auth/login?next=…` redirect hands the person to.
+    #
+    # `local` is the default so an existing deployment, and every existing
+    # test, keeps the username/password form it has today. Under `pocketid`
+    # that form is **gone**, not merely hidden: `POST /admin/auth/login` and
+    # both halves of `/admin/register` 404, so there is no password path around
+    # the identity provider. See `src/auth/oidc.py`.
+    auth_mode: Literal["local", "pocketid"] = "local"
+
+    # The OIDC provider's issuer identifier — the `iss` every ID token must
+    # carry and the origin discovery is fetched from
+    # (`<issuer>/.well-known/openid-configuration`). HTTPS is required with no
+    # loopback exemption, unlike `BASE_URL`: this is somebody else's origin
+    # over a network the operator does not own, and an ID token is a bearer
+    # assertion of identity.
+    oidc_issuer: str | None = None
+    oidc_client_id: str | None = None
+    oidc_client_secret: str | None = None
+    # Where the provider sends the browser back — must be one of the redirect
+    # URIs registered with the provider, and is sent on both the authorization
+    # request and the token exchange so the two cannot disagree.
+    oidc_redirect_uri: str | None = None
+    # When set, the ID token's `groups` claim must contain this value or the
+    # login is refused. Unset means "every account the provider authenticates
+    # may sign in", which is the provider's own access policy and is a
+    # deliberate choice rather than an oversight — PocketID gates client
+    # assignment per user already.
+    oidc_required_group: str | None = None
+    # Space-separated, RFC 6749 §3.3 form. `openid` is not optional and is
+    # re-added by the validator if an operator drops it: without it the
+    # provider is under no obligation to return an ID token at all, and the ID
+    # token is the entire identity assertion this flow rests on.
+    oidc_scopes: str = "openid profile email groups"
+
     # ── Panel session registry (#198, migration 024) ───────────────────────
     #
     # How stale `user_sessions.last_seen_at` may get before a validated request
@@ -1019,6 +1061,128 @@ class Settings(BaseSettings):
             raise ValueError(
                 "OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_federated_login(self) -> "Settings":
+        """Refuse to boot `AUTH_MODE=pocketid` with a login that cannot work.
+
+        Every branch here is a **startup** refusal for the same reason the
+        `SECRET_KEY` placeholder guard is one: the failure it prevents is
+        otherwise discovered by a person standing in front of a login page that
+        redirects to a provider it cannot name, on a deployment whose local
+        password form has already been withdrawn — i.e. with nobody able to
+        sign in and no way back except an operator with shell access. A
+        configuration that cannot authenticate anybody is not a degraded mode,
+        it is a locked door.
+
+        Four things are checked.
+
+        **`MULTI_USER_MODE` must be on.** `src/main.py` mounts the auth router
+        *only* in multi-user mode, so under single-user mode
+        `/admin/auth/login` and the OIDC callback do not exist as routes at
+        all — the panel's identity is the sentinel and its credential is
+        Traefik's OAuth chain. `AUTH_MODE=pocketid` there would be a setting
+        that reads as configured and changes nothing, which is worse than a
+        refusal because it looks like it worked.
+
+        **The four required fields must be present.** A missing one is not
+        recoverable at request time: the authorization request cannot be built
+        without an issuer, a client id or a redirect URI, and the token
+        exchange cannot be authenticated without the secret.
+
+        **The issuer must be HTTPS**, with no loopback exemption — `BASE_URL`
+        has one because it names *this* process, while the issuer names
+        somebody else's origin across a network the operator does not own, and
+        everything the flow trusts (the discovery document, the JWKS, the token
+        response) arrives over it. It must also be a bare origin-with-optional-
+        path: discovery appends `/.well-known/openid-configuration`, so a
+        query string or a fragment silently produces a URL that fetches
+        nothing, and userinfo in the URL would put a credential in a log line.
+
+        **The redirect URI must be an absolute HTTPS URL** — or loopback HTTP,
+        which *is* exempt, because that one is a browser destination on the
+        developer's own machine and every OAuth profile permits it there.
+
+        `openid` is added to the scope set rather than refused: an operator who
+        trimmed it made a mistake with one correct repair, and refusing to
+        start over a repair this validator can perform is not fail-fast, it is
+        just a stop.
+        """
+        if self.auth_mode != "pocketid":
+            return self
+
+        if not self.multi_user_mode:
+            raise ValueError(
+                "AUTH_MODE=pocketid requires MULTI_USER_MODE=true. The auth "
+                "router that owns /admin/auth/login and the OIDC callback is "
+                "mounted only in multi-user mode, so federated login would be "
+                "configured and unreachable."
+            )
+
+        required = {
+            "OIDC_ISSUER": self.oidc_issuer,
+            "OIDC_CLIENT_ID": self.oidc_client_id,
+            "OIDC_CLIENT_SECRET": self.oidc_client_secret,
+            "OIDC_REDIRECT_URI": self.oidc_redirect_uri,
+        }
+        missing = [name for name, value in required.items() if not (value or "").strip()]
+        if missing:
+            raise ValueError(
+                f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} "
+                "required when AUTH_MODE=pocketid. Local password login is "
+                "disabled in that mode, so an incomplete provider "
+                "configuration locks every user out of the panel."
+            )
+
+        issuer = self.oidc_issuer.strip().rstrip("/")
+        parsed = urlparse(issuer)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "OIDC_ISSUER must be an https:// origin without credentials, "
+                "query or fragment (for example "
+                "https://auth.example.com). Discovery appends "
+                "/.well-known/openid-configuration to it."
+            )
+        self.oidc_issuer = issuer
+
+        redirect = self.oidc_redirect_uri.strip()
+        redirect_parsed = urlparse(redirect)
+        redirect_scheme_ok = redirect_parsed.scheme == "https" or (
+            redirect_parsed.scheme == "http"
+            and _is_loopback_host(redirect_parsed.hostname or "")
+        )
+        if (
+            not redirect_scheme_ok
+            or not redirect_parsed.hostname
+            or redirect_parsed.username is not None
+            or redirect_parsed.password is not None
+            or redirect_parsed.fragment
+        ):
+            raise ValueError(
+                "OIDC_REDIRECT_URI must be an absolute https:// URL (http:// "
+                "only for loopback development) with no credentials or "
+                "fragment — for example "
+                "https://obsidian-mcp.example.com/admin/auth/oidc/callback."
+            )
+        self.oidc_redirect_uri = redirect
+
+        scopes = (self.oidc_scopes or "").split()
+        if "openid" not in scopes:
+            scopes.insert(0, "openid")
+        self.oidc_scopes = " ".join(scopes)
+
+        for name in ("oidc_client_id", "oidc_client_secret", "oidc_required_group"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, value.strip() or None)
         return self
 
     @model_validator(mode="after")

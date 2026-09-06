@@ -285,6 +285,62 @@ would leave the validator finding no row for any cookie, i.e. every user locked
 out of the panel. `lock_timeout` / `statement_timeout` are set and `RESET` for
 013's reason.
 
+## 025: `users.oidc_subject`, and why the link is not the email
+
+Migration 025 adds one nullable column, `users.oidc_subject`, and one **partial
+unique** index over it, `ux_users_oidc_subject … WHERE oidc_subject IS NOT
+NULL`. It chains from **024** and **writes no row on any path**: no existing
+account has ever authenticated against an identity provider, NULL is the
+correct value for all of them, and a first federated login is what writes the
+column. Inventing a value here would be inventing an identity claim nobody
+made — and it is also what keeps the gate's stamp-back re-run from unlinking a
+live federated account.
+
+**The link is the provider's `sub` claim, never the email.** `sub` is stable
+for the life of the account at the provider; an email address is reassignable,
+and under an email-keyed link a provider that later handed a former address to
+a different person would hand them the first person's vault on the next login.
+The email is used exactly once — to choose which pre-existing local row a
+*first* login may adopt, guarded on that row carrying no `oidc_subject` yet —
+and never again. See `src/auth/routes.py`'s `_resolve_federated_user`.
+
+**Why the index is partial when a plain `UNIQUE` would also work.** Every local
+account has `oidc_subject IS NULL` and PostgreSQL treats NULLs as distinct, so
+the two are equivalent today. The predicate is written out because it *states*
+the rule rather than depending on a NULL semantic the next reader has to
+recall, and because it is the index the callback's `WHERE oidc_subject = :sub`
+lookup reads — a few federated rows rather than one entry per user.
+
+Uniqueness is not decoration. The callback serialises its check-then-act under
+`USER_BOOTSTRAP_LOCK_KEY` — the *same* advisory lock bootstrap registration
+takes, because both are "decide whether this account exists and create it if
+not" — so two concurrent first logins cannot both insert. The constraint is
+what still holds the day a future call site forgets that lock; without it two
+rows could claim one provider identity and which vault a person reached would
+depend on row order. The reconciliation path therefore reads the index's
+**definition** — columns, uniqueness, validity, partiality *and* the rendered
+predicate against a server-derived canonical (013's scratch-`TEMP`-table
+device) — because the damaging adoption is the quiet one: a same-named
+*non-unique* index passes every existence check while the invariant silently
+stops being true.
+
+Where the column already exists, 025 also refuses a `NOT NULL` one (no local
+account can satisfy it) and one carrying a server default (a provider identity
+every new row silently acquires — and under the unique index, the second such
+row cannot insert at all). Before creating the index it counts pre-existing
+duplicate subjects and **names the invariant** rather than letting
+`CREATE UNIQUE INDEX` surface a raw `duplicate key value`; that state is only
+reachable if the column was populated outside this migration, which is exactly
+the operator who needs to be told why the two rows may not both stand.
+
+025 pins `SET LOCAL search_path TO public` and asserts the unqualified name
+resolves to `public.users`, for 021's, 023's and 024's reason — 024 `RESET`s
+its own pin, so 025 needs one. Adding the column to a `users` in a schema the
+application never reads would have the login callback write a federated
+identity somewhere nothing looks and fail to find it again on the next request.
+`ADD COLUMN` of a nullable column with no default is metadata-only;
+`CREATE INDEX` takes a brief `SHARE` lock on a table with a handful of rows.
+
 ## Backups are protected data, not just a rollback tool
 
 A `pg_dump` of this database is the complete text of every tenant's notes

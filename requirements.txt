@@ -47,6 +47,17 @@ itsdangerous==2.2.0
 # Called directly by src/auth/passwords.py; passlib (unmaintained since 2020,
 # and the only reason bcrypt was held at <4.1) was dropped in favour of it.
 bcrypt==5.0.0
+# ID-token verification for `AUTH_MODE=pocketid` (src/auth/oidc.py). Already
+# present transitively — `mcp` requires PyJWT — and now a direct dependency, so
+# a future `mcp` release that drops it cannot silently break panel login.
+#
+# The `[crypto]` extra is the load-bearing half: without `cryptography` PyJWT
+# cannot verify RS256 at all, and `jwt.decode` raises rather than degrading, so
+# the failure is a refusal and never an unverified token. Writing out the
+# `cryptography` pin beside it keeps the deploy's Trivy gate reading one
+# explicit version rather than resolving an extra.
+pyjwt[crypto]==2.13.0
+cryptography==50.0.1
 
 # Rate limiting (Phase 8)
 slowapi==0.1.10

@@ -48,6 +48,7 @@ embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
 - [Cost expectations](#cost-expectations)
 - [The self-describing vault](#the-self-describing-vault)
 - [Multi-user mode](#multi-user-mode)
+- [Federated login with PocketID (OIDC)](#federated-login-with-pocketid-oidc)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Project layout](#project-layout)
@@ -970,6 +971,135 @@ to multi-user later resumes where you left off without re-bootstrapping
   configuration — which is why `/vaults/` **and the compose file's
   mounts** are the admin-trust boundary, not just the path strings.
 
+## Federated login with PocketID (OIDC)
+
+Multi-user mode's login form is the built-in username/password one by
+default. `AUTH_MODE=pocketid` replaces it with an OIDC provider —
+[PocketID](https://github.com/pocket-id/pocket-id), or any other
+standards-compliant one — so the people using the panel sign in with the
+identity you already run for everything else, and this server stops being
+somewhere passwords are kept.
+
+**What this changes and what it does not.** It changes exactly one thing: how
+the *human* behind the panel and the OAuth consent screen proves who they are.
+It does **not** touch the server's own OAuth 2.0 authorization server. MCP
+clients — Claude, Claude Code, ChatGPT — keep registering dynamically, keep
+doing PKCE, keep seeing the consent screen, keep refreshing and revoking, all
+exactly as before.
+
+That split is forced rather than chosen. MCP clients require dynamic client
+registration (RFC 7591), and PocketID does not implement it: its discovery
+document has no `registration_endpoint`. So PocketID cannot be the authorization
+server those clients talk to. What it can be — and what it is here — is the
+identity provider *behind* this server's consent screen. This server stays the
+authorization server for MCP clients and becomes a relying party to PocketID
+for human logins. Nothing about the MCP-facing protocol moves.
+
+### Register the client in PocketID
+
+Create one **OIDC client** with:
+
+| Field | Value |
+| --- | --- |
+| Callback / redirect URL | `https://obsidian-mcp.example.com/admin/auth/oidc/callback` — your own hostname, exactly, with no trailing slash |
+| Client type | **Confidential** (a client secret is issued and used) |
+| PKCE | **Enabled** |
+| Logout callback URL | `https://obsidian-mcp.example.com/admin/auth/login` (optional; only needed if you want a panel logout to end the PocketID session too) |
+
+Copy the client ID and client secret it gives you. If you want to gate access
+by group, create the group in PocketID and assign the users who should be able
+to sign in.
+
+The redirect URI must match byte for byte on both sides — it is sent on the
+authorization request *and* again on the token exchange, and a provider that
+sees two different values refuses the exchange.
+
+### Configure this server
+
+```bash
+MULTI_USER_MODE=true          # required: the auth routes are mounted only here
+AUTH_MODE=pocketid
+OIDC_ISSUER=https://auth.example.com
+OIDC_CLIENT_ID=<from PocketID>
+OIDC_CLIENT_SECRET=<from PocketID>
+OIDC_REDIRECT_URI=https://obsidian-mcp.example.com/admin/auth/oidc/callback
+
+# Optional
+OIDC_REQUIRED_GROUP=obsidian-mcp        # unset = anyone PocketID authenticates
+OIDC_SCOPES=openid profile email groups # the default
+```
+
+`make deploy` (the migration adding `users.oidc_subject` runs as part of it).
+
+The server **refuses to start** if `AUTH_MODE=pocketid` is set without
+`MULTI_USER_MODE`, without all four required values, with a non-HTTPS issuer,
+or with a redirect URI that is not an absolute HTTPS URL (plain `http://` is
+allowed only for loopback development). That is deliberate: in this mode the
+local password form is gone, so a half-configured provider would be a
+deployment nobody can sign in to.
+
+### Bootstrap the first admin *before* you switch
+
+Under `AUTH_MODE=pocketid`, `/admin/register` and `POST /admin/auth/login`
+return **404** — there is no password path around the identity provider — and a
+user created by a first federated login is **never** an admin and has **no**
+vault assigned. So:
+
+1. Deploy with `AUTH_MODE=local` (or leave it unset) and bootstrap your admin
+   at `/admin/register` as described under
+   [Multi-user mode](#multi-user-mode).
+2. Then set `AUTH_MODE=pocketid` and redeploy.
+
+On that admin's first federated login, their existing local account is adopted
+— see below — so they keep their admin flag, their vault, their keys and their
+OAuth clients.
+
+### How accounts are matched
+
+Accounts are linked by the ID token's **`sub`** claim, stored in
+`users.oidc_subject`, and never by email. `sub` is stable for the life of the
+account at the provider; an email address is reassignable, and a provider that
+later handed a former address to somebody else would otherwise hand them the
+first person's vault.
+
+On a first login for an unseen `sub`, a local username is derived from the
+email's local part (`max@example.com` → `max`), folded to
+lowercase `[a-z0-9_]`, and:
+
+- if a local account with that username exists and is **not yet linked** to any
+  provider identity, it is adopted — it keeps its admin flag, vault, keys and
+  history;
+- if it exists and is already linked to a *different* `sub`, the login is
+  **refused** rather than reassigned, and an operator resolves it by renaming
+  one of the accounts;
+- otherwise a new account is created, `is_admin=false`, with no `vault_path`.
+
+A new account can therefore sign in to the panel immediately and can do nothing
+with the vault until an admin assigns it one at `/admin/users/{id}/edit` —
+the same fail-closed state a local user with no assignment is already in.
+
+### Operational notes
+
+- **Every login failure renders one identical page.** Which check refused —
+  a bad signature, a wrong audience, an expired token, a missing group, an
+  unreachable provider — is in the security log as
+  `panel_oidc_login_refused` with a `reason`, and nowhere else. Account
+  creations and adoptions are logged as `panel_oidc_user_created` /
+  `panel_oidc_user_linked`; a successful sign-in emits the same
+  `panel_login_succeeded` a password login does.
+- **Logout** revokes the local session row first (so it really ends), then
+  redirects to the provider's `end_session_endpoint` when it advertises one. If
+  the provider is unreachable, logout still succeeds locally.
+- **The callback is rate-limited** at 10 requests/minute per client address.
+- **Rolling back** is `AUTH_MODE=local` and a restart. The password form and
+  `/admin/register` come back; `users.oidc_subject` stays in place, so
+  switching forward again re-links every account without a second adoption.
+  Note that an account *created* by a federated login has no usable local
+  password — an admin sets one through the reset path if it needs one.
+- **`AUTH_MODE=local` remains the default**, and nothing above applies to it.
+  Local development, the test suite and every existing deployment keep the
+  username/password form with no OIDC settings present at all.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -979,6 +1109,13 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
 | `MULTI_USER_MODE` | `false` | In-app login, per-user vaults. See [Multi-user mode](#multi-user-mode). |
+| `AUTH_MODE` | `local` | How the *human* signs in to the panel: `local` (username/password) or `pocketid` (OIDC). Governs the panel login only — the server's own OAuth authorization server for MCP clients is unchanged either way. `pocketid` requires `MULTI_USER_MODE=true` and removes the password form and self-registration (both 404). See [Federated login with PocketID](#federated-login-with-pocketid-oidc). |
+| `OIDC_ISSUER` | — | Required when `AUTH_MODE=pocketid`. The provider's issuer, e.g. `https://auth.example.com`. HTTPS with no loopback exemption; discovery appends `/.well-known/openid-configuration`. |
+| `OIDC_CLIENT_ID` | — | Required when `AUTH_MODE=pocketid`. |
+| `OIDC_CLIENT_SECRET` | — | Required when `AUTH_MODE=pocketid`. Confidential client; sent as `client_secret_post` on the token exchange. |
+| `OIDC_REDIRECT_URI` | — | Required when `AUTH_MODE=pocketid`. Absolute HTTPS URL (http only for loopback), registered byte-for-byte with the provider: `https://<host>/admin/auth/oidc/callback`. |
+| `OIDC_REQUIRED_GROUP` | — | When set, the ID token's `groups` claim must contain it or the login is refused. Unset defers to the provider's own client assignment. |
+| `OIDC_SCOPES` | `openid profile email groups` | Space-separated. `openid` is mandatory and is re-added if omitted. |
 | `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS` | `10` | How long the vault-root overlap check waits on one root before giving up on it. Expiry quarantines that one account (`root unexaminable`) and the check carries on, so a hung mount cannot hold up startup. Multi-user mode only. |
 | `MCP_HOSTNAME` | — | Public hostname. Derives `BASE_URL`, `ALLOWED_ORIGINS` and `ALLOWED_HOSTS` as `https://<host>`. Required (or `BASE_URL`) for the transfer tools. |
 | `BASE_URL` | derived | Explicit public origin. HTTPS except on loopback. |

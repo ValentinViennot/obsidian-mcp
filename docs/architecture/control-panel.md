@@ -860,3 +860,86 @@ The lifecycle, in one table — one implementation per phase:
   absence of any numeric `minlength` on these forms **and** that each handler
   actually passes the key — a template reading it off a context that has none
   renders `minlength=""`, which is silently no minimum at all.
+
+## Federated panel login (`AUTH_MODE=pocketid`)
+
+`AUTH_MODE` governs **one thing**: how the human behind the panel — and behind
+the OAuth consent screen — proves who they are. `src/oauth/routes.py`, this
+server's own OAuth 2.0 authorization server for MCP clients, is untouched by it
+in both modes.
+
+- **The split is forced, not chosen.** MCP clients (Claude, Claude Code)
+  require dynamic client registration; PocketID's discovery document has no
+  `registration_endpoint`, verified against the deployed v2.14.0. So PocketID
+  cannot be the authorization server those clients talk to. This server stays
+  that authorization server and additionally becomes a *relying party* to
+  PocketID for human logins. Nothing about the MCP-facing protocol —
+  registration, PKCE, consent, token, refresh, revoke — moves.
+
+- **The seam is one redirect, and its contract is unchanged.**
+  `authorize_get` already sends an unauthenticated user to
+  `/admin/auth/login?next=<the whole /authorize URL>`. Under `pocketid` that
+  page redirects onward to the provider instead of rendering a form; `next` is
+  carried through the round trip **inside the signed cookie**, not through the
+  provider's `state`, so the value never leaves this server in a form anybody
+  can edit, and the person lands back on the consent screen they came from.
+
+- **The password form is withdrawn, not hidden.** `POST /admin/auth/login`,
+  `GET /admin/register` and `POST /admin/register` all 404 under `pocketid`
+  (`_require_local_password_route`, `_require_account_route`'s D23 rule one
+  mode over). A login form that still verified `password_hash` would be a way
+  around the identity provider, and `/admin/register` would mint an
+  administrator the provider has never heard of. The mirror holds too: the OIDC
+  callback 404s under `local`, so it is not an unauthenticated endpoint making
+  outbound requests to whatever `OIDC_ISSUER` was left in the environment.
+
+- **`state`, `nonce`, the PKCE verifier and `next` share one signed cookie**,
+  under `URLSafeTimedSerializer(secret_key, salt="oidc-login")` — the
+  `oauth_state` mechanism next door with a different salt, so a value sealed by
+  one flow cannot be presented to the other. The cookie is deleted on **every**
+  callback path including the refusals: a leftover triple is a replayable one,
+  and the refusal paths are where a leftover would be most useful to somebody.
+
+- **PKCE is used even though the client is confidential.** The secret protects
+  the token *endpoint*; the verifier protects the *code*, which travels through
+  a browser redirect and a query string proxies log. Neither substitutes for
+  the other.
+
+- **The ID token is the whole identity assertion.** Signature (RS256 against a
+  `kid` from the JWKS), `iss`, `aud`, `exp`, `iat` — including the
+  future-`iat` refusal PyJWT treats as informational — `azp` on a
+  multi-audience token, and `nonce`. There is no `userinfo` call, so there is
+  no second document whose claims could disagree with the signed one, and the
+  `access_token` is discarded unread.
+
+- **Nothing is ever auto-promoted.** A row created by a first federated login
+  is `is_admin=False` with no `vault_path`, so the person has a panel session
+  and no vault until an administrator assigns one — the same fail-closed state
+  `_vault_root` already enforces. The first administrator is bootstrapped under
+  `AUTH_MODE=local` and adopted on their first federated login; there is
+  deliberately no "first OIDC user becomes admin" rule.
+
+- **Adoption is guarded, because the username derivation is many-to-one.**
+  `max@a.example` and `max@b.example` both fold to the local name `max`. A
+  first login adopts a matching row only when that row carries **no**
+  `oidc_subject`; one already linked to a different `sub` is refused and an
+  administrator resolves it by renaming. Without that guard the derivation
+  would be an account-takeover primitive. See
+  [schema-and-migrations.md](schema-and-migrations.md)'s 025 section for why
+  the durable link is `sub` and not the email.
+
+- **Every refusal renders one identical page and says nothing.** The cause
+  lives only in `panel_oidc_login_refused`'s `reason` — a closed vocabulary,
+  every value this server's own classification and never provider- or
+  caller-authored text. A person whose provider is briefly down, a person an
+  operator has not added to `OIDC_REQUIRED_GROUP`, and a person replaying a
+  forged callback all see the same thing; telling them apart is the log's job,
+  exactly as the password form's constant "Invalid credentials" already works.
+  A *successful* federated sign-in emits `panel_login_succeeded`, the same
+  event a password login does, so "who signed in" is one query either way.
+
+- **Logout revokes the local row first**, then redirects to the provider's
+  `end_session_endpoint` when it advertises one. `end_session_url` never
+  raises: the local session is already gone by the time it is consulted, and a
+  logout that has ended the session must not become a 500 because the provider
+  is unreachable.

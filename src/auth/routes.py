@@ -4,6 +4,26 @@ The router is mounted at the FastAPI app level in `src/main.py` ONLY when
 `settings.multi_user_mode` is true. In single-user mode the router is not
 mounted at all, so these paths 404.
 
+`AUTH_MODE` decides which of two mutually exclusive login mechanisms this
+router exposes, and it is exclusive on purpose:
+
+* `local` (the default, and unchanged) — the username/password form, the
+  bootstrap registration page, and the four handlers below that serve them.
+* `pocketid` — `GET /admin/auth/login` redirects to an OIDC provider,
+  `GET /admin/auth/oidc/callback` completes the flow, and **the password form
+  and self-registration 404**. Not hidden: 404. A login page that still
+  accepted a password would be a way around the identity provider, and the
+  provider is the whole point of choosing that mode.
+
+**What does not change in either mode**: the server's own OAuth 2.0
+authorization server in `src/oauth/routes.py`. MCP clients still register
+dynamically, still do PKCE, still see the consent screen, still refresh and
+revoke — because PocketID publishes no `registration_endpoint` and those
+clients require one. `GET /authorize`'s redirect to
+`/admin/auth/login?next=<the whole /authorize URL>` is the one seam between the
+two, and its contract is untouched: this router still answers that path, still
+honours that parameter, and still lands the person back on the consent screen.
+
 `/admin/auth/*` and `/admin/register` live under the `/admin` prefix so that
 Traefik's `chain-oauth@file` middleware (which gates `/admin/*` on the
 production deploy) still fronts them. That gating is what makes the bootstrap
@@ -15,17 +35,20 @@ depth.
 import logging
 import os
 import re
+import secrets
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Form, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.auth import oidc
 from src.auth.passwords import (
     MIN_PASSWORD_LENGTH,
     hash_password,
+    unusable_password_hash,
     validate_new_password,
     verify_password,
 )
@@ -190,6 +213,426 @@ def _render_register(
     )
 
 
+# --- Federated login (AUTH_MODE=pocketid) ---------------------------------
+
+#: Re-exported from `src/auth/oidc.py` so the two handlers that set and clear
+#: it, and the tests that read it, name one constant.
+LOGIN_COOKIE = oidc.LOGIN_COOKIE
+
+
+def _federated() -> bool:
+    return settings.auth_mode == "pocketid"
+
+
+def _require_local_password_route() -> None:
+    """404 the password form and self-registration under `AUTH_MODE=pocketid`.
+
+    `_require_account_route`'s rule, one mode over (D23): a route that cannot
+    do anything here should not advertise that it exists elsewhere, so 404 and
+    not 403. The stronger reason is that these two routes are not merely
+    useless in federated mode, they are a **bypass**: a `POST` to the login
+    form that still verified `password_hash` would sign a person in without the
+    identity provider ever being consulted, and `/admin/register` would mint a
+    fresh administrator the provider has never heard of. Withdrawing them is
+    what makes "the provider is the only way in" true of the code rather than
+    of the template that stopped rendering a form.
+
+    One rule for every method of both routes is also one thing to test.
+    """
+    if _federated():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+
+def _require_federated_route() -> None:
+    """The mirror: the OIDC callback does not exist under `AUTH_MODE=local`.
+
+    Same 404, same reason. A callback that stayed reachable in local mode would
+    be an unauthenticated endpoint performing outbound requests against
+    whatever `OIDC_ISSUER` happened to be left in the environment.
+    """
+    if not _federated():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+
+def _oidc_refused(request: Request, reason: str, *, user_id: int | None = None) -> None:
+    """One `panel_oidc_login_refused`. The rendered page is the same for all.
+
+    Subject is the client address, never a resolved row: like every other
+    unauthenticated refusal in this server, keying on the account an attacker
+    named would hand them one fresh allowance per identity they guess. `reason`
+    is the closed vocabulary `src/auth/oidc.py` raises plus this module's own
+    four, and it is the only place the cause exists — the browser sees one
+    constant page for every branch, exactly as `login_submit`'s three password
+    branches answer with one byte-identical 401.
+    """
+    security_events.emit(
+        "panel_oidc_login_refused",
+        subject=security_events.subject_for(request=request),
+        reason=reason,
+        user_id=user_id,
+        client_ip=security_events.client_ip(request),
+        route=request.url.path,
+    )
+
+
+def _render_oidc_error(request: Request, *, status_code: int) -> HTMLResponse:
+    """The one page every federated refusal renders.
+
+    It names no reason. A person who mistyped nothing and did everything right
+    can reach this page (their provider is down, or an operator has not
+    assigned them the group), and a person probing it can reach it too; telling
+    the two apart is the log's job. The only affordance is a link back to
+    `/admin/auth/login`, which starts a fresh authorization request — a retry
+    is the correct response to most of the reasons behind it.
+    """
+    try:
+        request.session.pop("flash_new_key", None)
+    except (AssertionError, AttributeError):
+        pass
+    return templates.TemplateResponse(
+        request, "oidc_error.html", {}, status_code=status_code
+    )
+
+
+def _clear_login_cookie(response: Response) -> None:
+    """Delete `LOGIN_COOKIE` — on **every** callback path, including refusals.
+
+    A `state`/`nonce`/verifier triple that outlives the callback it was minted
+    for is a replayable one, and the refusal paths are exactly where a leftover
+    would be most useful to somebody: a `state` mismatch that left the cookie in
+    place would let an attacker keep firing codes at it until one matched.
+    """
+    response.delete_cookie(LOGIN_COOKIE, path="/")
+
+
+def _set_login_cookie(response: Response, sealed: str) -> None:
+    """`oauth_state`'s cookie attributes, verbatim, one flow over.
+
+    `httponly` because no script has any business reading it; `secure` keyed on
+    `BASE_URL`'s scheme, because a browser silently drops a `Secure` cookie on
+    plain HTTP and loopback development would otherwise be unable to log in at
+    all; `samesite="lax"`, which is the strongest setting that survives the
+    provider's top-level `GET` redirect back — `strict` would have the browser
+    withhold the cookie on exactly the request that needs it.
+    """
+    response.set_cookie(
+        LOGIN_COOKIE,
+        sealed,
+        httponly=True,
+        secure=settings.base_url.startswith("https://"),
+        samesite="lax",
+        max_age=oidc.LOGIN_COOKIE_MAX_AGE,
+        path="/",
+    )
+
+
+async def _redirect_to_provider(request: Request, target: str) -> Response:
+    """Mint a login attempt and send the browser to the provider.
+
+    `target` arrives **already through `_safe_next`**, and it is sealed into
+    the signed cookie rather than round-tripped through the provider's `state`.
+    Two reasons: the value never leaves this server in a form anybody can edit,
+    so the callback's redirect cannot be turned into an open redirect by
+    tampering; and `state` stays what it is for — an opaque CSRF nonce with no
+    payload to parse.
+    """
+    try:
+        url, pending = await oidc.authorization_request(target)
+    except oidc.OIDCError as exc:
+        # The provider is unreachable, or its discovery document is unusable.
+        # 503 rather than 500: nothing is wrong with the request, and a retry
+        # in a minute is the right advice.
+        _oidc_refused(request, exc.reason)
+        return _render_oidc_error(
+            request, status_code=status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+    response = RedirectResponse(url, status_code=status.HTTP_302_FOUND)
+    _set_login_cookie(response, oidc.seal_pending(pending))
+    return response
+
+
+def _local_username_for(identity: oidc.VerifiedIdentity) -> str | None:
+    """The local `users.username` this provider identity corresponds to.
+
+    Used for **two** things and they are not the same weight:
+
+    * naming a **new** row, and
+    * choosing which pre-existing row a *first* login may adopt.
+
+    The email's local part first, then `preferred_username`, folded into the
+    `_USERNAME_RE` alphabet the rest of this server already enforces. The order
+    matters because adoption is specified in terms of the email: an operator
+    who created `max` by hand expects `max@example.com` to land on it.
+
+    **Adoption is guarded on the target row carrying no `oidc_subject` yet**
+    (see `_resolve_federated_user`), which is what keeps this derivation from
+    being an account-takeover primitive: two provider accounts can easily fold
+    to one local name — `max@a.example` and `max@b.example` both give `max` —
+    and without that guard the second would inherit the first's vault. With it,
+    the second is refused and an administrator resolves it by renaming.
+
+    Returns `None` when neither claim yields a usable name, which is a refusal
+    rather than a generated fallback: a server-invented username is a name no
+    operator can recognise in the panel.
+    """
+    for source in (identity.email, identity.preferred_username):
+        if not source:
+            continue
+        candidate = re.sub(r"[^a-z0-9_]", "_", source.split("@", 1)[0].strip().lower())
+        candidate = candidate.strip("_")[:64]
+        if _USERNAME_RE.match(candidate):
+            return candidate
+    return None
+
+
+async def _resolve_federated_user(
+    session: AsyncSession, identity: oidc.VerifiedIdentity
+) -> tuple[User | None, str]:
+    """Find, adopt or create the local account for a verified identity.
+
+    Returns `(user, outcome)` where `outcome` is one of `existing`, `linked`,
+    `created` — or `(None, <refusal reason>)`, and the caller cannot tell the
+    two apart except by the `None`, which is deliberate: every refusal renders
+    the same page.
+
+    **The whole check-then-act runs under the bootstrap advisory lock.** Two
+    concurrent first logins by the same person — a browser and its own
+    prefetch — would otherwise both see "no row for this subject", both derive
+    the same username and both insert. The unique index on `users.username`
+    turns the loser into an `IntegrityError`, i.e. a 500 on a login that should
+    simply have joined the winner. The lock is the *same* key
+    `register_submit` takes, which is correct rather than convenient: both are
+    "decide whether this account exists and create it if not", and giving them
+    separate keys would let a bootstrap and a first federated login race each
+    other into two administrators' worth of confusion.
+
+    The lock and `lock_account_guard` (which `start_session` takes) are
+    therefore held **sequentially, never nested** — this function commits
+    before the caller mints a session, exactly as `register_submit` does.
+
+    **No account is ever auto-promoted.** A created row is `is_admin=False`
+    with no `vault_path`, so a person the provider has authenticated arrives
+    with a session and no vault, and every MCP tool refuses them until an
+    administrator assigns one. That is the same fail-closed shape
+    `_vault_root` already enforces for a local user with no assignment, and it
+    is why the first administrator must be bootstrapped under `AUTH_MODE=local`
+    (or by hand) rather than being whoever logs in first.
+    """
+    existing = (
+        await session.execute(
+            select(User).where(User.oidc_subject == identity.subject)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if not existing.is_active:
+            return None, "inactive_user"
+        return existing, "existing"
+
+    username = _local_username_for(identity)
+    if username is None:
+        return None, "no_username_claim"
+
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:k)"), {"k": _BOOTSTRAP_LOCK_KEY}
+    )
+
+    # Re-read under the lock. A concurrent first login may have created or
+    # adopted the row between the unlocked lookup above and this point, and the
+    # correct answer then is that one — not a second row for the same person.
+    existing = (
+        await session.execute(
+            select(User).where(User.oidc_subject == identity.subject)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if not existing.is_active:
+            return None, "inactive_user"
+        return existing, "existing"
+
+    local = (
+        await session.execute(select(User).where(User.username == username))
+    ).scalar_one_or_none()
+
+    if local is not None:
+        if local.oidc_subject is not None:
+            # Another provider identity already owns this name. Refused rather
+            # than reassigned: the two are different people as far as the
+            # provider is concerned, and rewriting the link would hand the
+            # second one the first one's vault. An administrator renames one.
+            return None, "username_claimed"
+        if not local.is_active:
+            return None, "inactive_user"
+        local.oidc_subject = identity.subject
+        return local, "linked"
+
+    created = User(
+        username=username,
+        # No local password exists for this account and none is invented — see
+        # `unusable_password_hash`.
+        password_hash=unusable_password_hash(),
+        # **Never auto-granted.** The provider says who somebody is; it does
+        # not say what they may do here.
+        is_admin=False,
+        is_active=True,
+        oidc_subject=identity.subject,
+    )
+    session.add(created)
+    await session.flush()  # populate created.id
+    return created, "created"
+
+
+@router.get("/admin/auth/oidc/callback")
+@limiter.limit("10/minute")
+async def oidc_callback(
+    request: Request,
+    code: str = Query(""),
+    state: str = Query(""),
+    error: str = Query(""),
+    session: AsyncSession = Depends(get_session),
+):
+    """Complete the authorization-code flow and start a panel session.
+
+    The order below is the order the checks have to happen in, and each one
+    stands between the next and something it would otherwise trust:
+
+    1. the mode gate, so this route does not exist under `AUTH_MODE=local`;
+    2. the signed cookie, which is the only thing that says a login is in
+       flight at all;
+    3. `state`, compared in constant time — the CSRF check, and it runs before
+       any outbound request so a forged callback cannot make this server talk
+       to the provider;
+    4. the provider's own `error` parameter, honoured after `state` so a
+       consent denial is attributed to a real login attempt;
+    5. the code exchange, then full ID-token verification including `nonce`;
+    6. the group requirement;
+    7. the account resolution and the commit;
+    8. `start_session`, which owns its own guarded transaction, and only then
+       the redirect.
+
+    Every refusal renders the same page and clears the cookie. Nothing partial
+    survives: there is no path that commits a `users` row and then fails to
+    sign the person in without saying so in the log.
+    """
+    _require_federated_route()
+
+    def refuse(reason: str, *, status_code: int = status.HTTP_400_BAD_REQUEST,
+               user_id: int | None = None) -> Response:
+        _oidc_refused(request, reason, user_id=user_id)
+        response = _render_oidc_error(request, status_code=status_code)
+        _clear_login_cookie(response)
+        return response
+
+    pending = oidc.open_pending(request.cookies.get(LOGIN_COOKIE))
+    if pending is None:
+        # No cookie, a forged one, an expired one, or one carrying the wrong
+        # shape. From here they are one event: there is no login in flight.
+        return refuse("no_login_in_flight")
+
+    if not state or not secrets.compare_digest(state, pending.state):
+        return refuse("state_mismatch")
+
+    if error:
+        # The provider refused, most often because the person declined consent.
+        # The provider's code is *not* logged: it is provider-authored text on
+        # an unauthenticated path, and `reason` is a closed vocabulary.
+        return refuse("provider_refused")
+
+    if not code:
+        return refuse("no_code")
+
+    try:
+        id_token = await oidc.exchange_code(code, pending.code_verifier)
+        identity = await oidc.verify_id_token(id_token, nonce=pending.nonce)
+    except oidc.OIDCError as exc:
+        # `provider_unreachable` is the one branch that is not the caller's
+        # fault, and it is still the same page: distinguishing them for the
+        # browser would tell a prober which of their forged tokens got as far
+        # as the network.
+        status_code = (
+            status.HTTP_503_SERVICE_UNAVAILABLE
+            if exc.reason in ("provider_unreachable", "provider_error")
+            else status.HTTP_400_BAD_REQUEST
+        )
+        return refuse(exc.reason, status_code=status_code)
+
+    if not oidc.group_allows(identity):
+        # Authenticated, not authorized. 403 rather than 400: the request was
+        # perfectly well formed and the answer will not change on a retry until
+        # an operator changes the provider-side group.
+        return refuse("group_required", status_code=status.HTTP_403_FORBIDDEN)
+
+    try:
+        user, outcome = await _resolve_federated_user(session, identity)
+        if user is None:
+            await session.rollback()
+            return refuse(outcome, status_code=status.HTTP_403_FORBIDDEN)
+        user.last_login_at = datetime.now(timezone.utc)
+        user_id = user.id
+        username = user.username
+        session_version = user.session_version
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    # After the commit, never after the flush (D17): a commit that then raises
+    # would otherwise leave a record asserting an account exists that does not.
+    if outcome in ("created", "linked"):
+        security_events.emit(
+            f"panel_oidc_user_{outcome}",
+            level=logging.INFO,
+            subject=security_events.subject_for(user_id=user_id, request=request),
+            user_id=user_id,
+            username=username,
+            client_ip=security_events.client_ip(request),
+        )
+
+    # Warm the per-user vault-path cache, exactly as `login_submit` does. A
+    # freshly created federated user has no assignment and is filtered out.
+    await warm_user_vault_cache(session, user_id)
+
+    # The mint runs after the resolution has committed and takes its own
+    # guard — the two advisory-lock keys are therefore sequential, never
+    # nested. A refusal here means a deactivation or a password reset committed
+    # in the window; nobody is signed in and no row comes back to life.
+    if (
+        await start_session(
+            request, session, user_id, expected_session_version=session_version
+        )
+        is None
+    ):
+        request.session.clear()
+        return refuse(
+            "session_mint_refused",
+            status_code=status.HTTP_403_FORBIDDEN,
+            user_id=user_id,
+        )
+
+    # **After the mint**, for `login_submit`'s reason (D17, sharpened): until
+    # `start_session` has committed a row there is no session to have
+    # succeeded. The same event as a password login, deliberately — an operator
+    # filtering for "who signed in" must find both.
+    security_events.emit(
+        "panel_login_succeeded",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=user_id, request=request),
+        user_id=user_id,
+        username=username,
+        client_ip=security_events.client_ip(request),
+        route=request.url.path,
+    )
+
+    # `pending.next_url` went through `_safe_next` before it was **signed**, so
+    # it cannot have been edited in the browser. It is re-validated anyway: the
+    # cost is one function call, and the alternative is a redirect whose safety
+    # rests on a signature check three hundred lines away.
+    response = RedirectResponse(
+        _safe_next(pending.next_url), status_code=status.HTTP_302_FOUND
+    )
+    _clear_login_cookie(response)
+    return response
+
+
 # --- Login / logout -------------------------------------------------------
 
 
@@ -207,7 +650,16 @@ async def login_form(
     # holding a dead cookie could reach.
     if await get_active_session_user(request, session) is not None:
         return RedirectResponse(_safe_next(next), status_code=status.HTTP_302_FOUND)
-    return _render_login(request, next_url=_safe_next(next))
+    target = _safe_next(next)
+    if _federated():
+        # **The seam.** `GET /authorize` redirects an unauthenticated MCP
+        # client's user here with the whole `/authorize` URL in `next`; this
+        # branch changes only who answers the "who are you" question, and
+        # `target` — already validated — is carried through the provider round
+        # trip inside a signed cookie so the person lands back on the consent
+        # screen they came from.
+        return await _redirect_to_provider(request, target)
+    return _render_login(request, next_url=target)
 
 
 @router.post("/admin/auth/login")
@@ -219,6 +671,7 @@ async def login_submit(
     next: str = Form("/admin/"),
     session: AsyncSession = Depends(get_session),
 ):
+    _require_local_password_route()
     target = _safe_next(next)
     normalized = (username or "").strip().lower()
 
@@ -346,6 +799,18 @@ async def logout(request: Request, session: AsyncSession = Depends(get_session))
 
     Only the presenting session is revoked — a logout on one device is not an
     account event.
+
+    **Under `AUTH_MODE=pocketid` the redirect target changes and nothing else
+    does.** The local revocation above is the part that matters and runs
+    identically; then, when the provider advertises an `end_session_endpoint`,
+    the browser is sent there so the *provider's* session ends too — otherwise
+    "sign out" leaves a session that signs the person straight back in on their
+    next click, which is the surprise this branch exists to remove. It is
+    strictly best-effort: `end_session_url` answers `None` for a provider that
+    advertises no such endpoint or cannot be reached, and the redirect falls
+    back to `/admin/auth/login` — which under this mode starts a fresh
+    authorization request anyway. A logout that has already revoked the local
+    session may not fail.
     """
     # Read the session **before** it is cleared, and read nothing else: the
     # `_session` suffix is the provenance (D15). Both values are copied from
@@ -422,7 +887,19 @@ async def logout(request: Request, session: AsyncSession = Depends(get_session))
         )
 
     request.session.clear()
-    return RedirectResponse("/admin/auth/login", status_code=status.HTTP_302_FOUND)
+
+    target = "/admin/auth/login"
+    if _federated():
+        # `end_session_url` never raises — see its docstring. The
+        # `post_logout_redirect_uri` is built on `BASE_URL` rather than on
+        # anything from the request, so a `Host` header cannot steer where the
+        # provider sends the browser next.
+        provider_logout = await oidc.end_session_url(
+            f"{settings.base_url.rstrip('/')}/admin/auth/login"
+        )
+        if provider_logout is not None:
+            target = provider_logout
+    return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
 
 
 # --- Bootstrap registration ----------------------------------------------
@@ -433,6 +910,7 @@ async def register_form(
     request: Request,
     session: AsyncSession = Depends(get_session),
 ):
+    _require_local_password_route()
     # Bootstrap is closed once any user exists.
     if not await _users_table_empty(session):
         return RedirectResponse("/admin/auth/login", status_code=status.HTTP_302_FOUND)
@@ -448,6 +926,7 @@ async def register_submit(
     vault_path: str = Form(...),
     session: AsyncSession = Depends(get_session),
 ):
+    _require_local_password_route()
     # Early UX-friendly validation (no DB roundtrip).
     normalized = (username or "").strip().lower()
     if not _USERNAME_RE.match(normalized):

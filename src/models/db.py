@@ -41,6 +41,16 @@ _INDEXED_PROVENANCE_MARKER = (
     "(016_indexed_vault_provenance)"
 )
 
+# Migration 025's ownership marker for `users.oidc_subject`, mirrored here for
+# 015/016/017/018/020's reason: `alembic check` compares column comments, so a
+# marker that drifted from the migration keying on it shows up as a pending
+# `alter_column(comment=...)` rather than as a `downgrade()` that has quietly
+# stopped recognising its own work. Must stay byte identical to
+# `COLUMN_MARKER` in `alembic/versions/025_oidc_subject.py`.
+_OIDC_SUBJECT_COLUMN_MARKER = (
+    "the identity provider's stable subject claim (025_oidc_subject)"
+)
+
 
 class User(Base):
     __tablename__ = "users"
@@ -56,6 +66,30 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     last_login_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ── Federated identity (migration 025, `AUTH_MODE=pocketid`) ───────────
+    #
+    # The identity provider's `sub` claim for this account, or NULL for an
+    # account that has never signed in through one. **The link is on `sub` and
+    # never on the email**: `sub` is stable for the life of the account at the
+    # provider, while an email address is reassignable, and a provider that let
+    # one person take another's former address would otherwise hand them that
+    # person's vault on the next login.
+    #
+    # **Unique, enforced by the database** (`ux_users_oidc_subject`, a partial
+    # index over the non-NULL rows). NULL is the ordinary state for every local
+    # account, so a plain unique constraint would be wrong in Postgres for a
+    # different reason than it is wrong here — NULLs do not conflict — but the
+    # partial index says what is actually meant and is what the lookup reads.
+    # Without uniqueness, two `users` rows could claim one provider identity
+    # and which vault a person reached would depend on row order.
+    #
+    # 255 characters: `sub` is opaque and provider-defined, PocketID's is a
+    # UUID, and the column matches `username` rather than inventing a third
+    # width for an identifier of the same kind.
+    oidc_subject: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment=_OIDC_SUBJECT_COLUMN_MARKER
+    )
 
     # ── Index provenance (issue #91, migration 016) ────────────────────────
     #
@@ -206,6 +240,27 @@ class User(Base):
     # reason.
     sessions: Mapped[list["UserSession"]] = relationship(
         back_populates="user", cascade="all, delete", passive_deletes=True
+    )
+
+    __table_args__ = (
+        # **Partial, over the non-NULL rows only** (migration 025). Postgres
+        # already treats NULLs as distinct, so a plain `UNIQUE` would admit
+        # every local account too — but the predicate is what states the rule
+        # rather than relying on a NULL semantic a reader has to recall, and it
+        # is also the index the `WHERE oidc_subject = :sub` lookup reads.
+        #
+        # It is the database's half of "one provider identity, one account".
+        # The callback takes the bootstrap advisory lock around its
+        # check-then-act, so the constraint is not the only guard — but a
+        # constraint is the guard that survives a future call site that forgets
+        # the lock, and without it two rows could claim one `sub` and which
+        # vault a person reached would depend on row order.
+        Index(
+            "ux_users_oidc_subject",
+            "oidc_subject",
+            unique=True,
+            postgresql_where=text("oidc_subject IS NOT NULL"),
+        ),
     )
 
 

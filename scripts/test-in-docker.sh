@@ -11,6 +11,7 @@
 #   scripts/test-in-docker.sh                  # whole suite
 #   scripts/test-in-docker.sh tests/test_x.py  # any pytest arguments
 #   REBUILD=1 scripts/test-in-docker.sh        # force the image to rebuild
+#   SKIP_BUILD=1 scripts/test-in-docker.sh     # never build; use the image as-is
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,7 +20,19 @@ IMAGE="obsidian-mcp-test:local"
 cd "$REPO_ROOT"
 
 needs_build=0
-if [ "${REBUILD:-0}" = "1" ]; then
+if [ "${SKIP_BUILD:-0}" = "1" ]; then
+  # CI builds the image itself, with a registry-backed layer cache, and then
+  # runs this script so that local and CI execute the same command against the
+  # same image definition. The staleness check below would defeat that: a
+  # cache-restored image carries its ORIGINAL creation timestamp, which is
+  # older than the mtimes a fresh checkout stamps on the manifests, so every
+  # run would discard the cache and rebuild from scratch.
+  needs_build=0
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "SKIP_BUILD=1 but $IMAGE does not exist — build it first." >&2
+    exit 1
+  fi
+elif [ "${REBUILD:-0}" = "1" ]; then
   needs_build=1
 elif ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   needs_build=1

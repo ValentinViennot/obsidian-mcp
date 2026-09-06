@@ -5,6 +5,7 @@ import enum
 import errno
 import fnmatch
 import hashlib
+import json
 import logging
 import os
 import time
@@ -65,6 +66,7 @@ from src.services.index_state import (
     state_table_exists,
 )
 from src.services.links import (
+    MAX_ALIASES_PER_NOTE,
     build_vault_index,
     extract_links_bounded,
     resolve_target,
@@ -719,7 +721,19 @@ def _content_hash(content: str) -> str:
 # CLEARS, so it can never suppress an invalidation another rule mandates — a
 # content change, a `file_path` change, a provider change, exclusion
 # reconciliation.
-CURRENT_EXTRACTION_VERSION = 2
+# Version 3 is an **Obsidian-syntax** bump: `%%comments%%` are now excluded
+# from link extraction, tag extraction and the embedding text; the inline-tag
+# grammar no longer reads hex colours and issue numbers as tags and now reads
+# Unicode ones that it used to truncate; and `resolve_target` learned
+# frontmatter aliases, case-insensitive filenames and Obsidian's
+# shortest-path tie-break. All three are invisible to `content_hash`, so the
+# marker is what re-derives them. Unlike version 2 the *embedding* text does
+# move — but only for a note containing a comment, and
+# `_grammar_changed_the_embedding_text` compares per note, so the re-embed is
+# scoped to those notes rather than to the vault. No manual `make reindex` is
+# needed: the next pass sees every row's marker as stale, re-parses it,
+# re-tags it, re-links it, re-writes its keyword vector and re-stamps it.
+CURRENT_EXTRACTION_VERSION = 3
 
 
 def _grammar_changed_the_embedding_text(stamped_version: int, body: str) -> bool:
@@ -2350,13 +2364,7 @@ async def _update_links_for_changed(
     """
     bodies = path_to_content if path_to_content is not None else {}
     # Build vault_index once for the entire pass — scoped to this user when set.
-    vi_stmt = select(NoteMetadata.file_path, NoteMetadata.id)
-    if user_id is None:
-        vi_stmt = vi_stmt.where(NoteMetadata.user_id.is_(None))
-    else:
-        vi_stmt = vi_stmt.where(NoteMetadata.user_id == user_id)
-    rows = (await session.execute(vi_stmt)).all()
-    vault_index = build_vault_index([(r.file_path, r.id) for r in rows])
+    vault_index = await _alias_aware_vault_index(session, user_id)
     paths_to_id: dict[str, int] = vault_index["paths"]
 
     if changed_paths:
@@ -2495,11 +2503,28 @@ async def _update_links_for_changed(
     #
     # The bare-stem form (`[[Foo]]`) is only safe to match when exactly one
     # note in the vault carries that stem. With a shared stem the resolver
-    # (`resolve_target`) uses same-folder preference and an alphabetical
-    # tie-break, so a blind `target_path = stem` match here would mis-attach
-    # dangling rows that belong to a *different* note. Ambiguous stems stay
-    # dangling and resolve later when their own source note is reindexed.
+    # (`resolve_target`) uses same-folder preference and then Obsidian's
+    # shortest-path rule, so a blind `target_path = stem` match here would
+    # mis-attach dangling rows that belong to a *different* note. Ambiguous
+    # stems stay dangling and resolve later when their own source note is
+    # reindexed.
+    #
+    # **Aliases ride the same rule.** A note that arrives declaring
+    # `aliases: [Chimera]` should attach every dangling `[[Chimera]]` written
+    # before it existed, exactly as a new `Chimera.md` would — otherwise the
+    # edge waits for the *source* note to change, which for a stable note is
+    # never. Only unambiguous aliases are folded in: an alias claimed by two
+    # notes is a tie this statement cannot break, and guessing here would
+    # attach the row to the wrong one permanently.
     stems: dict[str, list[tuple[str, int]]] = vault_index["stems"]
+    alias_map: dict[str, list[tuple[str, int]]] = vault_index["aliases"]
+    # Alias → the note declaring it, inverted once per pass rather than per
+    # changed path: a re-derive makes every note a changed path.
+    aliases_by_id: dict[int, list[str]] = {}
+    for alias, holders in alias_map.items():
+        if len(holders) != 1:
+            continue
+        aliases_by_id.setdefault(holders[0][1], []).append(alias)
     for path in changed_paths:
         nid = paths_to_id.get(path)
         if nid is None:
@@ -2515,8 +2540,20 @@ async def _update_links_for_changed(
         # Only fold in the bare stem when it maps to a single note.
         if len(stems.get(stem, [])) == 1:
             params["stem"] = stem
-        in_clause = ", ".join(f":{p}" for p in ("full", "no_ext", "stem")
-                              if p in params)
+        alias_names = aliases_by_id.get(nid, [])
+        alias_keys = []
+        for i, alias in enumerate(alias_names[:MAX_ALIASES_PER_NOTE]):
+            key = f"alias{i}"
+            # The map is case-folded; `target_path` is the literal text the
+            # author wrote. Matching folded-to-literal would miss every link
+            # whose case differs, so the comparison is pushed into SQL with
+            # `lower()` on the column — the same widening `resolve_target`
+            # makes, kept on the same side of the join.
+            params[key] = alias
+            alias_keys.append(key)
+        in_clause = ", ".join(
+            f":{p}" for p in ("full", "no_ext", "stem") if p in params
+        )
         where_extra = ""
         if user_id is None:
             where_extra = (
@@ -2529,14 +2566,64 @@ async def _update_links_for_changed(
                 " AND source_note_id IN ("
                 "SELECT id FROM notes_metadata WHERE user_id = :uid)"
             )
+        match_clause = f"target_path IN ({in_clause})"
+        if alias_keys:
+            folded = ", ".join(f":{k}" for k in alias_keys)
+            match_clause = f"({match_clause} OR lower(target_path) IN ({folded}))"
         reresolve_sql = (
             "UPDATE note_links "
             "SET target_note_id = :nid "
             "WHERE target_note_id IS NULL "
-            f"AND target_path IN ({in_clause})"
+            f"AND {match_clause}"
             f"{where_extra}"
         )
         await session.execute(text(reresolve_sql), params)
+
+
+async def _alias_aware_vault_index(session, user_id: int | None) -> dict:
+    """The `vault_index` link resolution runs against, aliases included.
+
+    Aliases are a *name* for a note (`aliases: [PRD, Chimera]`), so a link
+    written through one is an ordinary graph edge — and this server used to
+    store every one of them as a dangling row, which made `get_backlinks`
+    quietly incomplete on exactly the notes that have enough identity to be
+    worth aliasing. `resolve_target` consults them last, after every filename
+    rule, so nothing that resolved before can be re-pointed by this.
+
+    **Only the `aliases` key is selected, not the whole block.** The index is
+    built once per pass over every note in the scope; `frontmatter` is
+    note-controlled JSONB with no size ceiling of its own, and pulling all of
+    it to read one key would put the vault's entire frontmatter in the pass's
+    working set. `->` on a missing key (or a NULL column) is NULL, which
+    `normalize_aliases` reads as "none".
+    """
+    alias_json = NoteMetadata.frontmatter["aliases"].label("aliases")
+    stmt = select(NoteMetadata.file_path, NoteMetadata.id, alias_json)
+    if user_id is None:
+        stmt = stmt.where(NoteMetadata.user_id.is_(None))
+    else:
+        stmt = stmt.where(NoteMetadata.user_id == user_id)
+    rows = (await session.execute(stmt)).all()
+    return build_vault_index(
+        [(r.file_path, r.id, _decode_alias_value(r.aliases)) for r in rows]
+    )
+
+
+def _decode_alias_value(value):
+    """Whatever the driver handed back for `frontmatter -> 'aliases'`.
+
+    Normally already deserialized by the JSONB result processor. A `str` here
+    means some driver/dialect combination returned the raw JSON text instead,
+    and decoding it is cheaper than the alternative — silently treating every
+    alias in the vault as absent, which would look exactly like "this vault
+    has no aliases" and never raise.
+    """
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+    return value
 
 
 async def _ancillary_pass_is_permitted(
@@ -2666,7 +2753,7 @@ async def _link_backfill_pinned(
         log_suffix = f" (user_id={user_id})" if user_id is not None else ""
         logger.info(f"Starting link backfill across {len(rows)} notes{log_suffix}")
 
-        vault_index = build_vault_index([(r.file_path, r.id) for r in rows])
+        vault_index = await _alias_aware_vault_index(session, user_id)
 
         try:
             note_ids = [r.id for r in rows]

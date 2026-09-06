@@ -96,7 +96,7 @@ async def test_link_index_vault_query_is_null_owned(monkeypatch, tmp_path):
 async def test_link_reresolution_update_is_null_owned(tmp_path):
     note = tmp_path / "note.md"
     note.write_text("no links", encoding="utf-8")
-    row = SimpleNamespace(file_path="note.md", id=7)
+    row = SimpleNamespace(file_path="note.md", id=7, aliases=None)
     session = _Session([_Result([row])])
 
     await indexer._update_links_for_changed(

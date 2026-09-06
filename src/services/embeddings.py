@@ -29,7 +29,7 @@ from src.services.index_state import (
     get_state,
     state_table_exists,
 )
-from src.services.links import BODY, scan_fences
+from src.services.links import BODY, comment_spans, scan_fences
 
 logger = logging.getLogger(__name__)
 
@@ -45,15 +45,25 @@ logger = logging.getLogger(__name__)
 
 
 def clean_for_embedding(content: str) -> str:
-    """Strip fenced code blocks (``` and ~~~) from markdown before embedding.
+    """Strip fenced code blocks and `%%comments%%` before embedding.
 
     `content` is a note's post-frontmatter **body**, so the recognizer runs in
     `BODY` context and never re-partitions. Inline backtick code is preserved
     (typically short identifiers, often semantically meaningful). Indented
     code blocks are not stripped — they're ambiguous with regular indented
     prose in personal notes, and are a documented divergence of the grammar.
+
+    **Comments are removed second, from the fence-stripped text**, so a `%%`
+    inside a code block cannot pair with one outside it. An Obsidian comment
+    is text the note does not say, and embedding it put content no reader ever
+    sees into the vector that decides what `semantic_search` and `find_related`
+    return. The largest case by far is Excalidraw: its plugin stores an entire
+    scene — every element id, coordinate and colour — inside a `%%` block, so
+    before this every drawing in the vault contributed serialized geometry to
+    vector space, and a `find_related` neighbour could be "another drawing".
     """
-    return _remove_spans(content, scan_fences(content, context=BODY).spans)
+    fenced = _remove_spans(content, scan_fences(content, context=BODY).spans)
+    return _remove_spans(fenced, comment_spans(fenced))
 
 
 def _remove_spans(text: str, spans) -> str:
@@ -209,16 +219,34 @@ def _v0_clean(body: str) -> str:
     return body
 
 
+def _v1_clean(body: str) -> str:
+    """`clean_for_embedding` as it stood for versions 1 and 2. Frozen.
+
+    Fenced blocks removed, nothing else. Version 3 additionally removes
+    `%%comments%%`, so this has to survive as its own function: a v1- or
+    v2-stamped row must be compared against what it actually embedded, and
+    every note WITHOUT a comment must compare equal so it is not re-embedded
+    for nothing. Deleting this and pointing 1 and 2 at the current cleaner
+    would invalidate every vector in the vault.
+    """
+    return _remove_spans(body, scan_fences(body, context=BODY).spans)
+
+
 _EXTRACTION_CLEANERS = {
     0: _v0_clean,
-    1: clean_for_embedding,
+    1: _v1_clean,
     # Version 2 is the version-1 grammar under a new key. The link grammar
     # changed (#180), so `CURRENT_EXTRACTION_VERSION` has to move for the
     # indexer to re-derive `note_links` — but the *embedding* text is
     # untouched, so a v1-stamped row must compare equal here and NOT be
     # re-embedded. Binding the same function is what makes that true by
     # construction rather than by inspection.
-    2: clean_for_embedding,
+    2: _v1_clean,
+    # Version 3 removes `%%comments%%` as well. Unlike version 2 this DOES
+    # change the embedded text — but only for a note that contains a comment,
+    # and the per-note comparison is what keeps the re-embed scoped to exactly
+    # those notes rather than to the whole vault.
+    3: clean_for_embedding,
 }
 
 

@@ -3134,6 +3134,31 @@ def _link_excerpt(link_text: str | None) -> str:
     return flat[:_LINK_EXCERPT_CHARS] + "…"
 
 
+# Obsidian's own attachment set, plus the two note-shaped file types it stores
+# outside markdown. Only these, and not "any suffix at all": `[[Q3 2024. Plan]]`
+# has a suffix under `PurePosixPath` and is a note somebody forgot to create,
+# which is a dangling link and must keep saying so.
+_ATTACHMENT_SUFFIXES = frozenset({
+    # images
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".avif",
+    # documents
+    ".pdf",
+    # audio
+    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm",
+    # video
+    ".mp4", ".mov", ".mkv", ".ogv",
+    # Obsidian's own non-markdown note formats
+    ".canvas", ".base",
+})
+
+
+def _is_attachment_target(target_path: str | None) -> bool:
+    """Does this unresolved target name a file rather than a note?"""
+    if not target_path:
+        return False
+    return PurePosixPath(target_path).suffix.lower() in _ATTACHMENT_SUFFIXES
+
+
 @_tracked("get_backlinks", ["path", "limit"])
 async def get_backlinks_impl(path: str, limit: int = 50) -> str:
     """Notes that link TO `path` (resolved links only)."""
@@ -3302,10 +3327,19 @@ async def get_links_impl(path: str, limit: int = 100) -> str:
     # owned set, and calling such a link "resolved" would print a `None` title
     # and path for it.
     resolved = [r for r in rows if r.resolved_id is not None]
-    dangling = [r for r in rows if r.resolved_id is None]
+    unresolved = [r for r in rows if r.resolved_id is None]
+    # An `![[diagram.png]]` or `[[report.pdf]]` is not a broken link: it is an
+    # attachment, and this server indexes only `.md`, so it can never resolve
+    # to a note however healthy the vault is. Reporting it under "Dangling"
+    # told an agent the note had broken references and invited it to go and
+    # "fix" links that were never wrong — on an attachment-heavy note, most of
+    # the dangling list was this. They are still listed, because an agent
+    # should know the note embeds them; they are just no longer called broken.
+    attachments = [r for r in unresolved if _is_attachment_target(r.target_path)]
+    dangling = [r for r in unresolved if not _is_attachment_target(r.target_path)]
     lines = [
-        f"`{path}` — {len(resolved)} resolved, {len(dangling)} dangling — "
-        f"truncated: {truncated}:\n"
+        f"`{path}` — {len(resolved)} resolved, {len(dangling)} dangling, "
+        f"{len(attachments)} attachment — truncated: {truncated}:\n"
     ]
     if resolved:
         lines.append("**Resolved:**")
@@ -3313,6 +3347,15 @@ async def get_links_impl(path: str, limit: int = 100) -> str:
             lines.append(
                 f"- {r.kind} → **{r.title}** (`{r.file_path}`) — "
                 f"`{_link_excerpt(r.link_text)}`"
+            )
+    if attachments:
+        lines.append(
+            "\n**Attachments** (non-markdown targets — not indexed as notes, "
+            "so never resolved; read them with `read_file`):"
+        )
+        for r in attachments:
+            lines.append(
+                f"- {r.kind} → `{r.target_path}` — `{_link_excerpt(r.link_text)}`"
             )
     if dangling:
         lines.append("\n**Dangling:**")
@@ -4272,6 +4315,29 @@ def _splice_rewrites(
     return "".join(parts)
 
 
+# The rewriter's resolution is deliberately NARROWER than the indexer's.
+#
+# `resolve_target` learned two Obsidian rules the graph was missing —
+# frontmatter aliases, and case-insensitive filename matching — and both are
+# right for *reading* the graph and wrong for *writing* notes. This function
+# decides which links on disk to overwrite by asking what they resolve to, so
+# every widening of resolution is a widening of what a move mutates, and
+# neither widening earns it:
+#
+# * an alias lives in the moved note's own frontmatter and travels with the
+#   file, so `[[Alias]]` still resolves after the move. Rewriting it to
+#   `[[New]]` would destroy the author's alias to fix nothing.
+# * a case-differing bare name resolves by stem, and a folder move does not
+#   change the stem.
+#
+# Passing both False keeps `move_note`'s on-disk behaviour bit-identical to
+# what it was before this change, which is the bar for the destructive path.
+# `pre_move_index` is additionally built from two-tuples, so its alias map is
+# empty anyway; the explicit flags are what make that a decision rather than
+# an accident nobody would notice reversing.
+_MOVE_RESOLUTION = {"follow_aliases": False, "case_insensitive": False}
+
+
 def _rewrite_links_in_text(
     content: str,
     from_rel: str,
@@ -4355,7 +4421,7 @@ def _rewrite_links_in_text(
         target = target_raw.strip()
         if not target:
             continue
-        if resolve_target(target, source_path, pre_move_index) != from_id:
+        if resolve_target(target, source_path, pre_move_index, **_MOVE_RESOLUTION) != from_id:
             continue
         target_no_md = target[:-3] if target.endswith(".md") else target
         is_path_style = "/" in target_no_md or target.endswith(".md")
@@ -4374,7 +4440,9 @@ def _rewrite_links_in_text(
         if not href:
             continue
         target_for_resolve = href[:-3] if href.endswith(".md") else href
-        if resolve_target(target_for_resolve, source_path, pre_move_index) != from_id:
+        if resolve_target(
+            target_for_resolve, source_path, pre_move_index, **_MOVE_RESOLUTION
+        ) != from_id:
             continue
         anchor = _kept(link.anchor_start, link.anchor)
         text = _kept(link.text_start, link.text)

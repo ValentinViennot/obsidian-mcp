@@ -270,6 +270,11 @@ class FakeSession:
                     SimpleNamespace(
                         id=i, user_id=self.note_owner, file_path=p,
                         content_hash=self.existing.get(p),
+                        # The vault-index SELECT this branch also serves now
+                        # carries `frontmatter -> 'aliases'`; None is what
+                        # Postgres returns for a note without that key, which
+                        # is every note in these fixtures.
+                        aliases=None,
                     )
                     for p, i in self.note_ids.items()
                 ])

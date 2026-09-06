@@ -17,6 +17,7 @@ the image build, which is where the mistake was actually made.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -89,3 +90,36 @@ def test_required_binaries_are_declared_once_in_one_place(binary):
     this one catches the environment. Both have to hold.
     """
     assert shutil.which(binary) is not None
+
+
+# ---------------------------------------------------------------------------
+# The suite must not run with privileges it will not have in production
+# ---------------------------------------------------------------------------
+
+
+def test_the_suite_does_not_run_as_root():
+    """Root makes every permission assertion in this suite vacuous.
+
+    This is not hypothetical. `deploy/hooks/post-receive` had a real bug — a
+    redirection onto a POSIX special builtin, which exits the shell instead of
+    returning a status the surrounding `if` can catch, so a hook whose entire
+    contract is "never fail a push" failed pushes. The test for it passed
+    locally for months of container runs and failed on GitHub, because the
+    container ran as root and root ignores the 0500 mode the test relies on.
+    CI was right; the local gate could not reproduce it.
+
+    A gate that cannot reproduce CI's failures is not a gate, so the condition
+    is asserted rather than left to whoever next edits the test image. If this
+    fails, the image or the `docker run` regained privileges — fix that, do not
+    skip this.
+
+    Skipped where the concept does not apply (Windows has no uid 0).
+    """
+    if not hasattr(os, "geteuid"):  # pragma: no cover - non-POSIX
+        pytest.skip("no uid concept on this platform")
+    assert os.geteuid() != 0, (
+        "The test suite is running as root. Every permission-dependent "
+        "assertion here is silently passing regardless of the behaviour it "
+        "claims to check. Run it unprivileged — docker/test.Dockerfile sets "
+        "USER runner, and a bare `docker run` needs --user \"$(id -u):$(id -g)\"."
+    )

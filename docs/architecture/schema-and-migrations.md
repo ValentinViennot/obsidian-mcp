@@ -285,6 +285,52 @@ would leave the validator finding no row for any cookie, i.e. every user locked
 out of the panel. `lock_timeout` / `statement_timeout` are set and `RESET` for
 013's reason.
 
+## 025: `valid_from` / `valid_to`, and why both are nullable
+
+Embeddings only ever covered HEAD, so anything the author rewrote or deleted
+was unfindable. 025 gives each `note_embeddings` row a validity interval —
+`valid_from` and `valid_to`, both `timestamptz NULL` — plus
+`ix_note_embeddings_validity` btree `(valid_to, valid_from)`.
+
+**`valid_to IS NULL` is the definition of "current".** That is the whole
+compatibility story: every row that existed when 025 ran was written by the
+ordinary embed pass and describes the note as it stands, so `NULL` is not a
+placeholder awaiting a backfill — it is the correct value, the `ADD COLUMN` is
+metadata-only, and no query's answer changed. `valid_from IS NULL` means
+something different: *unbounded in the past as far as this row knows*. The
+embed pass reads a directory of files, so it knows what a note says and has no
+way to learn since when; only `src/services/history_indexer.py`, which has
+commit dates, ever fills it in.
+
+A `NOT NULL` shape with sentinel defaults was rejected. `-infinity` for
+`valid_from` would have been honest, but `+infinity` for `valid_to` would make
+"current" a value the writer has to remember to write — so a row it forgot
+would read as *expired* and vanish from search, while NULL fails safe in the
+one direction that matters.
+
+**The downgrade deletes rows, and its order is the point.** A historical row is
+a vector over text the note no longer contains, and `valid_to` is the only
+thing that says so; drop the column first and every superseded paragraph in the
+database silently becomes current, with nothing left in the schema able to
+detect it. So `downgrade()` runs `DELETE … WHERE valid_to IS NOT NULL` while
+the column still exists, then drops the index and columns. What it discards is
+derived and re-derivable from the vault's git history; what it keeps is exactly
+the rows the embed pass wrote.
+
+The index is deliberately **not** partial on `WHERE valid_to IS NULL`. Today
+every row is current, so a partial index would be a full copy of them — and the
+default vector path does not reach this index at all: it is served by the HNSW
+index on `embedding`, with `valid_to IS NULL` applied as a filter over the
+candidates that scan returns. Reshaping the HNSW index is a separate,
+rewrite-carrying decision this revision does not pre-empt.
+
+`CREATE INDEX` here is **not** `CONCURRENTLY`, because alembic runs the whole
+upgrade in one transaction and CONCURRENTLY cannot. A deployment whose
+embedding table is too large for a plain build inside the 60 s
+`statement_timeout` should build the index by hand, CONCURRENTLY, and stamp it
+with 025's comment marker before migrating — the reconciler adopts a marked
+index and refuses an unmarked one, for 013's reason.
+
 ## Backups are protected data, not just a rollback tool
 
 A `pg_dump` of this database is the complete text of every tenant's notes

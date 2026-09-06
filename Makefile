@@ -36,7 +36,7 @@ SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
 SCHEMA_TEST_PORT ?= 55438
 SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors backfill-history backfill-history-dry audit trivy test-schema test-integration
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -71,6 +71,8 @@ help:
 	@echo "  make reindex      - Explain how to trigger a reindex (panel only)"
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
 	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS (no embeddings, no API calls)"
+	@echo "  make backfill-history-dry - Report what a history backfill would embed (writes nothing)"
+	@echo "  make backfill-history - Embed superseded note versions from the vault's git history"
 	@echo "  make status       - Show container and health status"
 	@echo "  make clean        - Remove containers and images"
 	@echo ""
@@ -383,6 +385,35 @@ rebuild-tsvectors:
 	@echo "$(YELLOW)Rebuilding keyword (FTS) index for the configured FTS_CONFIGS...$(NC)"
 	$(COMPOSE) run --rm obsidian-mcp python -m scripts.rebuild_tsvectors
 	@echo "$(GREEN)Done. Keyword search now reflects FTS_CONFIGS (embeddings untouched, no API calls).$(NC)"
+
+# Temporal embeddings (migration 025). Walks the mounted vault's git history and
+# embeds every *superseded* version of every note, storing each with the
+# interval over which it was that note's content. Ordinary search is unaffected:
+# every current-state reader filters on `valid_to IS NULL`.
+#
+# `run --rm`, not `exec`, for `reset-embeddings`' reason (#142): a fresh
+# container re-reads `.env`, and this works while the service is down.
+#
+# **Run the dry form first.** A vault's history is much larger than its present,
+# every version is a provider call, and the embedding endpoint is shared with
+# other services — the dry run is the only way to know the cost before paying
+# it. Both forms are safe to interrupt and safe to re-run: work is committed one
+# note at a time and an already-backfilled version is skipped by matching its
+# interval, so there is no cursor to reset and a completed run is a no-op.
+# BACKFILL_ARGS passes anything else through (--user-id, --limit, --vault).
+BACKFILL_ARGS ?=
+
+backfill-history-dry:
+	@echo "$(GREEN)Dry run: walking vault history, writing nothing...$(NC)"
+	$(COMPOSE) run --rm obsidian-mcp python -m scripts.backfill_history --dry-run $(BACKFILL_ARGS)
+
+backfill-history:
+	@echo "$(YELLOW)Backfilling historical embeddings from the vault's git history.$(NC)"
+	@echo "$(YELLOW)Run 'make backfill-history-dry' first if you have not.$(NC)"
+	@echo "Press Ctrl+C to cancel, waiting 5s..."
+	@sleep 5
+	$(COMPOSE) run --rm obsidian-mcp python -m scripts.backfill_history $(BACKFILL_ARGS)
+	@echo "$(GREEN)Done. Historical vectors are queryable point-in-time; ordinary search is unchanged.$(NC)"
 
 # Invariant: the application container must not be able to see the backups
 # directory (docs/architecture/control-panel.md, "Backup recency"). The mount

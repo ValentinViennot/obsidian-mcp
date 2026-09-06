@@ -2,9 +2,17 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies.
+#
+# `git` is here for `scripts/backfill_history.py` only (`make
+# backfill-history`), which walks the mounted vault's history to embed the
+# versions of a note that no longer exist on disk. Nothing on the request path
+# shells out to it, and the server runs identically without it — but the
+# backfill is a `docker compose run --rm` against this same image, so this is
+# where it has to be available.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     curl \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Add non-root user

@@ -1,0 +1,105 @@
+# Traefik front door — labels only.
+#
+# An OVERRIDE. It attaches the app to an EXISTING Traefik's network and adds
+# the router labels; it restates nothing from the base file.
+#
+#     docker compose -f docker-compose.yml -f docker-compose.traefik.yml up -d
+#
+# Use it when you already run Traefik. If you do not, docker-compose.caddy.yml
+# brings its own TLS terminator and needs no external anything.
+#
+# ── What you must have already ────────────────────────────────────────────
+#   * A running Traefik with an `https` entrypoint and a working certificate
+#     resolver. Set TRAEFIK_NETWORK / TRAEFIK_CERTRESOLVER in `.env` to match
+#     yours; the defaults below are placeholders, not working values.
+#   * The network named by TRAEFIK_NETWORK must already exist (`external: true`
+#     below): it is Traefik's, not this stack's, and compose will not create it.
+#   * TRAEFIK_PANEL_MIDDLEWARE naming a middleware chain that authenticates a
+#     HUMAN — a forward-auth to an OAuth proxy, basic auth, whatever you use.
+#     Everything under /admin and /api is protected by it and by nothing else
+#     in single-user mode. Leaving it at the default publishes your panel.
+#
+# The routers below are copied, with their reasoning intact, from the
+# maintainer's homelab stack that used to be this repo's docker-compose.yml.
+# What is NOT copied: the hard-coded registry image, the personal certificate
+# resolver, and per-user vault bind mounts naming real people. Those are why
+# that file could not be run by anyone else.
+
+networks:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik}
+
+services:
+  obsidian-mcp:
+    # Traefik reaches the app over its own network, so nothing is published on
+    # the host. `!reset` (Compose ≥ 2.24) is required to DELETE the base file's
+    # mapping: compose merges `ports` by concatenation, so neither omitting the
+    # key nor `ports: []` removes it, and 127.0.0.1:8000 would stay open beside
+    # the proxied route.
+    ports: !reset null
+
+    networks:
+      - mcp_internal
+      - traefik
+
+    labels:
+      - "traefik.enable=true"
+      # Compose can't infer which network to route to when a service is on two.
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik}"
+
+      # ── Panel + authorize (human auth in front) ──────────────────────────
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.entrypoints=https"
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.rule=Host(`${MCP_HOSTNAME:?set MCP_HOSTNAME in .env}`) && (PathPrefix(`/admin`) || Path(`/authorize`))"
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.tls=true"
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.tls.certresolver=${TRAEFIK_CERTRESOLVER:-default}"
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.middlewares=${TRAEFIK_PANEL_MIDDLEWARE:-chain-oauth@file}"
+      - "traefik.http.routers.obsidian-mcp-panel-rtr.service=obsidian-mcp-svc"
+
+      # ── API / MCP / OAuth (app-level auth) ───────────────────────────────
+      #
+      # NO `ratelimit` middleware here, deliberately (#194). A Traefik
+      # ratelimit was considered and rejected for three reasons. (1) A proxy
+      # cannot condition on the RESPONSE STATUS, so bounding unauthenticated
+      # probing at this layer would mean throttling authenticated agents too;
+      # the failed-authentication budget lives in `APIKeyMiddleware` instead,
+      # where it can count only the 401s. (2) This one router also serves
+      # /transfer, /health and /.well-known, so any label here would throttle
+      # all four surfaces together. (3) A control expressed in a proxy's static
+      # config lives outside this tree and so is not reproducible from it. The
+      # per-principal token buckets and the per-address auth budget are
+      # in-process — see docs/architecture/rate-limits.md, and note that
+      # `--workers 1` in the Dockerfile is load-bearing for them.
+      - "traefik.http.routers.obsidian-mcp-api-rtr.entrypoints=https"
+      - "traefik.http.routers.obsidian-mcp-api-rtr.rule=Host(`${MCP_HOSTNAME}`) && (PathPrefix(`/mcp`) || PathPrefix(`/transfer`) || Path(`/health`) || PathPrefix(`/.well-known`) || Path(`/register`) || Path(`/token`) || Path(`/revoke`))"
+      - "traefik.http.routers.obsidian-mcp-api-rtr.tls=true"
+      - "traefik.http.routers.obsidian-mcp-api-rtr.tls.certresolver=${TRAEFIK_CERTRESOLVER:-default}"
+      - "traefik.http.routers.obsidian-mcp-api-rtr.service=obsidian-mcp-svc"
+
+      # ── REST API (human auth in front) ───────────────────────────────────
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.entrypoints=https"
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.rule=Host(`${MCP_HOSTNAME}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.tls=true"
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.tls.certresolver=${TRAEFIK_CERTRESOLVER:-default}"
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.middlewares=${TRAEFIK_PANEL_MIDDLEWARE:-chain-oauth@file}"
+      - "traefik.http.routers.obsidian-mcp-apirest-rtr.service=obsidian-mcp-svc"
+
+      # ── Root MCP fallback ────────────────────────────────────────────────
+      # Bypass the human-auth chain for a bare `/` carrying a Bearer token
+      # (clients like OpenWebUI strip the /mcp prefix; RootMCPProxyMiddleware
+      # rewrites exactly `/` → `/mcp/` and nothing else). The `Path(`/`)` scope
+      # is load-bearing SECURITY, not tidiness: without it this rule's
+      # priority=100 outranks the protected panel/api routers (whose default
+      # priority is their rule length, ~52–78) for EVERY path, so any request
+      # to `/admin/*` or `/api/*` carrying any `Authorization: Bearer` header
+      # would reach the app with the middleware chain bypassed. Keep the path
+      # scope on any future header-matched root rule.
+      - "traefik.http.routers.obsidian-mcp-root-rtr.entrypoints=https"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.rule=Host(`${MCP_HOSTNAME}`) && Path(`/`) && HeaderRegexp(`Authorization`, `^Bearer `)"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.tls=true"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.tls.certresolver=${TRAEFIK_CERTRESOLVER:-default}"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.priority=100"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.service=obsidian-mcp-svc"
+
+      # ── Shared backend ───────────────────────────────────────────────────
+      - "traefik.http.services.obsidian-mcp-svc.loadbalancer.server.port=8000"

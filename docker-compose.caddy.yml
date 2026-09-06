@@ -1,0 +1,108 @@
+# TLS front door — Caddy, with automatic Let's Encrypt certificates.
+#
+# An OVERRIDE. It adds one service and edits one line of the base file; it does
+# not restate postgres or the app.
+#
+#     docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d
+#
+# Use it when nothing on this host terminates TLS yet. If you already run a
+# reverse proxy, use the base file alone (it publishes 127.0.0.1:8000 for the
+# proxy to forward to) or docker-compose.traefik.yml.
+#
+# Requirements: MCP_HOSTNAME must resolve to this host's public IP, and ports
+# 80 and 443 must be free and reachable — Let's Encrypt validates over both.
+# The certificate is issued for MCP_HOSTNAME, so a wrong or unresolved name is
+# the usual reason this comes up and then serves nothing.
+#
+# The Caddyfile it mounts is `Caddyfile.example`, which fails closed on /admin
+# behind a placeholder bcrypt hash. Replace that hash before you rely on it.
+
+services:
+  obsidian-mcp:
+    # Caddy reaches the app over the compose network by service name, so the
+    # base file's host publication is redundant here and is removed.
+    #
+    # `!reset` is required and `ports: []` does NOT work: compose merges the
+    # `ports` key by CONCATENATION, so an empty list contributes nothing and
+    # the base mapping survives — the app would stay on 127.0.0.1:8000 beside
+    # the proxy. `!reset` (Compose ≥ 2.24) is the only way to delete an
+    # inherited key. Verify with
+    # `docker compose -f docker-compose.yml -f docker-compose.caddy.yml config`.
+    ports: !reset null
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+
+    depends_on:
+      obsidian-mcp:
+        condition: service_healthy
+
+    environment:
+      # Caddyfile.example is a one-site file keyed on this name; it is both the
+      # site address and the certificate's subject.
+      MCP_HOSTNAME: ${MCP_HOSTNAME:?set MCP_HOSTNAME in .env}
+
+    # 80 and 443 are the only ports in this whole stack that face the internet,
+    # and both have to: HTTP-01 validation and redirect on 80, everything else
+    # on 443. The /udp entry is HTTP/3.
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+
+    volumes:
+      - ./Caddyfile.example:/etc/caddy/Caddyfile:ro
+      # Named volumes, not bind mounts: `caddy_data` holds the issued
+      # certificates and the ACME account key. Losing it means re-issuing, and
+      # Let's Encrypt rate-limits that (5 duplicate certificates per week), so
+      # this volume is the one piece of the stack worth backing up besides the
+      # database.
+      - caddy_data:/data
+      - caddy_config:/config
+
+    networks:
+      - mcp_internal
+
+    healthcheck:
+      # Caddy's admin API on loopback: up means the config loaded, which is the
+      # failure worth catching (a Caddyfile typo). Certificate issuance is
+      # asynchronous and deliberately not part of this check.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # Caddy binds 80 and 443. In the container it runs as root so this is
+      # currently redundant, but it is the one capability that must survive if
+      # the image ever drops to a non-root user — dropping ALL without it is
+      # how "Caddy won't start" happens after an unrelated image bump.
+      - NET_BIND_SERVICE
+
+    # ── Resources ────────────────────────────────────────────────────────
+    # A TLS terminator in front of one backend serving a handful of agent
+    # sessions. Caddy's resident set for this is single-digit MiB; 256 MiB is
+    # not a sizing estimate, it is a ceiling that a certificate renewal storm
+    # or a slowloris flood cannot walk past. 64 MiB reserved keeps the process
+    # and its certificate cache resident.
+    mem_limit: 256m
+    mem_reservation: 64m
+    memswap_limit: 256m
+    # TLS handshakes are the only real CPU cost here, and they are bursty and
+    # short. Half a core absorbs them without letting a handshake flood starve
+    # the app of the other half.
+    cpus: 0.5
+    # Caddy is one Go process; the number here bounds goroutine-backed OS
+    # threads, not connections. 128 is far above what it uses and far below a
+    # fork bomb.
+    pids_limit: 128
+
+volumes:
+  caddy_data:
+  caddy_config:

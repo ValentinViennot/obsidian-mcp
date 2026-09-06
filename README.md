@@ -781,12 +781,17 @@ cp .env.example .env
 $EDITOR .env
 ```
 
-In `docker-compose.yml`, point the `/obsidian` volume at your vault:
+Point the bind mount at your vault by setting `VAULT_HOST_PATH` in
+`.env` — `docker-compose.yml` reads it and refuses to start without it:
 
-```yaml
-volumes:
-  - /path/to/your/vault:/obsidian
+```env
+VAULT_HOST_PATH=/path/to/your/vault
 ```
+
+The container runs as **uid:gid 1000:1000**, not root, and the write
+tools mutate that directory. If it belongs to another account, either
+`chown -R 1000:1000` it or set `APP_UID` / `APP_GID` in `.env` to the
+owner you already have. See DEPLOYMENT.md, "Vault ownership".
 
 ### 2. Pick an embedding backend
 
@@ -939,17 +944,24 @@ vault and keys carry over to the bootstrap admin.
 
 ### Inviting users
 
-1. Edit `docker-compose.yml` to add a volume mount for the new user's
-   vault under `/vaults/<username>`. Host paths with spaces must be
-   quoted as a single YAML string:
+1. Add a volume mount for the new user's vault under
+   `/vaults/<username>`. Put it in a small override file of your own
+   rather than in the tracked `docker-compose.yml` — host paths name
+   real people and real directories, and this repository is public:
 
    ```yaml
-   volumes:
-     - "/storage/vaults/alice:/vaults/alice"
-     - "/storage/shared/bob/Obsidian:/vaults/bob"
+   # docker-compose.users.yml, gitignored
+   services:
+     obsidian-mcp:
+       volumes:
+         - "/storage/vaults/alice:/vaults/alice"
+         - "/storage/shared/bob/Obsidian:/vaults/bob"
    ```
 
-   `make deploy` to apply.
+   Host paths with spaces must be quoted as a single YAML string.
+   `volumes` merges by concatenation, so these are added to the base
+   file's `/obsidian` mount rather than replacing it. Bring the stack up
+   with the extra `-f docker-compose.users.yml` to apply.
 2. In the panel, `/admin/users/create` — pick a username and set an
    initial password.
 3. `/admin/users/{id}/edit` — set the user's `vault_path` to the
@@ -1716,8 +1728,10 @@ backup, `alembic upgrade head`, then recreate the container. Run
 - API keys use the `omcp_` prefix and are stored as SHA-256 hashes.
   The raw key is shown exactly once at creation.
 - The control panel is intended to sit behind an external auth
-  gateway. The included `docker-compose.yml` uses Traefik with an
-  OAuth chain. Don't expose `/admin` directly to the internet.
+  gateway. `docker-compose.caddy.yml` puts basic auth in front of it and
+  `docker-compose.traefik.yml` puts a middleware chain there; the base
+  file publishes the app on loopback only, for a proxy of your own.
+  Don't expose `/admin` directly to the internet.
 - Panel sessions are server-side rows. The signed cookie carries a
   256-bit random id; the database stores only its SHA-256, so a
   database dump contains no usable session. Logging out revokes that

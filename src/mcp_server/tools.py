@@ -34,10 +34,14 @@ from src.auth.session import (
     current_user_id,
 )
 from src.config import (
+    MAX_BLAME_LINE_CHARS,
+    MAX_BLAME_LINES,
     MAX_CHUNKS_PER_NOTE,
+    MAX_HISTORY_COMMITS,
     MAX_LINKS_PER_NOTE,
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
+    MAX_PICKAXE_TEXT_CHARS,
     MAX_SEARCH_QUERY_CHARS,
     max_move_rewrite_sources,
     settings,
@@ -63,7 +67,7 @@ from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
 from src.services.search import full_text_search
 from src.services.usage_stats import OVER_QUOTA_PARAM
-from src.services import transfer, vault_fs
+from src.services import git_history, transfer, vault_fs
 from src.services.vault import (
     MAX_PATH_CHARS,
     VAULT_ROOT_NOT_READY_ERROR,
@@ -89,9 +93,11 @@ from src.services.vault import (
     move_file_no_clobber,
     open_mutable,
     outline_sections,
+    parse_frontmatter,
     read_bytes,
     read_bytes_at,
     read_file,
+    section_span,
     soft_delete_target,
     unlink_at,
     validate_visible_path,
@@ -690,7 +696,10 @@ _SUPPRESSED_PARAM = rate_limits.SUPPRESSED_PARAM
 #: Which setting an over-long argument names in its refusal. Keyed by argument
 #: name rather than by the cap's value, because two caps may one day share a
 #: number and an operator needs the name of the thing they would change.
-_CHAR_CAP_SETTING_NAMES = {"query": "MAX_SEARCH_QUERY_CHARS"}
+_CHAR_CAP_SETTING_NAMES = {
+    "query": "MAX_SEARCH_QUERY_CHARS",
+    "text": "MAX_PICKAXE_TEXT_CHARS",
+}
 
 
 class _TrashUnusable(Exception):
@@ -6734,3 +6743,460 @@ async def delete_file_impl(
         f"Moved {rel} to {dest}. It is out of the vault's visible tree but still "
         "on disk; pass permanent=True to unlink instead."
     )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Git history: note_history / note_blame / find_when_written
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Three read-only tools over the vault's own git repository, for the one class
+# of question the index cannot answer: *when*, and *by whom*, was this
+# written. The plumbing — every subprocess and every bound on it — is in
+# `src/services/git_history.py`; what lives here is argument validation, the
+# vault-relative → repository-relative translation, and rendering.
+#
+# **All three run git on a worker thread.** `git log --follow` over a large
+# history is hundreds of milliseconds of somebody else's CPU, and this server
+# runs `--workers 1` by contract (docs/architecture/rate-limits.md), so a
+# blocking call here is a stall for every other tenant on the process. The
+# service module is deliberately synchronous and `asyncio.to_thread` is
+# applied at each of its call sites here.
+
+
+def _git_error_text(exc: git_history.GitHistoryError) -> str:
+    """A git-history refusal as the caller sees it.
+
+    Every exception that module raises already carries caller-facing prose
+    naming what would fix it, so this is the one place that decides how much
+    of it to show — bounded, because the one type that forwards text this
+    server did not author (`GitFailed`, carrying git's stderr) is exactly the
+    one whose length nothing here controls.
+    """
+    return _bounded(str(exc), settings.max_read_response_chars)
+
+
+def _git_target(path: str, uid: int | None) -> tuple[Path, str]:
+    """`(vault root, vault-relative POSIX path)` for a validated `path`.
+
+    `validate_visible_path` is the containment: it refuses traversal out of
+    the vault root and refuses a dot-directory, and it resolves symlinks, so a
+    link aimed outside the vault is refused rather than followed. Nothing here
+    re-implements any of that — the point of routing through the vault service
+    is that the git tools inherit exactly the containment `read_note` has,
+    rather than growing a second, weaker copy beside it.
+
+    Raises `ValueError` carrying the vault service's own wording for a refused
+    path, and for the one case it has no wording for: a path resolving to the
+    vault root itself, which is not a note.
+    """
+    resolved = validate_visible_path(path, user_id=uid)
+    root = _vault_root(uid).resolve()
+    rel = resolved.relative_to(root)
+    if not rel.parts:
+        raise ValueError(
+            "Path names the vault root itself, not a note. Pass a "
+            "vault-relative path to a file."
+        )
+    return root, rel.as_posix()
+
+
+def _repo_relative(repo: git_history.Repo, vault_rel: str) -> str:
+    """A vault-relative path as git will see it.
+
+    Git reports and accepts paths relative to the **repository** root — the
+    vault root in the expected deployment, an ancestor of it when a vault
+    lives inside a larger repository. `prefix` is the difference.
+    """
+    return f"{repo.prefix}{vault_rel}" if repo.prefix else vault_rel
+
+
+def _vault_relative(repo: git_history.Repo, repo_path: str) -> str:
+    """The inverse, for display. A path outside the vault is labelled, not hidden.
+
+    A repository larger than the vault can rename a file *into* it, and
+    `--follow` then reports a pre-rename path no vault-relative form
+    describes. Rendering it as though it were vault-relative would be a false
+    statement about where a file was; the label is the honest answer, and it
+    names no bytes the caller could not already reach.
+    """
+    if not repo.prefix:
+        return repo_path
+    if repo_path.startswith(repo.prefix):
+        return repo_path[len(repo.prefix):]
+    return f"{repo_path} (outside the vault, elsewhere in the repository)"
+
+
+def _commit_lines(
+    repo: git_history.Repo,
+    commit: git_history.Commit,
+    *,
+    repo_path: str | None = None,
+) -> list[str]:
+    """One commit rendered as two or three lines.
+
+    Both timestamps are printed because they answer different questions and
+    routinely differ on a *reconstructed* history: the authored time is when
+    the note was written (backdated by the import), the committed time is when
+    the import ran. A tool that printed one and called it "the date" would be
+    wrong for whichever question the caller actually had.
+
+    The subject goes through `json.dumps`, so a commit message cannot end the
+    quoted span it sits in or smuggle a newline into a list of bullets — the
+    #149 discipline applied to text a vault's own history controls.
+    """
+    change = commit.change_for(repo_path) if repo_path else None
+    what = f" — {change.label}" if change is not None else ""
+    lines = [
+        f"- `{commit.short_sha}`{what} — authored {commit.authored_at} by "
+        f"{commit.author_name} <{commit.author_email}> — "
+        f"{json.dumps(commit.subject)}"
+    ]
+    detail = f"  committed {commit.committed_at}"
+    if (commit.committer_name, commit.committer_email) != (
+        commit.author_name,
+        commit.author_email,
+    ):
+        detail += f" by {commit.committer_name} <{commit.committer_email}>"
+    detail += f" — full sha `{commit.sha}`"
+    lines.append(detail)
+    if change is not None and change.old_path:
+        lines.append(
+            f"  renamed from `{_vault_relative(repo, change.old_path)}` "
+            f"to `{_vault_relative(repo, change.path)}`"
+        )
+    return lines
+
+
+def _capped(lines: list[str], what: str) -> str:
+    """Join rendered lines under the shared read-response cap.
+
+    The same cap every read tool answers to (`MAX_READ_RESPONSE_CHARS`): tool
+    output is model input, and a blame or a history can run to far more text
+    than the note it describes. Cutting is **announced** — a silently
+    shortened list of commits reads as a complete one, and for a "when was
+    this written" answer that is the worst failure available, since the
+    interesting record is the oldest one, i.e. the one at the end.
+    """
+    cap = settings.max_read_response_chars
+    out = "\n".join(lines)
+    if len(out) <= cap:
+        return out
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > cap - 300:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    kept.append(
+        f"\n**[TRUNCATED]** The response reached the {cap:,}-character cap and "
+        f"{len(lines) - len(kept):,} further {what} are not shown — including, "
+        "for a history, the oldest ones. Narrow the request (a smaller "
+        "`limit`, a line range, or a `section`) to reach them."
+    )
+    return "\n".join(kept)
+
+
+def _body_and_offset(raw: str) -> tuple[str, int]:
+    """`(body, character offset of that body within `raw`)`.
+
+    Section selectors are defined over a note's **body**, with a valid
+    frontmatter block stripped — that is what `read_note` returns and what
+    `edit_note(section=…)` replaces — while git numbers the lines of the whole
+    file. `parse_frontmatter` returns a body that is a true *suffix* of its
+    input, so the difference in lengths is the offset and no second parse is
+    needed to find it.
+    """
+    _, body = parse_frontmatter(raw)
+    return body, len(raw) - len(body)
+
+
+def _line_number(text: str, offset: int) -> int:
+    """The 1-based line `offset` falls on, counting `\\n` the way git does."""
+    return text.count("\n", 0, max(0, offset)) + 1
+
+
+async def _resolve_repo(root: Path) -> git_history.Repo:
+    return await asyncio.to_thread(git_history.resolve_repo, root)
+
+
+@_tracked("note_history", ["path", "limit"])
+async def note_history_impl(path: str, limit: int = 50) -> str:
+    """Commit history of one note, newest first, with its birth commit named."""
+    uid = current_user_id.get()
+    limit = max(1, min(limit, MAX_HISTORY_COMMITS))
+    try:
+        root, rel = _git_target(path, uid)
+    except ValueError as e:
+        return str(e)
+
+    try:
+        repo = await _resolve_repo(root)
+        repo_path = _repo_relative(repo, rel)
+        result = await asyncio.to_thread(
+            git_history.note_history, repo, repo_path, limit
+        )
+    except git_history.GitHistoryError as e:
+        return _git_error_text(e)
+
+    if not result.commits:
+        return (
+            f"No git history for `{rel}`. The path is not tracked in the "
+            "vault's repository — it may be untracked, ignored, or created "
+            "since the last commit."
+        )
+
+    count = len(result.commits)
+    lines = [
+        f"Git history for `{rel}` — {count} commit{'s' if count != 1 else ''} "
+        "shown, newest first (`--follow`, so renames are traced through).",
+        "",
+    ]
+    if result.birth is not None:
+        birth = result.birth
+        first_path = birth.changes[0].path if birth.changes else repo_path
+        certainty = (
+            ""
+            if result.birth_certain
+            else " — git's output was capped, so this is the oldest commit "
+            "seen rather than certainly the first"
+        )
+        lines += [
+            f"**Created** {birth.authored_at} by {birth.author_name} "
+            f"<{birth.author_email}> in `{birth.short_sha}` "
+            f"({json.dumps(birth.subject)}), as "
+            f"`{_vault_relative(repo, first_path)}`{certainty}.",
+            "",
+        ]
+    if result.truncated:
+        lines += [
+            "*git produced more output than the server reads; the list below is "
+            "the part that was read.*",
+            "",
+        ]
+    for commit in result.commits:
+        lines += _commit_lines(repo, commit, repo_path=repo_path)
+    return _capped(lines, "commits")
+
+
+@_tracked("note_blame", ["path", "section", "start_line", "end_line"])
+async def note_blame_impl(
+    path: str,
+    section: str | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
+    """Per-line authorship of a note, from `git blame -w -M -C`."""
+    uid = current_user_id.get()
+    if section is not None and (start_line is not None or end_line is not None):
+        return (
+            "note_blame: `section` and an explicit line range cannot be "
+            "combined — a section resolves to its own range. Pass one or the "
+            "other."
+        )
+    if start_line is not None and start_line < 1:
+        return f"note_blame: start_line must be >= 1 (got {start_line})."
+    if end_line is not None and end_line < 1:
+        return f"note_blame: end_line must be >= 1 (got {end_line})."
+    if start_line is not None and end_line is not None and end_line < start_line:
+        return (
+            f"note_blame: end_line ({end_line}) is before start_line "
+            f"({start_line})."
+        )
+
+    try:
+        root, rel = _git_target(path, uid)
+    except ValueError as e:
+        return str(e)
+
+    # The file as it stands decides the line numbering, so it is read before
+    # git runs: a `-L` range past the end of a file is a git *fatal*, and a
+    # section selector has no meaning at all without the text to resolve it
+    # against. Decoded without newline translation, because git counts the
+    # lines the bytes actually contain.
+    try:
+        data = await asyncio.to_thread(
+            read_bytes, rel, uid, settings.max_file_read_bytes
+        )
+    except FileNotFoundError:
+        return (
+            f"Note not found: {rel}. `note_blame` attributes the file as it "
+            "stands today; use `note_history` for a path that no longer exists."
+        )
+    except ValueError as e:
+        return str(e)
+    try:
+        raw = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"Cannot blame {rel}: it is not valid UTF-8 text."
+
+    total_lines = raw.count("\n") + (0 if raw.endswith("\n") or not raw else 1)
+    if total_lines == 0:
+        return f"`{rel}` is empty — there is nothing to attribute."
+
+    if section is not None:
+        body, offset = _body_and_offset(raw)
+        span, err = section_span(body, section)
+        if err is not None:
+            return err
+        span_start, span_end = span
+        start_line = _line_number(raw, offset + span_start)
+        end_line = _line_number(raw, max(offset + span_start, offset + span_end - 1))
+
+    first = start_line or 1
+    if first > total_lines:
+        return (
+            f"note_blame: start_line {first:,} is past the end of {rel}, which "
+            f"has {total_lines:,} lines."
+        )
+    last = max(first, min(end_line or total_lines, total_lines))
+
+    try:
+        repo = await _resolve_repo(root)
+        repo_path = _repo_relative(repo, rel)
+        ignore = await asyncio.to_thread(git_history.ignore_revs_file, root)
+        result = await asyncio.to_thread(
+            git_history.blame,
+            repo,
+            repo_path,
+            start_line=first,
+            end_line=last,
+            total_lines=total_lines,
+            max_lines=MAX_BLAME_LINES,
+            ignore_revs_path=ignore,
+        )
+    except git_history.GitHistoryError as e:
+        return _git_error_text(e)
+
+    if not result.lines:
+        return (
+            f"No blame information for `{rel}`. The file exists but no commit "
+            "in the vault's repository has authored any of these lines yet."
+        )
+
+    scope = f"lines {result.start_line:,}–{result.end_line:,} of {total_lines:,}"
+    if section is not None:
+        scope = f"section {json.dumps(section)} ({scope})"
+    ignore_note = {
+        "absent": f"no `{git_history.IGNORE_REVS_FILENAME}` at the vault root",
+        "applied": f"`{git_history.IGNORE_REVS_FILENAME}` applied",
+        "unusable": (
+            f"`{git_history.IGNORE_REVS_FILENAME}` exists but git refused it, "
+            "so its revisions were NOT skipped"
+        ),
+    }[result.ignore_revs]
+    lines = [
+        f"Blame for `{rel}` — {scope}. Whitespace-only changes, moves within "
+        "the file and copies between files are followed (`-w -M -C`); "
+        f"{ignore_note}.",
+        "",
+    ]
+    if result.capped:
+        lines += [
+            f"*Capped at {MAX_BLAME_LINES:,} lines. Ask for a narrower range "
+            "with `start_line`/`end_line`, or a `section`.*",
+            "",
+        ]
+    for line in result.lines:
+        content = line.content
+        if len(content) > MAX_BLAME_LINE_CHARS:
+            content = content[:MAX_BLAME_LINE_CHARS] + "…"
+        if line.uncommitted:
+            # git's all-zero object name. Rendering it as a sha and a date
+            # would present an edit nobody has committed as a fact about the
+            # history — the one thing this tool must not do.
+            lines.append(f"{line.line_no:>6} | (not committed yet) | {content}")
+            continue
+        moved = ""
+        if line.origin_path and line.origin_path != repo_path:
+            moved = f" [from `{_vault_relative(repo, line.origin_path)}`]"
+        lines.append(
+            f"{line.line_no:>6} | `{line.short_sha}` {line.authored_at} "
+            f"{line.author_name} <{line.author_email}>{moved} | {content}"
+        )
+    return _capped(lines, "lines")
+
+
+@_tracked(
+    "find_when_written",
+    ["text", "limit", "path", "regex"],
+    arg_char_caps={"text": MAX_PICKAXE_TEXT_CHARS},
+)
+async def find_when_written_impl(
+    text: str,
+    limit: int = 20,
+    path: str | None = None,
+    regex: bool = False,
+) -> str:
+    """The pickaxe: which commit introduced this string, and when."""
+    uid = current_user_id.get()
+    limit = max(1, min(limit, MAX_HISTORY_COMMITS))
+    if not text:
+        return (
+            "find_when_written: `text` is empty. Pass the exact string whose "
+            "introduction you want to date."
+        )
+
+    rel: str | None = None
+    if path is not None:
+        try:
+            root, rel = _git_target(path, uid)
+        except ValueError as e:
+            return str(e)
+    else:
+        try:
+            root = _vault_root(uid).resolve()
+        except (RuntimeError, OSError) as e:
+            return str(e)
+
+    try:
+        repo = await _resolve_repo(root)
+        repo_path = _repo_relative(repo, rel) if rel is not None else None
+        result = await asyncio.to_thread(
+            git_history.search_history,
+            repo,
+            text,
+            limit=limit,
+            repo_path=repo_path,
+            regex=regex,
+        )
+    except git_history.GitHistoryError as e:
+        return _git_error_text(e)
+
+    scope = f" in `{rel}`" if rel is not None else ""
+    kind = "regular expression" if regex else "string"
+    if not result.commits:
+        return (
+            f"No commit changed the number of occurrences of that {kind}"
+            f"{scope}. It may never have been committed, may predate the "
+            "repository's first commit, or may differ from what is in the file "
+            "— the match is exact, whitespace and all."
+        )
+
+    count = len(result.commits)
+    lines = [
+        f"{count} commit{'s' if count != 1 else ''} changed the number of "
+        f"occurrences of that {kind}{scope}, newest first. **The oldest entry "
+        "below is the one that introduced it.**",
+        "",
+    ]
+    if result.truncated:
+        lines += [
+            "*git produced more output than the server reads, so the oldest "
+            "entry below may not be the introducing commit.*",
+            "",
+        ]
+    for commit in result.commits:
+        lines += _commit_lines(repo, commit)
+        if commit.changes:
+            touched = ", ".join(
+                f"`{_vault_relative(repo, c.path)}` ({c.status})"
+                for c in commit.changes[:20]
+            )
+            more = (
+                f" (+{len(commit.changes) - 20:,} more)"
+                if len(commit.changes) > 20
+                else ""
+            )
+            lines.append(f"  files: {touched}{more}")
+    return _capped(lines, "commits")

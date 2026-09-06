@@ -245,6 +245,56 @@ def max_move_rewrite_sources() -> int:
     return max(0, soft - MOVE_REWRITE_FD_RESERVE - MOVE_REWRITE_SHARED_ROOT_FDS)
 
 
+# ── The git-history tools' bounds (`src/services/git_history.py`) ───────────
+#
+# Every one of them exists because `git` is an *external process* reading a
+# repository nobody in this codebase wrote. Its runtime is a property of the
+# history's shape (a `--follow` across a 20-year import, a pickaxe over every
+# commit) and its output size is a property of the repository, so neither may
+# be left to whatever the vault happens to contain: the process runs on a
+# worker thread of a single-worker server, and its stdout becomes a tool
+# result, which is model input.
+
+# Wall-clock ceiling on ONE git invocation, from spawn to exit. A pickaxe over
+# a large history is the expensive case and the one an agent will reach for
+# most; 20 s is generous for a vault-sized repository and still bounded. On
+# expiry the whole process group is killed — git forks (`git log` spawns no
+# child today, but `--ignore-revs-file` and config-driven helpers can), so
+# killing the leader alone would leave an orphan holding the pipe.
+GIT_HISTORY_TIMEOUT_SECONDS = 20
+
+# Bytes of git stdout read before the process is killed and the result is
+# marked truncated. This is the *raw* cap, well above what any rendered
+# response keeps, so parsing still sees whole records; the response cap below
+# is what actually bounds the model's input. 8 MiB of `--line-porcelain` is
+# roughly 25,000 blame lines — far past the line cap — so hitting this means
+# the repository, not the request, was pathological.
+GIT_HISTORY_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+
+# Hard cap on `note_history(limit=…)` and `find_when_written(limit=…)`, in the
+# shape the other list tools use: the caller's `limit` is clamped into
+# `1..cap` rather than refused.
+MAX_HISTORY_COMMITS = 500
+
+# Hard cap on the lines ONE `note_blame` renders. A 130 KB note is ~3,000
+# lines and each rendered line carries a sha, an author and a timestamp on top
+# of its own text, so an uncapped whole-file blame is several times the read
+# cap on its own. Blame past this is reachable by `start_line`/`end_line` or by
+# `section=`, and the response says so rather than truncating silently.
+MAX_BLAME_LINES = 2000
+
+# Characters kept from each blamed line's own content. Attribution is the
+# answer this tool returns; the line's full text is `read_note`'s job.
+MAX_BLAME_LINE_CHARS = 200
+
+# Longest `text` `find_when_written` will accept, enforced declaratively on
+# `_tracked` (`arg_char_caps`) like `MAX_SEARCH_QUERY_CHARS` — so before the
+# subprocess is spawned and before the value is interpolated into any
+# server-authored prose. The pickaxe matches a literal substring; a needle
+# longer than this is not a search, it is a document.
+MAX_PICKAXE_TEXT_CHARS = 1024
+
+
 # Headroom for the JSON-RPC envelope around a tool call's content argument:
 # method name, tool name, request id, the other arguments. See
 # `Settings.mcp_max_request_body_bytes`.

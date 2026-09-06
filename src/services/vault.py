@@ -3856,6 +3856,28 @@ def extract_section(text: str, heading: str) -> tuple[str | None, str | None]:
     return text[headings[idx]["line_start"]:body_end], None
 
 
+def section_span(text: str, heading: str) -> tuple[tuple[int, int] | None, str | None]:
+    """Return `((start, end), None)` — the character span a section occupies.
+
+    The span runs from the first character of the heading line to the end of
+    its body, i.e. exactly what `extract_section` returns as text. The
+    difference is that this reports *where*, which is what a caller needs when
+    it has to translate a section into the line numbers some other tool
+    addresses — `note_blame(section=…)` resolving a heading to a `git blame
+    -L` range is the reason it exists.
+
+    Same selector syntax and the same `_section_body_span` as the read and
+    write sides, so a section's line range can never name a different region
+    than a section read returns. `end` is exclusive.
+    """
+    headings = _scan_headings(text)
+    idx, err = _resolve_section_index(headings, heading)
+    if err is not None:
+        return None, err
+    _, body_end = _section_body_span(text, headings, idx)
+    return (headings[idx]["line_start"], body_end), None
+
+
 def extract_section_parts(
     text: str, heading: str
 ) -> tuple[tuple[str, str] | None, str | None]:

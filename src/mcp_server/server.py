@@ -13,6 +13,7 @@ from src.mcp_server.tools import (
     edit_note_impl,
     find_orphans_impl,
     find_related_impl,
+    find_when_written_impl,
     get_backlinks_impl,
     get_links_impl,
     get_neighborhood_impl,
@@ -23,6 +24,8 @@ from src.mcp_server.tools import (
     list_files_impl,
     list_notes_impl,
     move_note_impl,
+    note_blame_impl,
+    note_history_impl,
     read_file_impl,
     read_note_impl,
     request_download_impl,
@@ -702,6 +705,124 @@ async def find_orphans(folder: str | None = None, limit: int = 50) -> str:
         limit: Maximum results (default 50, hard cap 500).
     """
     return await find_orphans_impl(folder=folder, limit=limit)
+
+
+@mcp.tool()
+async def note_history(path: str, limit: int = 50) -> str:
+    """When a note was created and every commit that has touched it since, from
+    the vault's git repository. Use this for "when did I write this note?",
+    "when was this last changed?" and "who else has edited it?".
+
+    Renames are traced through (`git log --follow`), so a note that started
+    life in another folder still reports its real history rather than beginning
+    at the rename.
+
+    The response opens with the note's **birth commit** — its creation date,
+    its original path, and who wrote it — because that is the question this
+    tool exists for and it is not otherwise recoverable from a truncated list.
+    Every commit then carries: short and full sha, author name and email,
+    authored and committed timestamps as ISO 8601 **with the original
+    timezone**, the subject, and whether the note was added, modified, renamed
+    or deleted in that commit.
+
+    **Authored and committed times are both reported and routinely differ.**
+    On a history reconstructed from file timestamps, the authored time is when
+    the note was written and the committed time is when the import ran. If you
+    are answering "when did I write this", the authored time is the one you
+    want.
+
+    To date a specific *sentence* rather than the note, use
+    `find_when_written`. For per-line authorship, use `note_blame`.
+
+    Args:
+        path: Vault-relative path to the note (e.g. "Cards/Foo.md").
+        limit: Maximum commits listed (default 50, hard cap 500). The birth
+            commit is reported regardless of how many commits the list holds.
+    """
+    return await note_history_impl(path, limit=limit)
+
+
+@mcp.tool()
+async def note_blame(
+    path: str,
+    section: str | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> str:
+    """Per-line authorship of a note: for each line, which commit last changed
+    it, who wrote it, and when. Use this for "who wrote this paragraph?" and
+    "how old is this part of the note?".
+
+    Attribution runs with `-w -M -C`: whitespace-only changes are ignored, a
+    line moved within the file keeps its author, and a line copied from another
+    file in the same commit is attributed to where it came from (the response
+    names that origin file when it differs). A revision listed in a
+    `.git-blame-ignore-revs` file at the vault root is looked *through* rather
+    than at, so a bulk reformat does not become the author of the vault; the
+    response says whether that file was present and applied.
+
+    **This reads the note as it stands today** — the working tree, not the
+    last commit — so line numbers match what `read_note` returns, and a line
+    edited since the last commit comes back marked `(not committed yet)`
+    rather than attributed to whoever wrote the line it replaced. It cannot
+    attribute a path that no longer exists; use `note_history` for that.
+
+    Scope the call rather than blaming a whole large note: `section` accepts a
+    markdown heading (the same selectors `read_note` and `edit_note` take —
+    plain text, `Parent/Child`, or a `#N` ordinal) and blames only that
+    section; `start_line`/`end_line` blame an explicit 1-based inclusive range.
+    They are mutually exclusive. Whole-note blame is capped at 2,000 lines and
+    each line's text at 200 characters, and the response says when it capped.
+
+    Args:
+        path: Vault-relative path to the note.
+        section: Markdown heading whose lines to blame. Cannot be combined
+            with a line range.
+        start_line: First line to blame, 1-based inclusive.
+        end_line: Last line to blame, 1-based inclusive. Clamped to the end of
+            the file.
+    """
+    return await note_blame_impl(
+        path, section=section, start_line=start_line, end_line=end_line
+    )
+
+
+@mcp.tool()
+async def find_when_written(
+    text: str,
+    limit: int = 20,
+    path: str | None = None,
+    regex: bool = False,
+) -> str:
+    """**Find the commit that introduced a given string — the tool that answers
+    "on <datetime> you wrote <text>".** Give it a distinctive phrase from a
+    note and it returns when that phrase was first committed, by whom, and into
+    which file.
+
+    This is git's pickaxe (`git log -S`), not a search: it returns only commits
+    that **changed the number of occurrences** of the string, so a commit that
+    merely edited something else in a file already containing the text is not
+    reported. The oldest commit in the result is therefore the one that wrote
+    the text, and the response says so.
+
+    The match is an **exact substring**, whitespace and punctuation included —
+    paste the phrase rather than paraphrasing it, and prefer a distinctive
+    fragment of one sentence over a whole paragraph (a paragraph reformatted
+    since it was written will not match). Set `regex=True` to treat `text` as a
+    POSIX extended regular expression instead (`--pickaxe-regex`).
+
+    Use `note_history` when you want a note's dates rather than a phrase's, and
+    `keyword_search` / `semantic_search` when you want to find the note itself
+    rather than date its text.
+
+    Args:
+        text: The exact string to date. Max 1,024 characters.
+        limit: Maximum commits returned (default 20, hard cap 500).
+        path: Optional vault-relative path to search within one note only
+            (renames are followed). Omit to search the whole vault.
+        regex: Treat `text` as an extended regular expression.
+    """
+    return await find_when_written_impl(text, limit=limit, path=path, regex=regex)
 
 
 @mcp.tool()

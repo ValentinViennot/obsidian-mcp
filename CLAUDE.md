@@ -167,7 +167,7 @@ update it in the same change.** What stays here is the short list:
 
 ## MCP tools
 
-25 tools, all registered in `src/mcp_server/server.py` and all wrapped by
+28 tools, all registered in `src/mcp_server/server.py` and all wrapped by
 `_tracked`, which resolves the caller's vault root *before* the tool body runs
 — that decorator is the whole enforcement of "this user has no vault"
 ([vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md)).
@@ -181,6 +181,28 @@ update it in the same change.** What stays here is the short list:
 - `get_neighborhood(path, depth=1, limit=50)` — undirected BFS over the resolved-link graph; capped at `depth ≤ 5` and `limit ≤ 200`.
 - `find_related(path, limit=10)` — semantic neighbors via averaged chunk embeddings; pgvector cosine distance, deduped per note.
 - `find_orphans(folder, limit)` — notes with no incoming or outgoing resolved links; vault-hygiene tool.
+
+**Git history** — three read-only tools over the vault's own git repository,
+for the question the index cannot answer (`src/services/git_history.py` holds
+every subprocess; the MCP layer is thin).
+- `note_history(path, limit=50)` — `git log --follow` over one note, with the
+  **birth commit** reported separately so a short `limit` never costs the
+  creation date.
+- `note_blame(path, section?, start_line?, end_line?)` — `git blame -w -M -C
+  --line-porcelain`, honouring a `.git-blame-ignore-revs` at the vault root.
+  `section=` resolves a heading to a line range through the same
+  `_section_body_span` the read and write sides use.
+- `find_when_written(text, limit=20, path?, regex=False)` — `git log -S`, the
+  pickaxe: the commit that *introduced* a string, i.e. "on {datetime} you
+  wrote {text}".
+
+This is the only subprocess surface in the codebase. Explicit argv, never
+`shell=True`; every `GIT_*` variable dropped and the config layers pinned; a
+wall-clock deadline and a stdout byte cap on every invocation, with the process
+*group* killed on either; paths through `validate_visible_path` and nothing
+re-implementing containment. Bounds live in `src/config.py`
+(`GIT_HISTORY_*`, `MAX_HISTORY_COMMITS`, `MAX_BLAME_*`,
+`MAX_PICKAXE_TEXT_CHARS`).
 
 Link extraction lives in `src/services/links.py`. The extractor strips fenced/inline code before regex matching for `[[wikilink]]`, `![[embed]]`, and `[md](path.md)` forms. Targets are resolved at index time and stored in `note_links`. On startup, if `note_links` is empty the indexer runs a one-shot backfill across all notes (logged with progress and surfaced on the dashboard).
 

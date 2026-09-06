@@ -17,7 +17,6 @@ lives in `tests/integration/test_temporal_embeddings_pg.py`.
 import datetime
 import os
 import subprocess
-import tempfile
 
 import pytest
 
@@ -249,6 +248,29 @@ async def test_a_rename_is_a_delete_and_an_add(repo):
 
 
 @pytest.mark.asyncio
+async def test_notes_in_folders_are_walked(repo):
+    """A vault is mostly folders, and the pathspec is the one place that can
+    silently lose all of them.
+
+    `:(glob)*.md` — the spelling that looks more correct — turns on pathname
+    semantics, under which `*` stops at a `/` and every note outside the vault
+    root vanishes from the walk with no error anywhere. The bare `*.md` this
+    asserts uses git's default wildmatch, where `*` crosses `/`.
+    """
+    repo.write("root.md", "at the top\n")
+    repo.write("folder/nested.md", "one down\n")
+    repo.write("folder/deeper/still.md", "two down\n")
+    repo.write("folder/notes.txt", "not markdown\n")
+    repo.commit("c1", at(1))
+
+    assert set(await walk(repo)) == {
+        "root.md",
+        "folder/nested.md",
+        "folder/deeper/still.md",
+    }
+
+
+@pytest.mark.asyncio
 async def test_exclude_patterns_keep_a_note_out_of_history_too(repo):
     """An excluded note must not be searchable through its past either —
     which is also why the indexer's exclusion branch deletes a note's vectors
@@ -273,13 +295,15 @@ async def test_a_vault_in_a_subdirectory_yields_vault_relative_paths(tmp_path):
     outer = Repo(str(tmp_path / "outer"))
     outer.write("README.md", "repo readme, not a note\n")
     outer.write("vault/note.md", "a note\n")
+    outer.write("vault/folder/deep.md", "a nested note\n")
+    outer.write("vault/asset.png", "not markdown\n")
     outer.commit("c1", at(1))
 
     root, prefix = await resolve_repo(os.path.join(outer.path, "vault"))
     assert prefix == "vault/"
     versions = await walk_note_versions(root, prefix=prefix)
 
-    assert set(versions) == {"note.md"}
+    assert set(versions) == {"note.md", "folder/deep.md"}
 
 
 @pytest.mark.asyncio

@@ -186,10 +186,6 @@ class BackfillStats:
     versions_unreadable: int = 0
     paths_excluded: int = 0
 
-    def merge(self, other: "BackfillStats") -> None:
-        for name in self.__dataclass_fields__:
-            setattr(self, name, getattr(self, name) + getattr(other, name))
-
     def render(self) -> str:
         return (
             f"notes={self.notes_walked} versions={self.versions_walked} "
@@ -330,8 +326,22 @@ async def walk_note_versions(
         "-z",
         f"--format={_COMMIT_SEP}%H{_FIELD_SEP}%aI",
     ]
-    pathspec = f"{prefix}*.md" if prefix else "*.md"
-    args += ["--", pathspec]
+    # The pathspec is what keeps the log small on a repository with a decade of
+    # history, and its two forms are not arbitrary.
+    #
+    # No prefix (the vault *is* the repository, the common case): a bare
+    # `*.md`, whose default wildmatch semantics let `*` cross `/` so notes in
+    # folders are included. **Not `:(glob)*.md`** — the `glob` magic word turns
+    # on pathname semantics, under which `*` stops at a `/` and every note
+    # outside the vault root silently disappears from the walk.
+    #
+    # With a prefix: `:(literal)` on the directory alone. A vault directory
+    # containing `[`, `*` or `?` is not exotic — `Reading [2024]/` — and under
+    # glob semantics such a name would match the wrong paths, or nothing.
+    # `literal` and `glob` cannot be combined, so the directory is matched
+    # literally and the `.md` test happens in Python below, where it is a claim
+    # about the vault-relative name the rest of the system uses anyway.
+    args += ["--", f":(literal){prefix}" if prefix else "*.md"]
 
     entries = parse_git_log(await _git(repo_root, *args))
 

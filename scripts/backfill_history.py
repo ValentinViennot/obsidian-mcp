@@ -158,21 +158,33 @@ async def run(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_and_dispose(args: argparse.Namespace) -> int:
+    """`run`, then close the pool — in **one** event loop.
+
+    `engine.dispose()` from a second `asyncio.run` would be closing connections
+    that belong to a loop that no longer exists, which asyncpg reports as a
+    stream of "Event loop is closed" noise on the way out of an otherwise
+    successful backfill.
+    """
+    try:
+        return await run(args)
+    finally:
+        await engine.dispose()
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
     args = _parse_args(argv)
     try:
-        return asyncio.run(run(args))
+        return asyncio.run(_run_and_dispose(args))
     except GitError as exc:
+        # The one failure an operator is likely to cause: a vault that is not
+        # in a git repository, or a container without `git`. Named, not
+        # traced — there is nothing in the traceback they can act on.
         print(f"backfill_history failed: {exc}", file=sys.stderr)
         return 2
-    finally:
-        try:
-            asyncio.run(engine.dispose())
-        except Exception:  # pragma: no cover - best-effort teardown
-            pass
 
 
 if __name__ == "__main__":

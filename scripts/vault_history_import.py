@@ -402,13 +402,43 @@ def commit_message(entry: Entry) -> str:
 
 DEFAULT_EXCLUDES = (
     ".git",
-    ".obsidian",
     ".smart-env",
     ".trash",
     ".DS_Store",
     "Icon\r",
     "Icon",
 )
+
+#: Obsidian's own config directory is *kept* — it carries the settings, enabled
+#: plugins and daily-note format that make the vault behave the way its owner
+#: set it up, and a clone without it opens as a bare default vault. Only the
+#: parts that are per-machine state or regenerable cache are dropped.
+OBSIDIAN_DIR = ".obsidian"
+OBSIDIAN_EXCLUDED_NAMES = (
+    "workspace.json",
+    "workspace-mobile.json",
+)
+OBSIDIAN_EXCLUDED_GLOBS = (
+    "copilot-index*.json",
+    "*.ajson",
+)
+#: Safety net for the cache files a plugin invents next week. On the vault this
+#: was written for, one cache file was 236 MB — 64% of the entire directory.
+#: Committed once, it is in the history permanently.
+OBSIDIAN_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _keep_obsidian_file(path: Path) -> bool:
+    if path.name in OBSIDIAN_EXCLUDED_NAMES:
+        return False
+    if any(path.match(pattern) for pattern in OBSIDIAN_EXCLUDED_GLOBS):
+        return False
+    try:
+        if path.stat().st_size > OBSIDIAN_MAX_BYTES:
+            return False
+    except OSError:
+        return False
+    return True
 
 
 def scan(vault: Path, excludes: tuple[str, ...]) -> list[Path]:
@@ -420,6 +450,11 @@ def scan(vault: Path, excludes: tuple[str, ...]) -> list[Path]:
                 continue
             path = Path(root) / name
             if path.is_symlink() or not path.is_file():
+                continue
+            if OBSIDIAN_DIR in path.relative_to(vault).parts:
+                if not _keep_obsidian_file(path):
+                    continue
+                found.append(path)
                 continue
             if path.stat().st_size == 0 and not name.endswith(".md"):
                 # 128 zero-byte extensionless artefacts is a sync-client
@@ -493,11 +528,22 @@ def build(
             env=env,
         )
 
+    skipped: list[str] = []
     for index, entry in enumerate(entries, start=1):
         target = work / entry.relpath
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(entry.abspath.read_bytes())
-        git(["add", "--", entry.relpath], cwd=work)
+        try:
+            git(["add", "--", entry.relpath], cwd=work)
+        except RuntimeError as exc:
+            # `git add` exits non-zero on a path the .gitignore excludes. That
+            # is the ignore file doing its job, not an error — skip the file
+            # rather than aborting an import that is most of the way done.
+            if "ignored by one of your .gitignore" in str(exc):
+                skipped.append(entry.relpath)
+                target.unlink(missing_ok=True)
+                continue
+            raise
         # A file matched by .gitignore stages nothing; skip rather than making
         # an empty commit.
         if not git(["diff", "--cached", "--name-only"], cwd=work).strip():
@@ -549,6 +595,7 @@ def build(
         git(["push", "-q", "--tags", "origin"], cwd=work)
 
     stats["commits"] = int(git(["rev-list", "--count", "HEAD"], cwd=work).strip())
+    stats["skipped_by_gitignore"] = len(skipped)
     return stats
 
 

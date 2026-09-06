@@ -410,13 +410,30 @@ origin the mint tools refuse rather than emit a localhost link.
 
 ### Wikilink graph
 - `get_backlinks(path, limit=50)`, notes linking TO `path`
-- `get_links(path)`, outgoing links, both resolved and dangling
+- `get_links(path)`, outgoing links: resolved, dangling, and
+  attachments (a `![[diagram.png]]` names a real file and can never
+  resolve to a note, so it is not reported as broken)
 - `get_neighborhood(path, depth=1, limit=50)`, undirected BFS over the
   resolved-link graph, capped at depth ≤ 5 and limit ≤ 200
 - `find_related(path, limit=10)`, semantic neighbors via averaged
   chunk embeddings and pgvector cosine distance, deduped per note
 - `find_orphans(folder?, limit=50)`, notes with zero in or out
   resolved links
+
+Links resolve the way Obsidian resolves them, not the way a markdown
+parser would: `[[Note]]`, `[[folder/Note]]`, `[[Note#Heading]]`,
+`[[Note#^block-id]]`, `[[Note|alias]]` and `![[Note]]` all reach the
+same note; matching ignores case; a link written through a note's
+frontmatter `aliases:` is an ordinary edge; and when two notes share a
+basename the link goes to the one nearest the vault root, which is
+Obsidian's rule. `%%comments%%` are excluded from the graph, from the
+tag vocabulary and from the embedded text — a commented-out link is a
+relationship the author withdrew. Tags follow Obsidian's grammar,
+including nested `#parent/child` and non-English tags, and exclude the
+things that merely look like tags: hex colours, issue numbers, and `#`
+tokens inside code. The full audit, including what is deliberately out
+of scope, is in
+[docs/architecture/obsidian-compatibility.md](docs/architecture/obsidian-compatibility.md).
 
 ### Git history
 When the vault is a git repository, three read-only tools answer the

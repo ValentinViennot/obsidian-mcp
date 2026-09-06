@@ -2,9 +2,18 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies.
+#
+# `git` is a hard runtime requirement for this fork, not a convenience: the
+# vault is a git repository, commit-on-write shells out to git after every
+# write-class tool call, and note_history / note_blame / find_when_written are
+# nothing but git plumbing. Without the binary all four degrade *silently* —
+# the write still lands and the tools still answer, they just stop recording
+# and reporting history, which is the one failure nobody notices until they
+# need the history. tests/test_runtime_dependencies.py keeps this honest.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     curl \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Add non-root user

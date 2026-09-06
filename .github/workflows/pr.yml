@@ -92,16 +92,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      # gitleaks exits 0 when the scan itself *fails* (a bad repo path makes it
-      # log "partial scan completed" and report no leaks), so the exit code
-      # alone is not a gate. The log is checked for the line that only a
+      # Two flags carry weight here.
+      #
+      # `-v` prints the finding — file, line, rule and fingerprint. Without it
+      # a failure is the single line "leaks found: 1", which tells whoever
+      # opened the PR nothing they can act on and nothing they could paste into
+      # `.gitleaksignore` if it turns out to be a false positive.
+      #
+      # `--redact` keeps the secret itself out of a public build log, which is
+      # the one place a real finding must not be republished.
+      #
+      # And gitleaks exits 0 when the scan itself *fails* (a bad repo path makes
+      # it log "partial scan completed" and report no leaks), so the exit code
+      # alone is not a gate either. The log is checked for the line that only a
       # completed scan prints. House rule: a gate that silently skips is not a
       # gate.
       - name: Scan
         run: |
           set -o pipefail
           docker run --rm -v "$PWD:/repo" "$GITLEAKS_IMAGE" \
-            detect --source /repo --redact --no-banner --exit-code 1 \
+            detect --source /repo --redact --no-banner -v --exit-code 1 \
             2>&1 | tee gitleaks.log
           if ! grep -qE '[0-9]+ commits scanned' gitleaks.log; then
             echo "::error::gitleaks did not complete a scan — treating as a failure."

@@ -4,7 +4,11 @@
 
 ## Embedding providers
 - `EMBEDDING_PROVIDER=ollama` (default) — uses `OLLAMA_URL` and
-  `EMBEDDING_MODEL`; serial single-input HTTP per chunk.
+  `EMBEDDING_MODEL`. Native batching: up to `OLLAMA_BATCH_LIMIT` (32) inputs
+  per `/api/embed` POST, with sub-batching for larger lists, positional order
+  preservation checked against the response length, and per-chunk degradation
+  when a batched request fails. `embed_one` (the `semantic_search` query path)
+  still sends a bare string.
 - `EMBEDDING_PROVIDER=openai` — requires `OPENAI_API_KEY` (validated at
   startup). Uses `OPENAI_BASE_URL` (default `https://api.openai.com/v1`)
   and `OPENAI_EMBEDDING_MODEL` (default `text-embedding-3-small`). Native
@@ -104,17 +108,43 @@
   `MAX_REBUILD_REREADS`, and still recording the same path and hash →
   `TsvectorRebuildAborted`, rolling the single transaction back rather than
   committing around it.
-- **`OllamaProvider.embed_batch` has no aggregate deadline** (#127); the 30 s
-  per-call `wait_for` is the only liveness bound. The old fixed 300 s
-  whole-batch budget could fire only when every chunk was individually healthy
-  — i.e. exactly on a note with more chunks than 300 s of normal latency
-  covers, which then never certified and was re-selected every tick: a
-  permanent 300 s burn under `index_pass_lock` that could never finish. A
-  *proportional* replacement re-introduces the same boundary one size class up
-  and was rejected. `OpenAIProvider` is untouched. The cost is a giant note
-  holding the pass for 30 s × chunks once; the pause is honoured at the next
-  note boundary, as always. `embed_note` still refuses to certify partial chunk
-  coverage.
+- **`OllamaProvider.embed_batch` has no aggregate deadline** (#127); the only
+  liveness bound is per **request**, and a request carries at most
+  `OLLAMA_BATCH_LIMIT` chunks. The old fixed 300 s whole-batch budget could
+  fire only when every chunk was individually healthy — i.e. exactly on a note
+  with more chunks than 300 s of normal latency covers, which then never
+  certified and was re-selected every tick: a permanent 300 s burn under
+  `index_pass_lock` that could never finish. A *proportional* replacement
+  spanning the whole note re-introduces the same boundary one size class up
+  and was rejected then, and is still rejected.
+  `_ollama_batch_timeout(n) = 30 + 10·(n−1)` is not that: it bounds **one**
+  request over at most 32 chunks, so a note of any size gets one deadline per
+  request instead of one deadline for the note, and no quantity of healthy work
+  can exhaust any of them. It is also never larger than what the same chunks
+  were allowed as serial calls (30·n), so liveness is strictly better than the
+  #127 baseline — a hung provider is caught in ≤ 340 s where 32 serial calls
+  took up to 960 s. `embed_note` still refuses to certify partial chunk
+  coverage, and the pause is honoured at the next note boundary, as always.
+- **Batched results are checked, not trusted.** `/api/embed` answers with a
+  bare positional array and no `index` field, so the response length is the
+  only evidence that vector *i* describes input *i*. A length disagreement
+  raises `ProviderBatchSizeMismatch` and is deliberately **not** retried
+  per-chunk: it is the provider contradicting the contract, and papering over
+  it would hide a broken model or gateway behind a slow green pass. A
+  *timeout* is likewise not retried per-chunk — that would multiply exactly the
+  burn the deadline exists to stop. Every other failure (5xx, dropped
+  connection, `ProviderInputTooLarge` on one over-long chunk) degrades to one
+  request per chunk at the plain 30 s deadline, which does not rescue a note
+  with a genuinely unembeddable chunk (coverage must still be exact) but does
+  make a batch-only fault free and attributes a chunk-specific fault to the
+  chunk that caused it.
+- **Why batch at all.** Measured against the production endpoint: 0.092
+  s/chunk unbatched, 0.0233 at 8, 0.0169 at 32, 0.0170 at 50 — a 5.4x speedup
+  that flattens by 50, which is why the limit is 32. The larger reason is
+  contention: the Ollama instance is shared with other services, so 32x fewer
+  requests is 32x less queueing imposed on somebody else's latency. On the
+  production corpus (~14,000 chunks) that is ~21 minutes of load turned into
+  ~4. `OpenAIProvider` batched natively from the start and is untouched.
 - Indexer runs on startup then every 5 minutes, hash-based change detection.
   Each periodic tick ends with `prewarm_search_caches()` **inside**
   `index_pass_lock`: one `get_embedding("warmup")` (Ollama only — a remote API

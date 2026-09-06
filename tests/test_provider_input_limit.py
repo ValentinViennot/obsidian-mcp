@@ -358,18 +358,28 @@ async def test_ollama_5xx_still_propagates_as_today(ollama_settings):
 
 @pytest.mark.asyncio
 async def test_ollama_batch_propagates_the_typed_exception(ollama_settings):
-    """`embed_batch` wraps each call in `asyncio.wait_for`; the exception must
-    come out of it as itself, not as a `TimeoutError` or a swallowed None."""
+    """`embed_batch` wraps each request in `asyncio.wait_for`; the exception
+    must come out of it as itself, not as a `TimeoutError` or a swallowed None.
+
+    With native batching the refusal arrives on the *array* request, which says
+    only that something in the sub-batch was too large. The per-chunk fallback
+    is what turns that into a statement about the offending chunk — and the
+    typed exception still has to survive it.
+    """
     provider = OllamaProvider()
     with respx.mock(base_url="http://ollama:11434") as mock:
         route = mock.post("/api/embed")
         route.side_effect = [
+            # The batched request: refused because one of its inputs is too big.
+            Response(400, json=OLLAMA_INPUT_LENGTH),
+            # The fallback, one request per chunk: the short one is fine…
             Response(200, json={"embeddings": [[0.1, 0.2, 0.3]]}),
+            # …and the refusal is now attributed to the chunk that caused it.
             Response(400, json=OLLAMA_INPUT_LENGTH),
         ]
         with pytest.raises(refusals.ProviderInputTooLarge):
             await provider.embed_batch(["short", "very long"])
-    assert route.call_count == 2
+    assert route.call_count == 3
 
 
 @pytest.mark.asyncio

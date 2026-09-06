@@ -528,18 +528,99 @@ def _input_limit_reason(
     return None
 
 
-class OllamaProvider:
-    """Default provider — POSTs to a self-hosted Ollama instance, one input
-    per request. Sends `keep_alive` so the model stays resident between
-    (often infrequent) calls instead of paying a cold reload each time."""
+#: How many chunks go into one `/api/embed` request. Mirrors
+#: `OpenAIProvider.OPENAI_BATCH_LIMIT`, and is a *bound* rather than a target:
+#: it is what makes every deadline below finite, because the deadline scales
+#: with the request and the request can never carry more than this.
+#:
+#: 32 is where the measured curve flattens against the production endpoint
+#: (seconds per chunk: 0.092 unbatched, 0.0233 at 8, 0.0169 at 32, 0.0170 at
+#: 50). Past that the marginal gain is noise while the cost of a failed request
+#: — the whole sub-batch is re-issued one chunk at a time — keeps growing, and
+#: so does the peak memory the provider holds for one request.
+OLLAMA_BATCH_LIMIT = 32
 
-    async def embed_one(self, text: str) -> list[float]:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+#: The deadline for a request carrying **one** chunk. Unchanged from #127: a
+#: single-chunk request is byte for byte the call this provider made before
+#: batching existed, and it must fail in the same bounded time.
+OLLAMA_REQUEST_TIMEOUT_SECONDS = 30.0
+
+#: The extra deadline each *additional* chunk in a request buys.
+#:
+#: Deliberately far above the measured marginal cost (~0.017 s/chunk at a batch
+#: of 32, so ~600x headroom) and deliberately far below
+#: `OLLAMA_REQUEST_TIMEOUT_SECONDS`: a batched chunk is marginal work on a
+#: model that is already resident and already has the request, not a fresh
+#: round trip, so charging it a fresh round trip's allowance would make the
+#: bound useless.
+OLLAMA_BATCH_MARGINAL_TIMEOUT_SECONDS = 10.0
+
+
+def _ollama_batch_timeout(chunk_count: int) -> float:
+    """The deadline for one `/api/embed` request carrying `chunk_count` chunks.
+
+    Affine, not fixed and not per-note: `30 + 10 × (n − 1)`, so 30 s for one
+    chunk (identical to the pre-batching call) and 340 s for a full 32.
+
+    **This is not the aggregate budget #127 removed, and the difference is the
+    whole reason batching is safe here.** That budget spanned an unbounded
+    number of *sequential* provider calls, so the only thing it could ever
+    catch was a healthy note with too many chunks — it fired on work that was
+    succeeding, the note was never certified, and the next pass selected it
+    again for the same doomed 300 s. This deadline spans exactly one request
+    to one provider, over at most `OLLAMA_BATCH_LIMIT` chunks. A note with
+    10,000 chunks gets 313 deadlines, not one; no quantity of healthy work can
+    exhaust any of them, so there is no note size at which this starts failing
+    and never stops.
+
+    It is also never larger than what the same chunks were allowed before:
+    n chunks used to get n × 30 s as n separate calls and now get
+    30 + 10(n − 1) ≤ 30n. Liveness is therefore strictly better than the #127
+    baseline, not merely preserved — a hung provider is detected in ≤ 340 s
+    where it previously took up to 960 s for the same 32 chunks.
+    """
+    return OLLAMA_REQUEST_TIMEOUT_SECONDS + OLLAMA_BATCH_MARGINAL_TIMEOUT_SECONDS * max(
+        0, chunk_count - 1
+    )
+
+
+class ProviderBatchSizeMismatch(RuntimeError):
+    """A batched provider request answered with a different number of vectors
+    than it was sent.
+
+    Loud on purpose, and **never repaired by retrying**. `/api/embed` returns a
+    bare positional array, so the caller's only evidence that vector *i*
+    describes input *i* is that the two lists are the same length. If they are
+    not, the provider has said nothing about which inputs it dropped, every
+    surviving pairing is a guess, and the failure mode of guessing is a note
+    whose chunk text and chunk vector describe different paragraphs — a
+    permanently, silently wrong search result, which is the one outcome this
+    server ranks above every expensive one.
+    """
+
+
+class OllamaProvider:
+    """Default provider — POSTs to a self-hosted Ollama instance. Sends
+    `keep_alive` so the model stays resident between (often infrequent) calls
+    instead of paying a cold reload each time."""
+
+    async def _post(
+        self, payload_input: str | list[str], *, timeout: float
+    ) -> list[list[float]]:
+        """One `/api/embed` round trip, returning the raw `embeddings` array.
+
+        `payload_input` is passed through to the request body untouched, so
+        `embed_one` keeps sending a bare string (which is what every deployment
+        this has ever run against accepts) and only the batch path sends an
+        array. The response shape is the same either way: `embeddings` is an
+        array of vectors, positionally aligned with the inputs.
+        """
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"{settings.ollama_url}/api/embed",
                 json={
                     "model": settings.embedding_model,
-                    "input": text,
+                    "input": payload_input,
                     "keep_alive": _coerce_keep_alive(settings.ollama_keep_alive),
                 },
             )
@@ -558,32 +639,123 @@ class OllamaProvider:
                     raise refusals.ProviderInputTooLarge(reason, provider="ollama")
             response.raise_for_status()
             data = response.json()
-            return data["embeddings"][0]
+            return data["embeddings"]
+
+    async def embed_one(self, text: str) -> list[float]:
+        vectors = await self._post(text, timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS)
+        return vectors[0]
+
+    async def _embed_sub_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed up to `OLLAMA_BATCH_LIMIT` chunks in one request, degrading to
+        one request per chunk if that request fails.
+
+        **Order is positional and is checked, not trusted.** `/api/embed`
+        answers an array `input` with an array `embeddings` in input order;
+        this returns it unrearranged and refuses any response whose length
+        disagrees with the request (`ProviderBatchSizeMismatch`). There is no
+        `index` field to sort on as OpenAI's endpoint has, so length is the
+        only cross-check available and it is applied unconditionally.
+
+        **A size mismatch does not fall back.** It is not a transient fault
+        about one chunk; it is the provider contradicting the contract this
+        call depends on, and quietly re-issuing the work per chunk would hide a
+        broken model or gateway behind a slow but green index pass, for ever.
+
+        **A timeout does not fall back either.** A deadline says something
+        about the provider, not about a chunk, so re-issuing the same work as
+        32 more requests would multiply exactly the burn the deadline exists to
+        stop — and would make the bound `_ollama_batch_timeout` documents a
+        lie. It propagates, `embed_note` records `PROVIDER_FAILED`, the note's
+        existing vectors survive untouched (#11) and a later pass retries it.
+
+        Everything else — a 5xx, a dropped connection, a
+        `ProviderInputTooLarge` for one over-long chunk — *does* fall back to
+        one request per chunk. What that buys is not that the note survives a
+        genuinely bad chunk (it cannot: `embed_note` requires exact coverage,
+        so one unembeddable chunk still fails the note). It buys two things
+        that matter more: a batch-level fault that per-chunk requests do not
+        reproduce costs nothing, and a fault that *is* about one chunk is
+        attributed to that chunk in the logs instead of to the 31 innocent ones
+        beside it. The fallback re-uses `embed_one`, so each retried chunk gets
+        the plain 30 s deadline it would have had before batching existed.
+        """
+        timeout = _ollama_batch_timeout(len(texts))
+        try:
+            vectors = await asyncio.wait_for(
+                self._post(texts, timeout=timeout), timeout=timeout
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            raise
+        except Exception as exc:
+            if len(texts) == 1:
+                # Already the narrowest possible request; there is nothing to
+                # degrade to, and retrying it once more would just double the
+                # latency of every genuine failure.
+                raise
+            logger.warning(
+                "Ollama batch of %d failed (%s: %s); retrying one chunk at a "
+                "time so the fault is attributed to the chunk that caused it",
+                len(texts),
+                type(exc).__name__,
+                exc,
+            )
+            out: list[list[float]] = []
+            for text_ in texts:
+                out.append(
+                    await asyncio.wait_for(
+                        self.embed_one(text_),
+                        timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS,
+                    )
+                )
+            return out
+
+        if len(vectors) != len(texts):
+            raise ProviderBatchSizeMismatch(
+                f"Ollama returned {len(vectors)} vectors for {len(texts)} "
+                "inputs; the response carries no way to say which inputs were "
+                "dropped, so no chunk-to-vector pairing can be trusted"
+            )
+        return vectors
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed each chunk in turn. **The per-call timeout is the only
-        deadline, deliberately** (#127, D5).
+        """Embed every chunk, `OLLAMA_BATCH_LIMIT` per request, in input order.
 
+        **`/api/embed` takes an array.** Sending one chunk per request cost
+        0.092 s/chunk against the production endpoint; a batch of 32 costs
+        0.0169 s/chunk, a 5.4x speedup that flattens by 50. On the real corpus
+        (~14,000 chunks) that is ~21 minutes of load turned into ~4. Speed is
+        the smaller half: this Ollama instance is **shared** with other
+        services, so 32x fewer requests is 32x less queue contention on
+        somebody else's latency, not just on ours.
+
+        **There is still no aggregate deadline, deliberately** (#127, D5).
         There used to be a fixed 300 s budget over the whole batch. It could
         only ever fire when every individual chunk was healthy — a hung
-        provider trips the 30 s `wait_for` long before it — so the one thing it
-        actually caught was a note with more chunks than 300 s of normal
-        latency covers. Such a note timed out, was never certified, and was
-        re-selected on the next pass: a permanent 300 s burn per tick, under
-        `index_pass_lock`, that could never complete. A *proportional* budget
-        was rejected in review for re-introducing the same boundary one size
-        class up — chunks that each answer just under 30 s exhaust any
-        per-chunk allowance once loop overhead is counted.
+        provider trips the per-request `wait_for` long before it — so the one
+        thing it actually caught was a note with more chunks than 300 s of
+        normal latency covers. Such a note timed out, was never certified, and
+        was re-selected on the next pass: a permanent 300 s burn per tick,
+        under `index_pass_lock`, that could never complete.
 
-        Liveness is unaffected: a provider that stops responding still fails in
-        ≤ 30 s. The cost is that a giant note holds the pass for 30 s × chunks
-        in the worst case, once, and the pause flag is honoured at the next
-        note boundary as it always was. `OpenAIProvider` is untouched — it
-        batches natively and never had this defect.
+        Nothing here reintroduces that. Every deadline belongs to exactly one
+        bounded request (`_ollama_batch_timeout`), this loop imposes none of
+        its own, and no amount of healthy work can exhaust a per-request bound
+        — which is precisely the property the retired budget lacked. A note of
+        any size still completes; a provider that stops responding still fails
+        in bounded time, now ≤ 340 s per request rather than the 960 s the same
+        32 chunks could take as 32 serial calls.
+
+        The pause flag is honoured at the next note boundary as it always was.
+        `OpenAIProvider` is untouched — it batched natively from the start and
+        never had this defect.
         """
+        if not texts:
+            return []
         results: list[list[float]] = []
-        for t in texts:
-            results.append(await asyncio.wait_for(self.embed_one(t), timeout=30.0))
+        for start in range(0, len(texts), OLLAMA_BATCH_LIMIT):
+            results.extend(
+                await self._embed_sub_batch(texts[start : start + OLLAMA_BATCH_LIMIT])
+            )
         return results
 
 

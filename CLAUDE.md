@@ -124,6 +124,18 @@ update it in the same change.** What stays here is the short list:
 
 - API keys use `omcp_` prefix, stored as SHA-256 hashes
 - Panel/OAuth passwords: direct `bcrypt` (`$2b$`, cost 12); both hash and verify truncate the UTF-8 encoding at 72 bytes and reject NUL bytes — passlib's historical semantics — so existing hashes stay valid; don't "fix" the truncation.
+- **`AUTH_MODE` governs the *panel* login and nothing else.** `local`
+  (default) is the built-in username/password form; `pocketid` federates the
+  human login to an OIDC provider (`src/auth/oidc.py`, migration 025's
+  `users.oidc_subject`). **`src/oauth/routes.py` — this server's own OAuth 2.0
+  authorization server for MCP clients — is untouched in both modes**, because
+  PocketID publishes no `registration_endpoint` and MCP clients require DCR.
+  The one seam is `authorize_get`'s existing `/admin/auth/login?next=…`
+  redirect, whose contract must not change. Under `pocketid` the password form
+  and `/admin/register` **404** (not hidden — a working form would be a bypass
+  of the IdP), accounts link by the provider's `sub` and never by email, and
+  nothing is ever auto-promoted to admin. See
+  [control panel](docs/architecture/control-panel.md).
 - Vault mounted read-write at /obsidian in container
 - Read responses are capped in characters (`MAX_READ_RESPONSE_CHARS`, default
   40,000) independently of the byte caps on disk I/O — see "Three kinds of size cap"

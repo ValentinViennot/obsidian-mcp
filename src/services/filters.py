@@ -1,13 +1,18 @@
-"""Shared SQL filter helper for NoteMetadata queries.
+"""Shared SQL filter helpers for NoteMetadata and NoteEmbedding queries.
 
 This is the single supported way to apply `folder`, `tags`, and `frontmatter`
-filters to a `select` over `NoteMetadata`. Inlining the equivalents in callers
-risks divergence (escape rules, containment semantics).
+filters to a `select` over `NoteMetadata`, and the single supported way to
+spell "the vectors that describe the note as it stands" over `NoteEmbedding`.
+Inlining the equivalents in callers risks divergence (escape rules,
+containment semantics, and — for the temporal predicate — a search that
+silently starts returning text the note no longer contains).
 """
 
-from sqlalchemy import Select
+import datetime
 
-from src.models.db import NoteMetadata
+from sqlalchemy import ColumnElement, Select, and_, or_
+
+from src.models.db import NoteEmbedding, NoteMetadata
 
 
 def _escape_like(s: str) -> str:
@@ -61,3 +66,68 @@ def apply_note_filters(
     else:
         stmt = stmt.where(NoteMetadata.user_id == user_id)
     return stmt
+
+
+# ── The temporal predicate (migration 025) ─────────────────────────────────
+#
+# `note_embeddings` holds more than one generation of vectors once
+# `scripts/backfill_history.py` has run: a row carries the interval over which
+# its `chunk_text` was the note's text. `valid_to IS NULL` means "still is",
+# and it is the **only** thing separating a vector over deleted content from a
+# vector over live content.
+#
+# That makes this the most load-bearing predicate on the read path. A search
+# that forgets it does not fail; it returns paragraphs the author deleted,
+# ranked and quoted exactly like current ones, to an agent that acts on them
+# without a human ever seeing the query. So it is written once, here, and every
+# current-state reader calls it — there is no correct hand-rolled spelling to
+# prefer.
+
+
+def current_embedding_predicate() -> ColumnElement[bool]:
+    """`note_embeddings.valid_to IS NULL` — the vectors that describe the note
+    as it stands.
+
+    A bare predicate rather than only a statement helper because `DELETE`
+    needs it too: `embed_note` replaces a note's *current* vectors and must
+    leave its history alone, and a `delete()` is not a `Select`.
+    """
+    return NoteEmbedding.valid_to.is_(None)
+
+
+def embedding_valid_at_predicate(when: datetime.datetime) -> ColumnElement[bool]:
+    """The rows whose validity interval contains `when`.
+
+    Half-open, `[valid_from, valid_to)`, so consecutive versions of a note
+    tile the timeline with no gap and no overlap: version *n* ends at exactly
+    the instant version *n+1* begins, and that instant belongs to *n+1*.
+
+    **A NULL bound is unbounded, not unknown-and-excluded.** `valid_from IS
+    NULL` reads as "since before anything this row can speak to" — which is
+    the honest reading for every row the ordinary embed pass wrote, since it
+    knows what a note says but not since when. Excluding those instead would
+    make a point-in-time query answer *nothing* for the overwhelmingly common
+    note that has never been through a history backfill, which is a worse
+    answer than a slightly over-inclusive one: the text it returns does at
+    least exist in the vault today.
+    """
+    return and_(
+        or_(NoteEmbedding.valid_from.is_(None), NoteEmbedding.valid_from <= when),
+        or_(NoteEmbedding.valid_to.is_(None), NoteEmbedding.valid_to > when),
+    )
+
+
+def apply_embedding_validity(
+    stmt: Select, *, as_of: datetime.datetime | None = None
+) -> Select:
+    """Scope a select over `NoteEmbedding` in time.
+
+    `as_of=None` — the default, and what every ordinary search passes — is
+    **current only**, not "unfiltered". That asymmetry is deliberate and is the
+    same one `apply_note_filters` makes for `user_id`: the absence of an
+    argument is a scoping decision, never the absence of one, because the
+    failure mode of "no predicate" here is deleted text served as current.
+    """
+    if as_of is None:
+        return stmt.where(current_embedding_predicate())
+    return stmt.where(embedding_valid_at_predicate(as_of))

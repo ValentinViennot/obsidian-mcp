@@ -59,7 +59,7 @@ from src.mcp_server.read_result import (
 from src.models.db import UsageLog
 from src.services import rate_limits, refusals, security_events, timing
 from src.services.embeddings import semantic_search
-from src.services.filters import apply_note_filters
+from src.services.filters import apply_embedding_validity, apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
 from src.services.search import full_text_search
 from src.services.usage_stats import OVER_QUOTA_PARAM
@@ -3414,6 +3414,11 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
     # why the caller's zero-row exact fallback is unconditional — there is no
     # unfiltered form of this statement left (D1a).
     stmt = stmt.where(_note_owner_predicate(user_id))
+    # Current vectors only (migration 025). `find_related` answers "what else
+    # is like this note", present tense; a historical row would offer a note as
+    # a neighbour on the strength of a paragraph its author deleted, and the
+    # chunk it quotes back would be that paragraph.
+    stmt = apply_embedding_validity(stmt)
     return stmt.order_by(distance).limit(overfetch)
 
 
@@ -3468,8 +3473,16 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         # below has in hand, so no path can quietly omit it.
         source_stale = source.embedded_content_hash != source.content_hash
 
+        # The query vector is the mean of the source's *current* chunks
+        # (migration 025). Averaging its history in would build a query vector
+        # describing what the note used to say as much as what it says, and the
+        # weighting would be an accident of how often that note was edited.
         chunks = (await session.execute(
-            select(NoteEmbedding.embedding).where(NoteEmbedding.note_id == source.id)
+            apply_embedding_validity(
+                select(NoteEmbedding.embedding).where(
+                    NoteEmbedding.note_id == source.id
+                )
+            )
         )).scalars().all()
         timing.add_ms("db_ms", time.monotonic() - db_start)
         if not chunks:

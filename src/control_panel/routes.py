@@ -58,6 +58,7 @@ from src.oauth.scope import (
     token_has_write,
 )
 from src.services import security_events, vault_overlap
+from src.services.filters import current_embedding_predicate
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     acquire_generation_lock_unbounded,
@@ -834,14 +835,20 @@ async def dashboard(
     notes_count = (await session.execute(notes_q)).scalar() or 0
 
     # Embeddings count joins through notes_metadata when scoping.
+    # `current_embedding_predicate()` on every count on this page (migration
+    # 025): these numbers answer "how much of the vault is indexed *now*", and
+    # a backfilled history would inflate every one of them — an operator would
+    # read 140% coverage, or a pending count that never falls.
     if uid is not None:
         emb_q = (
             select(func.count(func.distinct(NoteEmbedding.note_id)))
             .join(NoteMetadata, NoteMetadata.id == NoteEmbedding.note_id)
-            .where(NoteMetadata.user_id == uid)
+            .where(NoteMetadata.user_id == uid, current_embedding_predicate())
         )
     else:
-        emb_q = select(func.count(func.distinct(NoteEmbedding.note_id)))
+        emb_q = select(func.count(func.distinct(NoteEmbedding.note_id))).where(
+            current_embedding_predicate()
+        )
     notes_with_embeddings = (await session.execute(emb_q)).scalar() or 0
 
     # Currency, beside coverage — two different questions about the same rows.
@@ -2549,9 +2556,13 @@ async def settings_page(
     user=Depends(require_admin_panel),
 ):
     notes_count = (await session.execute(select(func.count(NoteMetadata.id)))).scalar() or 0
-    embeddings_count = (await session.execute(select(func.count(NoteEmbedding.id)))).scalar() or 0
+    # Current rows only (migration 025) — see the dashboard's counts for why.
+    embeddings_count = (await session.execute(
+        select(func.count(NoteEmbedding.id)).where(current_embedding_predicate())
+    )).scalar() or 0
     notes_with_emb = (await session.execute(
         select(func.count(func.distinct(NoteEmbedding.note_id)))
+        .where(current_embedding_predicate())
     )).scalar() or 0
 
     # Test DB connection

@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "024"
+HEAD_REVISION = "025"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -5113,4 +5113,234 @@ def test_downgrade_024_refuses_a_table_it_did_not_create():
         assert result.returncode != 0
         assert "024's comment marker" in result.stdout + result.stderr
         assert fetchval(url, "SELECT to_regclass('public.user_sessions')") is not None
+        assert alembic_version(url) == HEAD_REVISION
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 025 — note_embeddings.valid_from / valid_to (temporal embeddings)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `valid_to IS NULL` is the definition of "current" for a vector. Everything
+# below exists because the failure mode of getting that wrong is not an error —
+# it is `semantic_search` quoting a paragraph the author deleted back to an
+# agent as though the note still said it.
+
+VALIDITY_MARKER = "embedding validity interval (025_temporal_embeddings)"
+VALIDITY_INDEX = "ix_note_embeddings_validity"
+
+
+def validity_comment(url, column):
+    return fetchval(
+        url,
+        "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
+        "WHERE a.attrelid = 'note_embeddings'::regclass AND a.attname = $1",
+        column,
+    )
+
+
+def validity_index_columns(url):
+    return fetchval(
+        url,
+        "SELECT array_agg(a.attname ORDER BY k.ord) "
+        "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+        "     CROSS JOIN unnest(string_to_array(i.indkey::text, ' ')) "
+        "                WITH ORDINALITY AS k(attnum, ord) "
+        "     JOIN pg_attribute a ON a.attrelid = i.indrelid "
+        "                        AND a.attnum = k.attnum::smallint "
+        "WHERE i.indrelid = 'public.note_embeddings'::regclass "
+        "  AND ic.relname = $1 "
+        "GROUP BY ic.relname",
+        VALIDITY_INDEX,
+    )
+
+
+def seed_pre_025_vectors(url):
+    """One note with two chunk vectors, written before validity existed."""
+    insert_user(url, 1, "alice")
+    sql(
+        url,
+        "INSERT INTO notes_metadata "
+        "(id, user_id, file_path, title, content_hash, embedded_content_hash) "
+        "VALUES (1, 1, 'A.md', 'A', 'hash-a', 'hash-a')",
+    )
+    zero = "[" + ",".join(["0"] * DIM) + "]"
+    sql(
+        url,
+        "INSERT INTO note_embeddings (id, note_id, chunk_index, chunk_text, "
+        f"embedding) VALUES (1, 1, 0, 'first', '{zero}'), "
+        f"                  (2, 1, 1, 'second', '{zero}')",
+    )
+
+
+def test_the_validity_columns_are_nullable_undefaulted_and_marked():
+    with throwaway_db("schema_validity_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        for column in ("valid_from", "valid_to"):
+            shape = column_shape(url, "note_embeddings", column)
+            assert shape is not None, f"note_embeddings.{column} is missing"
+            attnotnull, coltype, coldefault = shape
+            assert attnotnull is False, (
+                f"{column} must be nullable — NULL is how this schema spells "
+                "'current' (valid_to) and 'origin unknown' (valid_from), and a "
+                "NOT NULL column could express neither"
+            )
+            assert coltype == "timestamp with time zone", (
+                "a naive timestamp would reinterpret every stored instant in "
+                "the server's local zone, so a point-in-time query could "
+                "return the neighbouring version across a DST boundary"
+            )
+            assert coldefault is None, (
+                "a server default would stamp an interval on the rows the "
+                "ordinary embed pass writes, which know no interval"
+            )
+            assert validity_comment(url, column) == VALIDITY_MARKER
+        assert validity_index_columns(url) == ["valid_to", "valid_from"]
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+        assert "No new upgrade operations detected" in check.stdout
+
+
+def test_025_reads_every_pre_existing_vector_as_current():
+    """The whole compatibility story. Every row that exists when 025 runs was
+    written by the ordinary embed pass and describes the note as it stands, so
+    NULL/NULL is not a placeholder — it is the correct value, and the read path
+    goes on returning exactly the rows it returned before."""
+    with throwaway_db("schema_validity_backfill", revision="024") as url:
+        seed_pre_025_vectors(url)
+        assert column_shape(url, "note_embeddings", "valid_to") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        rows = fetch(
+            url,
+            "SELECT id, chunk_text, valid_from, valid_to "
+            "FROM note_embeddings ORDER BY id",
+        )
+        assert [tuple(r) for r in rows] == [
+            (1, "first", None, None),
+            (2, "second", None, None),
+        ]
+        assert fetchval(
+            url, "SELECT count(*) FROM note_embeddings WHERE valid_to IS NULL"
+        ) == 2
+
+
+def test_rerunning_025_leaves_recorded_intervals_alone():
+    """Stamp-back idempotence, the shape the schema gate itself performs. A
+    history the backfill has since written must survive it."""
+    with throwaway_db("schema_validity_rerun", revision="024") as url:
+        seed_pre_025_vectors(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        sql(
+            url,
+            "UPDATE note_embeddings SET valid_from = '2020-01-01T00:00:00Z', "
+            "valid_to = '2021-01-01T00:00:00Z' WHERE id = 1",
+        )
+
+        _harness.run_alembic(url, "stamp", "024", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url, "SELECT valid_to FROM note_embeddings WHERE id = 1"
+        ) is not None
+        assert fetchval(
+            url, "SELECT valid_to FROM note_embeddings WHERE id = 2"
+        ) is None
+        assert validity_comment(url, "valid_to") == VALIDITY_MARKER
+
+
+def test_025_refuses_a_column_of_unknown_provenance():
+    """013's philosophy: reconcile a database that demonstrably has our shape,
+    refuse to guess for one that does not. A naive-timestamp `valid_to`
+    somebody else created would misplace every interval boundary."""
+    with throwaway_db("schema_validity_foreign", revision="024") as url:
+        sql(url, "ALTER TABLE note_embeddings ADD COLUMN valid_to TIMESTAMP")
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0, "025 should have refused"
+        combined = result.stdout + result.stderr
+        assert "not timestamp with time zone" in combined, combined
+        assert "025's comment marker" in combined, combined
+        assert alembic_version(url) == "024", "nothing should have been recorded"
+
+
+def test_025_refuses_an_index_name_it_did_not_create():
+    """An index of the right name over the wrong columns would be adopted
+    silently and would then serve nothing, while `alembic check` sees only that
+    an index by that name exists."""
+    with throwaway_db("schema_validity_index_squat", revision="024") as url:
+        sql(url, f"CREATE INDEX {VALIDITY_INDEX} ON note_embeddings (note_id)")
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0, "025 should have refused"
+        assert "025's comment marker" in result.stdout + result.stderr
+        assert alembic_version(url) == "024"
+
+
+def test_downgrade_025_deletes_history_and_keeps_the_present():
+    """The ordering that makes the downgrade safe rather than merely reversible.
+
+    A historical row is a vector over text the note no longer contains, and
+    `valid_to` is the only thing that says so. Dropping the column first would
+    silently promote every superseded paragraph in the database to current, and
+    nothing left in the schema could detect it. So the rows go while the column
+    that identifies them still exists — and the rows the embed pass wrote,
+    which are exactly the ones with `valid_to IS NULL`, all survive.
+    """
+    with throwaway_db("schema_validity_downgrade") as url:
+        seed_pre_025_vectors(url)
+        zero = "[" + ",".join(["0"] * DIM) + "]"
+        sql(
+            url,
+            "INSERT INTO note_embeddings (id, note_id, chunk_index, chunk_text, "
+            "embedding, valid_from, valid_to) VALUES "
+            f"(3, 1, 0, 'deleted paragraph', '{zero}', "
+            "'2020-01-01T00:00:00Z', '2021-01-01T00:00:00Z')",
+        )
+
+        _harness.run_alembic(url, "downgrade", "024", dimensions=DIM)
+        assert alembic_version(url) == "024"
+        assert column_shape(url, "note_embeddings", "valid_to") is None
+        assert validity_index_columns(url) is None
+
+        remaining = fetch(
+            url, "SELECT id, chunk_text FROM note_embeddings ORDER BY id"
+        )
+        assert [tuple(r) for r in remaining] == [(1, "first"), (2, "second")], (
+            "the historical row must be gone and the current ones kept"
+        )
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert validity_comment(url, "valid_from") == VALIDITY_MARKER
+        assert validity_index_columns(url) == ["valid_to", "valid_from"]
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_025_refuses_a_column_it_did_not_create():
+    """013's rule on the way back down: undo *this* migration, not delete a
+    column somebody else put there under this name — and in particular do not
+    delete rows on the strength of one."""
+    with throwaway_db("schema_validity_downgrade_foreign") as url:
+        seed_pre_025_vectors(url)
+        sql(
+            url,
+            "COMMENT ON COLUMN note_embeddings.valid_to IS "
+            "'somebody else made this'",
+        )
+        result = _harness.run_alembic(
+            url, "downgrade", "024", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "025's comment marker" in result.stdout + result.stderr
+        assert column_shape(url, "note_embeddings", "valid_to") is not None
+        assert fetchval(url, "SELECT count(*) FROM note_embeddings") == 2
         assert alembic_version(url) == HEAD_REVISION

@@ -314,6 +314,13 @@ _LINKS_TRUNCATED_COLUMN_MARKER = (
 # `alembic/versions/023_indexer_state.py`.
 _CHUNKS_TRUNCATED_COLUMN_MARKER = "chunk-cap truncation marker (023_indexer_state)"
 
+# Same device, same rule: byte identical to `MARKER` in
+# `alembic/versions/025_temporal_embeddings.py`. Carried by both validity
+# columns and by the index over them.
+_TEMPORAL_VALIDITY_COLUMN_MARKER = (
+    "embedding validity interval (025_temporal_embeddings)"
+)
+
 
 class UsageLog(Base):
     __tablename__ = "usage_logs"
@@ -497,6 +504,34 @@ class NoteEmbedding(Base):
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dimensions), nullable=False)
 
+    # ── Validity interval (migration 025) ──────────────────────────────────
+    #
+    # `valid_to IS NULL` is the definition of **current**, and every read path
+    # that means "the note as it stands" says so explicitly — see
+    # `current_embeddings_only` in `src/services/embeddings.py`, which is the
+    # single supported way to spell it.
+    #
+    # Both are nullable, and the two NULLs mean different things:
+    #
+    # - `valid_to IS NULL` — this vector still describes the note. Written by
+    #   the ordinary embed pass, which is the only writer of current rows.
+    # - `valid_from IS NULL` — unbounded in the past *as far as this row
+    #   knows*. The embed pass knows what a note says, not since when; only
+    #   `src/services/history_indexer.py` has a commit date to put here.
+    #
+    # A pre-025 row is NULL/NULL, which reads as "current, origin unknown" —
+    # the truth for every row that existed before this feature.
+    valid_from: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=_TEMPORAL_VALIDITY_COLUMN_MARKER,
+    )
+    valid_to: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=_TEMPORAL_VALIDITY_COLUMN_MARKER,
+    )
+
     note: Mapped["NoteMetadata"] = relationship(back_populates="embeddings")
 
     __table_args__ = (
@@ -508,6 +543,16 @@ class NoteEmbedding(Base):
             postgresql_ops={"embedding": "vector_cosine_ops"},
             postgresql_with={"m": "16", "ef_construction": "64"},
         ),
+        # `valid_to` leads because every temporal predicate filters on it and
+        # most filter on nothing else. Deliberately not partial on
+        # `valid_to IS NULL`: today every row is current, so that index would
+        # be a full copy — and the default vector path is served by the HNSW
+        # index above with `valid_to IS NULL` applied to its candidates.
+        # (The index's own 025 marker is a `COMMENT ON INDEX` the migration
+        # stamps and only its `downgrade()` reads. `Index` takes no `comment`
+        # and autogenerate does not compare one, so there is nothing here for
+        # `alembic check` to drift against.)
+        Index("ix_note_embeddings_validity", "valid_to", "valid_from"),
     )
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import enum
 import logging
 import re
@@ -19,7 +20,11 @@ from src.config import (
 )
 from src.models.db import NoteEmbedding, NoteMetadata
 from src.services import refusals, timing
-from src.services.filters import apply_note_filters
+from src.services.filters import (
+    apply_embedding_validity,
+    apply_note_filters,
+    current_embedding_predicate,
+)
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     FingerprintStatus,
@@ -1194,7 +1199,9 @@ async def embed_note(
                 session, note.id, certified_hash, certified_path, expire_on=note
             )
         await session.execute(
-            delete(NoteEmbedding).where(NoteEmbedding.note_id == note.id)
+            delete(NoteEmbedding).where(
+                NoteEmbedding.note_id == note.id, current_embedding_predicate()
+            )
         )
         if certified_hash is None:
             note.embedded_content_hash = note.content_hash
@@ -1302,10 +1309,25 @@ async def embed_note(
     # Only delete the old embeddings once new ones are in hand. If the provider
     # call above had failed, deleting first would let embed_vault commit the
     # DELETE and drop good vectors (issue #11).
+    #
+    # **Scoped to the current rows** (migration 025). This pass replaces the
+    # note's *present* vectors; a historical row is a fact about text the note
+    # used to contain, which an edit does not falsify — it is precisely what
+    # the edit creates more of. An unscoped DELETE here would make every
+    # ordinary edit silently erase the backfilled history of that note, and
+    # nothing would report it.
     await session.execute(
-        delete(NoteEmbedding).where(NoteEmbedding.note_id == note.id)
+        delete(NoteEmbedding).where(
+            NoteEmbedding.note_id == note.id, current_embedding_predicate()
+        )
     )
 
+    # `valid_from` / `valid_to` are left unset, which is NULL/NULL: current,
+    # origin unknown. Current because these vectors describe the note as it
+    # stands, and origin unknown because this pass reads a directory of files —
+    # it knows *what* the note says and has no way to learn since when. Only
+    # `src/services/history_indexer.py`, which has commit dates, ever fills
+    # `valid_from` in.
     for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
         session.add(NoteEmbedding(
             note_id=note.id,
@@ -1333,6 +1355,7 @@ async def semantic_search(
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
     user_id: int | None = None,
+    as_of: datetime.datetime | None = None,
 ) -> list[dict]:
     """Embed query and return the best-matching chunk per note (dedup), ordered by cosine distance.
 
@@ -1340,6 +1363,16 @@ async def semantic_search(
     so a single verbose note can't dominate the result set. Each result is a pointer
     to a note plus its most-relevant chunk as preview — the caller should `read_note`
     for full content.
+
+    **`as_of=None` means the note as it stands, and is the only thing any
+    caller passes today** (migration 025). Once `scripts/backfill_history.py`
+    has run, `note_embeddings` holds vectors over text that was edited away;
+    `apply_embedding_validity` is what keeps them out of an ordinary search,
+    and it is applied to this statement unconditionally — the default is a
+    scoping decision, not the absence of one. A caller that genuinely wants the
+    vault as it stood at some instant passes that instant and gets the versions
+    that were live then; nothing reaches this parameter by accident, because
+    the MCP tool layer does not forward one.
     """
     limit = max(1, min(limit, 50))
     embed_start = time.monotonic()
@@ -1379,6 +1412,10 @@ async def semantic_search(
     stmt = apply_note_filters(
         stmt, folder=folder, tags=tags, frontmatter=frontmatter, user_id=user_id
     )
+    # Before the ORDER BY, and never conditional: a historical row is a vector
+    # over text the author deleted, and without this it would rank, quote and
+    # be returned exactly like a live one.
+    stmt = apply_embedding_validity(stmt, as_of=as_of)
     stmt = stmt.order_by(distance).limit(overfetch)
 
     result = await session.execute(stmt)

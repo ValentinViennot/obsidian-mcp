@@ -2184,6 +2184,62 @@ async def _index_vault_pinned(
                 await session.execute(stmt)
             logger.info(f"Upserted {len(to_upsert)} notes")
 
+        # ── `modified_at` reconciliation ──────────────────────────────────
+        # **The upsert alone would have fixed nothing here** (#213). It
+        # carries only *changed* notes, and the notes whose dates are wrong
+        # are precisely the ones that have not changed since the checkout that
+        # mis-stamped them: a vault of 1,222 correct-content notes would have
+        # kept its 1,222 identical timestamps until each was individually
+        # edited, and a fix whose effect arrives one note at a time over years
+        # is not a fix. That is the whole reason this statement exists rather
+        # than the change stopping at `_modified_at`.
+        #
+        # So it is a separate, unconditional reconciliation: for every path
+        # git dated, set `modified_at` to that time where the row disagrees.
+        # `IS DISTINCT FROM` makes it a no-op once converged — the steady
+        # state updates zero rows — so it is cheap to run every pass and it
+        # self-heals a row that drifted for any other reason.
+        #
+        # Owner-scoped like every other write in this pass. It deliberately
+        # does not touch `indexed_at`, `content_hash` or anything the
+        # embedding certification reads: this corrects one metadata column and
+        # must not look like a content change to the embed backlog.
+        if git_times:
+            user_clause = "user_id IS NULL" if user_id is None else "user_id = :uid"
+            # Only paths this pass actually saw on disk. The git map is a
+            # superset (a deleted path keeps its last write time), and a row
+            # for a path no longer in the vault is the prune's business, not
+            # this statement's.
+            dated = [(p, git_times[p]) for p in sorted(seen) if p in git_times]
+            if dated:
+                params: dict = {
+                    "paths": [p for p, _ in dated],
+                    "whens": [
+                        datetime.fromtimestamp(w, tz=timezone.utc) for _, w in dated
+                    ],
+                }
+                if user_id is not None:
+                    params["uid"] = user_id
+                result = await session.execute(
+                    text(
+                        # `when` is a reserved word in Postgres (it opens a
+                        # CASE arm); `edited_at` is not, and an alias that
+                        # needs quoting is an alias waiting to be mistyped.
+                        "UPDATE notes_metadata AS nm SET modified_at = g.edited_at "
+                        "FROM (SELECT UNNEST(CAST(:paths AS text[])) AS path, "
+                        "             UNNEST(CAST(:whens AS timestamptz[])) AS edited_at) AS g "
+                        f"WHERE nm.file_path = g.path AND {user_clause} "
+                        "  AND nm.modified_at IS DISTINCT FROM g.edited_at"
+                    ),
+                    params,
+                )
+                if result.rowcount:
+                    logger.info(
+                        "Corrected modified_at from git history for %d note(s)%s",
+                        result.rowcount,
+                        log_suffix,
+                    )
+
         # Grammar-attributable embedding invalidation. A separate statement
         # because the upsert deliberately does NOT carry
         # `embedded_content_hash` — it must stay untouched for every note the

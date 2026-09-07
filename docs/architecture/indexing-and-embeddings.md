@@ -65,6 +65,27 @@
   same rule `git_vault` follows for commit-on-write. Gated on
   `GIT_VAULT_ENABLED`, so a deployment that has not opted into git pays no
   subprocess at all.
+
+  **The reconciliation UPDATE is the half that makes the fix reach a deployed
+  vault, and it is not optional.** Sourcing `modified_at` from git inside the
+  scan loop corrects only the notes the upsert carries — the *changed* ones —
+  and the notes whose dates are wrong are precisely the ones that have **not**
+  changed since the checkout that mis-stamped them. Shipping only that half
+  would have corrected zero of 1,222 rows, left every one of them wrong until
+  somebody happened to edit it, and claimed a fix in the commit message. So a
+  separate statement runs each pass over the paths the walk actually saw,
+  setting `modified_at` where the row disagrees with git. `IS DISTINCT FROM`
+  makes it a no-op once converged, so the steady state updates zero rows and
+  it self-heals a row that drifted for any other reason. It touches
+  `modified_at` alone — never `indexed_at`, `content_hash` or anything the
+  embedding certification reads — because correcting a date must not look like
+  a content change to the embed backlog.
+
+  `tests/integration/test_issue_213_modified_at_from_git_pg.py` pins exactly
+  that, and was checked by disabling the statement and watching it fail: with
+  the reconciliation removed, the four tests covering *new* notes still pass
+  and only the unchanged-note test breaks. That asymmetry is the bug, made
+  visible.
 - Embeddings: pluggable provider, `EmbeddingProvider` Protocol with two
   implementations (Ollama, OpenAI). Single `EMBEDDING_PROVIDER` env var
   picks the backend; `get_provider()` is a cached singleton. Default is

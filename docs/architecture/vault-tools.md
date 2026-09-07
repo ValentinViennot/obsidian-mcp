@@ -343,11 +343,42 @@ Every refusal is the shared shape from `src/services/refusals.py`: the tool's pr
 | L15 | A `rewrite_links=True` move whose own rewrite loses the in-call conflict reports **no** hash, so the agent must re-read the destination before guarding its next write there. | The destination holds a third writer's bytes this call never read; any hash the server could name would be one it cannot stand behind. |
 | L16 | A file over the tool's read cap cannot be guarded at all, and a successful call on one reports no `content_hash`. | Hashing is a linear read and the caps exist to bound exactly that. An **unguarded** call on such a file is unaffected — it behaves as it does today — so nothing that works now stops working. |
 
+## `get_vault_guide` states the caller's access, and can drop the primer (#213)
+
+Two changes to the tool an agent calls first, both from one session's report.
+
+**The capability line, always emitted.** `current_permission` — set from an API
+key's `permission` *or* an OAuth token's scope — was never surfaced anywhere,
+so the only way for an agent to learn whether it could write was to attempt a
+write and read the refusal. On a vault that is somebody's single source of
+truth that is a probe nobody should have to run, and the reporting agent said
+so plainly: it declined to try. The line names read-only or read-write and, in
+the read-only case, names the nine gated tools so the caller can plan work that
+does not depend on them.
+
+It lives in the guide rather than in a tool of its own. An agent's first
+question about an unfamiliar vault is "what are the conventions here" and its
+second is "may I write"; answering the second alongside the first costs one
+line, while a dedicated tool costs every client a round trip and this server a
+twenty-ninth tool. It is credential-neutral for the same reason `_require_write`'s
+refusal is: naming "a readwrite API key" tells an OAuth caller to go get a kind
+of credential it does not use and cannot mint.
+
+**`include_primer=False`.** The Obsidian primer is ~8.7 KB that is
+byte-identical on every call of every session, while the part a caller came for
+— the vault's own `CLAUDE.md` — is the part that varies. Tool output is model
+input, and a fixed cost paid repeatedly is the one kind of waste a server can
+remove on the caller's behalf. The capability line is emitted in **both** modes:
+a caller who trimmed the primer is precisely the caller who has been here before
+and is planning work. A test asserts the primer really is identical across calls
+— if that ever stops holding, the parameter is a false economy and should be
+revisited rather than kept.
+
 ## File-access tools (non-markdown)
 Raw read/write/browse of arbitrary vault files, distinct peers to the note tools (note tools stay markdown-only). Pure byte transport — no server-side PDF/text extraction, no embedding or indexing of non-markdown files.
 - `read_file(path, encoding="auto", offset=0, limit=None, hash_only=False)` — `auto` resolves text-like MIME → text, image → inline MCP image content block (renders in-client), everything else → base64 string. `text` forces UTF-8 decode (errors on non-UTF-8); `base64` forces raw-bytes base64. Capped by `MAX_FILE_READ_BYTES` (default 10 MB), checked against on-disk size before reading. Text results are additionally bounded by `MAX_READ_RESPONSE_CHARS` and page via `offset`; base64 and image results are not windowed. Base64 reads are token-heavy — check size with `list_files` first.
 - `write_file(path, content, encoding="base64", overwrite=False, expected_hash=None)` — `base64` decodes `content` to raw bytes; `text` writes UTF-8. No-clobber by default (`overwrite=True` to replace), auto-creates parent dirs, atomic via `vault.write_file`. Capped by `MAX_FILE_WRITE_BYTES` (default 25 MB) on decoded length — **except for a `.md` destination**, which is capped at `min(MAX_NOTE_BYTES, MAX_FILE_WRITE_BYTES)`; see "The `.md` cap follows the extension, not the tool" below.
-- `list_files(folder=".", pattern="*", recursive=False, limit=200)` — `ls`-style: immediate children (subdirs + files) by default, each file with size + mtime; glob-filterable; capped at `limit` with a truncation note. `pattern` is refused over `MAX_LIST_PATTERN_CHARS` (1,024) — see "The `list_files` pattern cap" below.
+- `list_files(folder=".", pattern="*", recursive=False, limit=200)` — `ls`-style: immediate children (subdirs + files) by default, each file with size + mtime; glob-filterable; capped at `limit` with a truncation note. `pattern` filters files only and never subdirectories, so a filtered non-recursive listing reports the two counts separately — see "The `list_files` headline counts files and folders apart" below. `pattern` is refused over `MAX_LIST_PATTERN_CHARS` (1,024) — see "The `list_files` pattern cap" below.
 
 - `delete_file(path, permanent=False, expected_hash=None)` — soft-deletes to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` through the anchored helper; `permanent=True` unlinks. Refuses `.md` (pointing at `delete_note`), directories and symlinks. The `.md` refusal runs on the **canonical** final component, so `note.md/.`, `a//note.md` and `NOTE.MD` are refused too — the caller's string is not the path.
 
@@ -391,6 +422,30 @@ Two things about that check are load-bearing and must not be "tidied":
 1,024 characters is far beyond any real glob and compiles in about 5 ms. A
 separate wildcard-count cap would be redundant; running the walk in a thread
 is defence in depth and is deliberately not part of this.
+
+### The `list_files` headline counts files and folders apart (#213)
+
+`pattern` filters **file** entries only. Subdirectories are always listed,
+because a caller who cannot see them cannot navigate. That is deliberate and
+unchanged — what was wrong was the header.
+
+A non-recursive listing summed both into one number: a vault root holding 108
+markdown notes and 20 folders answered *"128 entries in '.' matching
+'\*.md'"*. That number is neither the match count nor the directory count, and
+an agent planning a bulk reorganisation over "128 markdown notes" was planning
+over twenty things that are not notes. The listing itself was always correct;
+only its headline lied, which is why nothing caught it — the bug was found by
+an agent reading the summary line and counting the entries underneath.
+
+So a listing **with** a pattern now counts in files — *"108 files matching
+'\*.md' in '.', plus 20 folders"* — and the folder clause is omitted when there
+are none, which is automatically the case for a recursive listing since it has
+no directory entries at all. An unfiltered listing keeps the plain "N
+entries", which is the common call and was never ambiguous.
+
+The general rule this instance of: a count in a header is read as the answer
+to the question the header states. If a tool filters one kind of entry and not
+another, it has two counts and must report two.
 
 ### The `.md` cap follows the extension, not the tool (#203)
 

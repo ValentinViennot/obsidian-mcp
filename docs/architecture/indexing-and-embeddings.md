@@ -34,6 +34,37 @@
 
 ## Indexing decisions
 
+- **`modified_at` comes from git when the vault is a git repository** (#213).
+  It was `st_mtime`, which is a true edit time only while the vault is a
+  directory somebody edits in place. Under git it is not: `git clone` and
+  `git checkout` stamp *every* file with the moment of the checkout, so a
+  freshly deployed server recorded one identical timestamp for the whole
+  vault — 1,222 notes, one second — and `get_recent`, whose entire job is
+  ordering by recency, returned an arbitrary slice in an arbitrary order.
+  `list_notes`' sort was equally meaningless. **Nothing failed.** The column
+  was populated, the query ran, the tool answered; the answer was noise. It
+  was found by an agent noticing the dates looked wrong, which is the same
+  shape as every other bug this deployment has had — a component reporting
+  success while doing nothing useful.
+
+  `git_history.last_commit_times` walks the history **once per pass**, newest
+  commit first, and takes each path's first appearance: one subprocess for the
+  whole vault (~70 KB and half a second at 1,314 commits), not one `git log
+  -1` per note. `--diff-filter=AMR` drops deletions and `--no-renames` makes a
+  rename a delete-plus-add, so the current path is dated by the commit that
+  actually wrote it. The map is a superset of what is on disk — a vanished
+  path keeps its last *write* time rather than taking the deletion's — and
+  those entries are inert because the indexer looks up only paths its own walk
+  found.
+
+  **`st_mtime` remains the fallback and that is not a defect.** An untracked
+  or not-yet-committed note has no commit to date it by, and for that window
+  the filesystem is the only witness there is. Every failure — git missing
+  from the image, the vault not a repository, a timeout, output over the byte
+  cap — degrades to that fallback and logs; none of them fails a pass, the
+  same rule `git_vault` follows for commit-on-write. Gated on
+  `GIT_VAULT_ENABLED`, so a deployment that has not opted into git pays no
+  subprocess at all.
 - Embeddings: pluggable provider, `EmbeddingProvider` Protocol with two
   implementations (Ollama, OpenAI). Single `EMBEDDING_PROVIDER` env var
   picks the backend; `get_provider()` is a cached singleton. Default is

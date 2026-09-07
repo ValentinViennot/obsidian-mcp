@@ -2264,9 +2264,55 @@ async def semantic_search_impl(
     return "\n".join(lines)
 
 
-@_tracked("get_vault_guide", [])
-async def get_vault_guide_impl() -> str:
-    """Return the Obsidian primer plus any vault-specific conventions from CLAUDE.md."""
+def _capability_line() -> str:
+    """One line naming what this credential may do, for the guide's header.
+
+    **Why the guide and not a tool of its own.** An agent's first question
+    about a vault it has never seen is "what are the conventions here", and
+    its second is "am I allowed to write". Answering the second only when the
+    first is asked costs one line; answering it with a dedicated tool costs
+    every client a round trip and this server a twenty-ninth tool.
+
+    Until this existed the only way to learn the answer was to attempt a write
+    and read the refusal — which on a vault that is somebody's single source
+    of truth is a probe nobody should have to run. The refusal message is
+    credential-neutral for the same reason this line is: `current_permission`
+    is set from an API key's `permission` *or* an OAuth token's scope, and
+    naming one of them tells the other caller to go get a credential it does
+    not use.
+    """
+    if current_permission.get() == "readwrite":
+        return (
+            "**Your access: read and write.** Every tool on this server is "
+            "available to you, including the ones that create, edit, move and "
+            "delete notes and raw files."
+        )
+    return (
+        "**Your access: read only.** Search, read and graph tools work "
+        "normally. The write tools — `create_note`, `edit_note`, `move_note`, "
+        "`delete_note`, `set_frontmatter`, `write_file`, `delete_file`, "
+        "`request_upload`, `import_from_url` — will refuse this credential, so "
+        "plan work that does not depend on them and ask the vault owner for "
+        "write access rather than attempting one to find out."
+    )
+
+
+@_tracked("get_vault_guide", ["include_primer"])
+async def get_vault_guide_impl(include_primer: bool = True) -> str:
+    """Return the Obsidian primer plus any vault-specific conventions from CLAUDE.md.
+
+    **`include_primer=False` exists because the primer is a constant.** It is
+    ~8.7 KB that is byte-identical on every call of every session, while the
+    part a caller actually came for — the vault's own `CLAUDE.md` — is the
+    part that varies. An agent that has already read the primer once, or that
+    is re-checking conventions mid-task, should not pay for it again; tool
+    output is model input, and a fixed cost paid repeatedly is the one kind of
+    waste a server can remove on the caller's behalf.
+
+    The capability line is emitted in **both** modes. It is the answer to "may
+    I write here", it is two lines, and a caller who trimmed the primer is
+    precisely the caller who has been here before and is planning work.
+    """
     uid = current_user_id.get()
     try:
         note = read_file("CLAUDE.md", user_id=uid)
@@ -2279,7 +2325,10 @@ async def get_vault_guide_impl() -> str:
         vault_section = _NO_CLAUDE_MD_MESSAGE
     except ValueError as e:
         vault_section = f"# Vault-Specific Conventions\n\n{e}"
-    return f"{_VAULT_GUIDE_PRIMER}\n\n---\n\n{vault_section}"
+    header = f"{_capability_line()}\n\n---\n\n"
+    if not include_primer:
+        return f"{header}{vault_section}"
+    return f"{header}{_VAULT_GUIDE_PRIMER}\n\n---\n\n{vault_section}"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -6198,10 +6247,29 @@ async def list_files_impl(
     if not entries:
         return f"No entries in '{where}' matching '{pattern}'"
 
-    header = f"{len(entries)} " + ("entry" if len(entries) == 1 else "entries")
-    header += f" in '{where}'"
+    # **Count files and folders apart whenever a pattern is in play** (#213).
+    # `pattern` filters files only — subdirectories are always listed, because
+    # a caller who cannot see them cannot navigate — so one combined "N
+    # entries … matching '*.md'" was a number that answered no question: it
+    # was neither the match count nor the directory count, and an agent
+    # planning work over "128 markdown notes" was planning over 108 notes and
+    # 20 folders. The listing itself was always right; only its headline lied.
+    #
+    # Recursive listings return files and nothing else, so they keep the
+    # single count and it is already a match count.
+    n_dirs = sum(1 for e in entries if e["is_dir"])
+    n_files = len(entries) - n_dirs
     if pattern != "*":
-        header += f" matching '{pattern}'"
+        # Say "files", because that is what the pattern selected. A recursive
+        # listing has no directory entries at all, so its folder clause is
+        # simply absent rather than special-cased.
+        header = f"{n_files} file" + ("" if n_files == 1 else "s")
+        header += f" matching '{pattern}' in '{where}'"
+        if n_dirs:
+            header += f", plus {n_dirs} folder" + ("" if n_dirs == 1 else "s")
+    else:
+        header = f"{len(entries)} " + ("entry" if len(entries) == 1 else "entries")
+        header += f" in '{where}'"
     if recursive:
         header += " (recursive)"
     if truncated:

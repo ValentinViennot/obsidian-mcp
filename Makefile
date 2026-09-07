@@ -241,7 +241,30 @@ test-schema:
 # because 55438 was taken has moved this one too. The consequence is that the
 # two targets share a container name and must not be run concurrently —
 # `test-schema` starts by `docker rm -f`ing that name.
+#
+# **Linux hosts only, and it now says so instead of failing 41 tests.** This
+# target runs the host's own `pytest`, unlike every other local test path,
+# and it has to: these modules need a docker CLI (`docker/record-backup.sh`
+# goes through `docker exec … psql`, which is the channel `pg_dump` itself
+# uses) as well as a Linux kernel, and the test image has no docker client.
+# CI gets both from an Ubuntu runner. A Mac has neither — `vault_fs` is built
+# on `openat2(2)` and `O_TMPFILE`, so a host run there failed dozens of these
+# before reaching a single assertion about Postgres.
+#
+# Routing it through `scripts/test-in-docker.sh` was tried and is not the fix:
+# it swaps the kernel failures for `docker exec` failures and timeouts, which
+# is the same worthless gate wearing different errors. So the guard below
+# refuses on a non-Linux host and names the two ways to actually run these —
+# a check that cannot pass is worse than one that declines, because the first
+# trains its operator to ignore the output.
 test-integration:
+	@if [ "$$(uname -s)" != "Linux" ]; then \
+		echo "$(RED)tests/integration needs a Linux host with a docker CLI; this is $$(uname -s).$(NC)"; \
+		echo "$(YELLOW)Run them on the VPS, or let CI's 'tests' job run them — it is the$(NC)"; \
+		echo "$(YELLOW)authoritative gate and runs on every push. For the offline suite$(NC)"; \
+		echo "$(YELLOW)locally, use: scripts/test-in-docker.sh$(NC)"; \
+		exit 1; \
+	fi
 	@echo "$(GREEN)Integration suite: throwaway $(SCHEMA_TEST_IMAGE) on :$(SCHEMA_TEST_PORT)$(NC)"
 	@docker rm -f $(SCHEMA_TEST_CONTAINER) >/dev/null 2>&1 || true; \
 	docker run --rm -d --name $(SCHEMA_TEST_CONTAINER) \

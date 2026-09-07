@@ -72,7 +72,7 @@ from src.services.links import (
     resolve_target,
 )
 from src.oauth.grants import lock_account_guard
-from src.services import vault_overlap
+from src.services import git_history, vault_overlap
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
     _vault_root,
@@ -1740,6 +1740,63 @@ async def index_vault(user_id: int | None = None):
         return await _index_vault_pinned(user_id, vault, root_fd, log_suffix)
 
 
+async def _git_modified_times(vault: Path, log_suffix: str) -> dict[str, int]:
+    """Per-path last-commit times for this vault, or `{}` when unavailable.
+
+    **Never raises, and never fails a pass.** Every way this can go wrong —
+    git absent from the image, the vault not a repository, a history too large
+    for the byte cap, a timeout — leaves the caller with an empty or partial
+    map and the `st_mtime` fallback underneath it. The same rule `git_vault`
+    follows for commit-on-write: a git failure degrades the derived data, it
+    does not take down the thing git was decorating.
+
+    Gated on `git_vault_enabled` rather than on "is there a `.git` here?" so a
+    deployment that has not opted into git pays no subprocess at all, and one
+    that has gets the answer even on the pass that runs before its first
+    commit-on-write.
+    """
+    if not settings.git_vault_enabled:
+        return {}
+    try:
+        repo = await asyncio.to_thread(git_history.resolve_repo, vault)
+        times, truncated = await asyncio.to_thread(git_history.last_commit_times, repo)
+    except git_history.NotAGitRepository:
+        # An operator turned the switch on against a plain directory. That is
+        # a supported, documented no-op elsewhere in this codebase, so it is
+        # not worth a WARNING on every pass.
+        logger.debug(f"Vault is not a git repository; using file mtimes{log_suffix}")
+        return {}
+    except git_history.GitHistoryError as e:
+        logger.warning(
+            f"Could not read commit times from the vault's history{log_suffix}: "
+            f"{e}. Falling back to file mtimes, which in a git checkout are the "
+            "time of the checkout rather than of the edit."
+        )
+        return {}
+    if truncated:
+        logger.warning(
+            f"The vault's history exceeded the git output cap{log_suffix}; "
+            f"{len(times):,} paths have real commit times and the oldest notes "
+            "fall back to file mtimes."
+        )
+    return times
+
+
+def _modified_at(rel_path: str, stat, git_times: dict[str, int]) -> datetime:
+    """The note's edit time: git's when git knows it, the filesystem's if not.
+
+    A tracked path's last-commit time is an *edit* time. `st_mtime` under git
+    is a *checkout* time, which is why it is the fallback and not the
+    preference. The fallback still matters and is not a defect: an untracked
+    or not-yet-committed note has no commit to date it by, and for that window
+    the filesystem is the only witness there is.
+    """
+    when = git_times.get(rel_path)
+    if when is None:
+        return datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+    return datetime.fromtimestamp(when, tz=timezone.utc)
+
+
 async def _index_vault_pinned(
     user_id: int | None, vault: Path, root_fd: int, log_suffix: str
 ) -> tuple[int, int]:
@@ -1749,6 +1806,12 @@ async def _index_vault_pinned(
         re_derive, facts = await _reconcile_provenance(
             user_id, vault, root_fd, log_suffix
         )
+
+    # Real edit times for `modified_at`, when the vault is under git. Built
+    # once for the whole pass — see `git_history.last_commit_times` for why
+    # `st_mtime` is not an edit time in a checked-out repository, and why a
+    # missing path here means "no git answer" rather than "never modified".
+    git_times = await _git_modified_times(vault, log_suffix)
 
     # Anything the pass discovered but could not fully process. **A non-empty
     # list makes a re-derive incomplete and withholds the stamp** (A.7a): the
@@ -1952,7 +2015,7 @@ async def _index_vault_pinned(
                     "content_hash": h,
                     "extraction_version": CURRENT_EXTRACTION_VERSION,
                     "file_size": stat.st_size,
-                    "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+                    "modified_at": _modified_at(rel_path, stat, git_times),
                 })
 
         logger.info(f"Found {len(seen)} markdown files{log_suffix}")

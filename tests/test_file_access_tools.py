@@ -304,3 +304,111 @@ async def test_list_reports_recent_mtime(vault):
     result = await tools.list_files_impl(".")
     assert "fresh.txt" in result
     assert Path(str(vault / "fresh.txt")).exists()
+
+
+# ── agent feedback, 2026-09: the headline count and the capability line ──────
+#
+# Both come from one session's report against the production vault. The
+# listing bug and the invisible scope are the two findings that were exactly
+# right; the fixes are asserted here so neither can regress into being
+# "documented behaviour" again.
+
+
+async def test_glob_headline_counts_files_not_folders(vault):
+    """`pattern` filters files only, so the count must say files, not entries.
+
+    The bug this pins: a root holding 108 notes and 20 folders answered
+    "128 entries … matching '*.md'", and an agent planning a bulk move over
+    that number was planning over twenty things that are not notes.
+    """
+    for i in range(3):
+        (vault / f"note{i}.md").write_text("n", encoding="utf-8")
+    for name in ("alpha", "beta"):
+        (vault / name).mkdir()
+    result = await tools.list_files_impl(".", pattern="*.md")
+    head = result.splitlines()[0]
+    assert "3 files matching '*.md'" in head
+    assert "plus 2 folders" in head
+    # The folders are still listed — a caller who cannot see them cannot
+    # navigate — they are simply counted apart.
+    assert "alpha/" in result and "beta/" in result
+
+
+async def test_glob_headline_singulars(vault):
+    (vault / "only.md").write_text("n", encoding="utf-8")
+    (vault / "one").mkdir()
+    head = (await tools.list_files_impl(".", pattern="*.md")).splitlines()[0]
+    assert "1 file matching" in head
+    assert "plus 1 folder" in head
+
+
+async def test_glob_headline_omits_folders_when_there_are_none(vault):
+    (vault / "only.md").write_text("n", encoding="utf-8")
+    head = (await tools.list_files_impl(".", pattern="*.md")).splitlines()[0]
+    assert "1 file matching" in head
+    assert "folder" not in head
+
+
+async def test_recursive_glob_says_files_and_names_no_folders(vault):
+    """A recursive listing has no directory entries at all, so the count is a
+    match count and the folder clause is simply absent."""
+    (vault / "sub").mkdir()
+    (vault / "sub" / "deep.md").write_text("d", encoding="utf-8")
+    (vault / "top.md").write_text("t", encoding="utf-8")
+    head = (
+        await tools.list_files_impl(".", pattern="*.md", recursive=True)
+    ).splitlines()[0]
+    assert "2 files matching '*.md'" in head
+    assert "folder" not in head
+    assert "(recursive)" in head
+
+
+async def test_unfiltered_listing_headline_unchanged(vault):
+    """No pattern, no behaviour change: this is the common call."""
+    (vault / "a.md").write_text("a", encoding="utf-8")
+    (vault / "sub").mkdir()
+    head = (await tools.list_files_impl(".")).splitlines()[0]
+    assert head.startswith("2 entries in '.'")
+
+
+async def test_guide_states_write_access(vault):
+    """A readwrite credential is told so, without having to probe."""
+    token = current_permission.set("readwrite")
+    try:
+        result = await tools.get_vault_guide_impl()
+    finally:
+        current_permission.reset(token)
+    assert "Your access: read and write" in result
+
+
+async def test_guide_states_read_only_access_and_names_the_gated_tools(vault):
+    """The finding: the only way to learn the scope was to attempt a write on
+    a production vault and read the refusal."""
+    token = current_permission.set("read")
+    try:
+        result = await tools.get_vault_guide_impl()
+    finally:
+        current_permission.reset(token)
+    assert "Your access: read only" in result
+    for name in ("create_note", "edit_note", "move_note", "delete_note"):
+        assert name in result
+
+
+async def test_guide_can_drop_the_constant_primer(vault):
+    """~8.7 KB byte-identical on every call is a cost an agent should be able
+    to decline once it has read it."""
+    (vault / "CLAUDE.md").write_text("# House rules\n\nKeep it tidy.\n", encoding="utf-8")
+    full = await tools.get_vault_guide_impl()
+    trimmed = await tools.get_vault_guide_impl(include_primer=False)
+    assert "# Obsidian Primer" in full
+    assert "# Obsidian Primer" not in trimmed
+    assert len(trimmed) < len(full) / 2
+    # The two things the caller came for survive the trim.
+    assert "Keep it tidy." in trimmed
+    assert "Your access:" in trimmed
+
+
+async def test_guide_primer_is_byte_identical_across_calls(vault):
+    """The premise of `include_primer=False`. If this ever stops holding, the
+    parameter is a false economy and should be revisited rather than kept."""
+    assert await tools.get_vault_guide_impl() == await tools.get_vault_guide_impl()

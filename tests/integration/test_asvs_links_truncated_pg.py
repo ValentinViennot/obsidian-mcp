@@ -232,7 +232,13 @@ async def test_the_pass_stamps_the_current_extraction_version(sessionmaker, vaul
     await indexer.index_vault(user_id=None)
 
     row = await note_row(sessionmaker, "Stamped.md")
-    assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION == 2
+    # Compared to the constant, not to a literal. The literal made this fail the
+    # moment the extraction grammar was legitimately revised (v2 -> v3 for
+    # Obsidian aliases, anchors and comment masking) — a green-to-red on a
+    # correct change, which teaches people to edit the assertion rather than
+    # read it. What the test is actually about is that the pass *stamps* the
+    # note with the current version, whatever that version happens to be.
+    assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION
 
 
 # ── get_links is bounded, and says what it is bounding ────────────────────

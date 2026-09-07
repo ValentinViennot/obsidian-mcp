@@ -1,0 +1,18 @@
+# Checks every 10 minutes against a 30-minute staleness threshold, so a genuine
+# break is reported within ~40 minutes at worst rather than found by accident
+# days later.
+#
+# Persistent=true so a host that was off does not silently skip the check it
+# owed; RandomizedDelaySec keeps it off the same second as the reconcile timer
+# it observes.
+[Unit]
+Description=Periodically check that the Obsidian vault is still reconciling
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

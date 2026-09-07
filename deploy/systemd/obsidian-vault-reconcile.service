@@ -24,6 +24,11 @@ Environment=GIT_AGENT_EMAIL=agent@obsidian-mcp.invalid
 # whatever user pushes must be able to write this directory — either run both as
 # the same user, or set RuntimeDirectoryMode=0775 and a shared group.
 RuntimeDirectory=obsidian-vault-reconcile
+# Creates and owns /var/lib/obsidian-mcp, where the success marker the staleness
+# watchdog reads is written. Needed because ProtectSystem=strict otherwise makes
+# the whole filesystem read-only to this unit — the marker write would fail and
+# the watchdog would then fire constantly, which is its own kind of useless.
+StateDirectory=obsidian-mcp
 RuntimeDirectoryPreserve=no
 Environment=VAULT_RECONCILE_LOCK=/run/obsidian-vault-reconcile/lock
 Environment=VAULT_RECONCILE_FLAG=/run/obsidian-vault-reconcile/requested

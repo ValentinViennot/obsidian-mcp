@@ -1,0 +1,52 @@
+# Notice when the vault sync stops happening at all.
+#
+# ── Why this exists as well as OnFailure ─────────────────────────────────────
+#
+# `OnFailure=` on the reconcile unit covers one case: the service ran and
+# returned non-zero. It says nothing about the cases where nothing runs —
+# the timer stopped, was masked, was never enabled after a reinstall, or the
+# unit file went missing. Those are the same silence with a different cause,
+# and they look identical from the outside: no errors anywhere, and a vault
+# that quietly stops keeping up.
+#
+# So this watches the *outcome* rather than the process. The reconcile script
+# touches a marker on every success; if that marker gets old, something in the
+# chain stopped working and it does not matter which link.
+#
+# Two independent timers now have to fail silently for a broken sync to go
+# unnoticed, instead of one.
+#
+# ── The threshold ────────────────────────────────────────────────────────────
+#
+# The reconcile timer runs every 2 minutes. 30 minutes is ~15 missed runs: long
+# enough that a reboot, a slow pull or a transient network blip never pages
+# anyone, short enough that a real break is caught the same hour rather than
+# discovered days later by accident — which is exactly how the incident this
+# guards against was found.
+[Unit]
+Description=Alert if the Obsidian vault has not reconciled recently
+After=network-online.target
+OnFailure=obsidian-vault-reconcile-failed@%N.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/obsidian-mcp/alert-relay.env
+Environment=MARKER=/var/lib/obsidian-mcp/last-reconcile-success
+Environment=MAX_AGE_MINUTES=30
+
+# Exits non-zero when the marker is missing or stale, which trips the
+# OnFailure above and turns this into a Telegram message. Deliberately not
+# `curl`ing the relay itself: one delivery path, defined in one unit, is one
+# thing to fix when the bot token rotates.
+ExecStart=/bin/sh -c '\
+  if [ ! -f "$$MARKER" ]; then \
+    echo "no reconcile has ever succeeded (marker $$MARKER is missing)"; exit 1; \
+  fi; \
+  age=$$(( ( $$(date +%%s) - $$(stat -c %%Y "$$MARKER") ) / 60 )); \
+  if [ "$$age" -gt "$$MAX_AGE_MINUTES" ]; then \
+    echo "vault has not reconciled for $${age} minutes (threshold $${MAX_AGE_MINUTES})"; exit 1; \
+  fi; \
+  echo "vault reconciled $${age} minute(s) ago"'
+
+[Install]
+WantedBy=multi-user.target

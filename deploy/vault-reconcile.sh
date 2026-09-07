@@ -250,3 +250,18 @@ if ! timeout "$VAULT_RECONCILE_NET_TIMEOUT" git push --quiet "$remote" "$branch"
 fi
 
 log "synced with $remote/$branch"
+
+# ── Success marker ───────────────────────────────────────────────────────────
+#
+# The staleness watchdog (obsidian-vault-staleness.service) reads this file's
+# mtime. Written last, and only on a clean run, so it records that the vault
+# actually reconciled rather than that this script started.
+#
+# Failure here is deliberately not fatal: losing the marker should raise an
+# alert through the watchdog, never fail the reconcile that just succeeded.
+MARKER="${VAULT_RECONCILE_MARKER:-/var/lib/obsidian-mcp/last-reconcile-success}"
+if mkdir -p "$(dirname "$MARKER")" 2>/dev/null && touch "$MARKER" 2>/dev/null; then
+    :
+else
+    log "WARNING: could not update $MARKER; the staleness watchdog will fire"
+fi

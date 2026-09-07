@@ -1,0 +1,65 @@
+# Tell a human when the vault sync breaks.
+#
+# ── Why this unit exists ─────────────────────────────────────────────────────
+#
+# The reconcile service failed every two minutes for hours and nobody found out.
+# Not because logging was missing — the journal recorded every failure — but
+# because **a timer whose service fails is still an "active" timer**. Every
+# surface anyone would casually check said the sync was running. The desktop
+# kept pushing to the bare repo, the server quietly stopped catching up, and the
+# discovery was an accident while looking at something else.
+#
+# Logs that nobody reads are not monitoring. This pushes.
+#
+# ── Wiring ───────────────────────────────────────────────────────────────────
+#
+# Referenced from the reconcile unit as:
+#
+#     OnFailure=obsidian-vault-reconcile-failed@%n.service
+#
+# `%n` passes the failing unit's name in, so one template serves any unit that
+# wants to shout, and the message names what actually broke.
+#
+# It posts to the fleet's existing alert relay rather than inventing a second
+# notification path: one place to change a bot token, one place that already
+# knows which Telegram topic operational alerts belong in.
+#
+# ── Deliberately not a Restart= ──────────────────────────────────────────────
+#
+# Restarting would have papered over this exact incident: the failure was a
+# permission problem that no number of retries would resolve, and an endlessly
+# restarting unit is just as silent as a failing one. The point is to be told.
+[Unit]
+Description=Report that %i failed to the ops alert relay
+# Never let the alerting fail the thing it is reporting on.
+DefaultDependencies=no
+After=network-online.target
+
+[Service]
+Type=oneshot
+
+# The relay's shared secret. Root-only; the reconcile unit does not need it, so
+# only this one reads it.
+EnvironmentFile=/etc/obsidian-mcp/alert-relay.env
+
+# `--fail` so an HTTP error is an exit code rather than a silent 403 body, and
+# a short timeout because an alert that hangs is an alert nobody gets.
+#
+# The journal excerpt is included because "it failed" without the reason means
+# someone still has to ssh in before they can act.
+ExecStart=/bin/sh -c '\
+  reason=$$(journalctl -u %i -n 6 --no-pager -o cat 2>/dev/null | tail -4 | tr "\\n" " " | cut -c1-600); \
+  body=$$(printf "{\\"level\\":\\"CRITICAL\\",\\"name\\":\\"%%s\\",\\"server\\":\\"%%s\\",\\"detail\\":\\"%%s\\"}" \
+    "%i" "$$(hostname)" "$$(printf "%%s" "$$reason" | sed "s/\\"/'"'"'/g")"); \
+  curl -sS --fail --max-time 15 \
+    -H "X-Relay-Secret: $$RELAY_SECRET" \
+    -H "content-type: application/json" \
+    -d "$$body" \
+    "$$RELAY_URL"'
+
+# If the relay itself is down, say so in the journal of *this* unit — the one
+# place someone will look after noticing they were never told.
+ExecStopPost=/bin/sh -c 'test "$$EXIT_STATUS" = "0" || echo "ALERT DELIVERY FAILED for %i — the relay did not accept the alert"'
+
+[Install]
+WantedBy=multi-user.target

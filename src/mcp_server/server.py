@@ -608,18 +608,27 @@ async def edit_note(
 
 
 @mcp.tool()
-async def get_vault_guide() -> str:
-    """Returns a two-part guide for working with this Obsidian vault:
+async def get_vault_guide(include_primer: bool = True) -> str:
+    """Returns a guide for working with this Obsidian vault:
 
-    1. **Obsidian primer** — generic syntax (wikilinks, embeds, block refs,
+    1. **Your access level** — whether this credential may write, so you can
+       plan work without probing with a write you may not be allowed to make.
+       Always included.
+    2. **Obsidian primer** — generic syntax (wikilinks, embeds, block refs,
        heading refs, tags, frontmatter, callouts, comments, highlights,
-       math, mermaid, footnotes, tasks, plugin literals).
-    2. **Vault-specific conventions** — folder structure, naming rules,
+       math, mermaid, footnotes, tasks, plugin literals). ~8.7 KB and
+       identical on every call; pass `include_primer=False` to omit it.
+    3. **Vault-specific conventions** — folder structure, naming rules,
        frontmatter requirements, and tag taxonomy as configured by the
        vault owner in `CLAUDE.md`. If `CLAUDE.md` is absent, the response
        includes instructions for creating one.
+
+    Args:
+        include_primer: Keep the generic Obsidian syntax primer (default).
+            Set False once you have read it in this session, or when you only
+            want this vault's own conventions and your access level.
     """
-    return await get_vault_guide_impl()
+    return await get_vault_guide_impl(include_primer=include_primer)
 
 
 @mcp.tool()
@@ -862,6 +871,30 @@ async def move_note(
     rows whose stored target matched the old path. Backlinks via `target_note_id`
     keep working without rewriting source notes (the moved note's id is unchanged).
 
+    **Which incoming links a plain move actually breaks — usually none.** This
+    server resolves a wikilink the way Obsidian does: exact path, then the
+    linking note's own folder, then **the whole vault by stem**. So a bare
+    `[[Note]]` keeps resolving to `Note.md` wherever in the vault it now
+    lives, and a move that only changes a note's folder — reorganising the
+    vault root into folders, say — leaves those links working and needs no
+    rewrite at all. What a move *does* break is the narrower set that names a
+    location:
+
+    - path-style wikilinks, `[[Folder/Note]]` and `![[Folder/Note]]`
+    - markdown links, `[text](Note.md)`, whose href is relative to the
+      linking note's folder
+    - a bare `[[Note]]` only where the vault holds **more than one** note with
+      that stem, since moving one changes which is nearest the root and
+      therefore which the link resolves to
+
+    **Check before you move, rather than rewriting blind.** `get_backlinks`
+    names the sources, and `get_links` on each shows the exact form every link
+    takes. A move whose backlinks are all bare `[[Note]]` needs
+    `rewrite_links=False`; one with path-style or markdown links needs `True`
+    for those sources or an `edit_note` afterwards. Doing that check first is
+    what makes a bulk reorganisation safe, because it is also the only thing
+    that tells you the job is finished.
+
     With `rewrite_links=True`, also opens every source note that linked to this
     note and rewrites the link in place: `[[Old]]` → `[[New]]`,
     `[[Old|alias]]` → `[[New|alias]]`, `[[Old#anchor]]` → `[[New#anchor]]`,
@@ -935,7 +968,11 @@ async def move_note(
             directories are created automatically.
         rewrite_links: If True, also rewrite incoming wikilinks and embeds in
             source notes. Off by default — opting in is destructive (it modifies
-            other notes' bodies).
+            other notes' bodies, which `expected_hash` cannot bind because you
+            never read them, and a rewrite can fail after the rename has
+            committed). Bare `[[Note]]` links survive a plain move on their
+            own; turn this on for the path-style and markdown links listed
+            above, after `get_links` has shown you there are some.
         expected_hash: `from_path`'s `content_hash` as you last read it.
             Refuses the move, changing nothing, if that note has changed since.
     """
@@ -1220,7 +1257,10 @@ async def list_files(
     By default lists the immediate children of `folder` — subdirectories and
     files, each file with size and modification time. `pattern` is a glob that
     filters file entries (e.g. "*.pdf"); `recursive=True` descends into
-    subfolders and returns matching files. Anything with a path component
+    subfolders and returns matching files. **`pattern` never filters
+    subdirectories** — they are always listed so you can keep navigating — so
+    a non-recursive listing with a pattern reports the two counts separately
+    ("108 files matching '*.md' in '.', plus 20 folders"). Anything with a path component
     starting with `.` is hidden — dot-directories (`.obsidian`, `.git`,
     `.trash`, …) **and dot-files** — and a `folder` with such a component is
     rejected.

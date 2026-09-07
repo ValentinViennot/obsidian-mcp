@@ -83,6 +83,28 @@ link (`[[old plan]]` → `Old Plan.md` → `New Plan.md`) dangling, where Obsidi
 would have re-pointed it. Accepted: closing it means widening the destructive
 path, and it needs its own adversarial pass.
 
+#### The consequence agents were getting wrong (#213)
+
+Vault-wide stem resolution is also why `rewrite_links=False` is a safe default
+rather than the trap it reads as. A calling agent reported it as a blocker —
+"moving 108 root notes into folders silently degrades link text across the
+whole vault" — and planned to ask for the destructive path by default. It does
+not: a bare `[[Note]]` resolves by stem from anywhere, so a move that changes
+only a note's *folder* leaves those links working, exactly as Obsidian does.
+
+What a move actually breaks is the narrower set that names a location —
+path-style `[[Folder/Note]]`, markdown `[text](Note.md)` whose href is
+relative to the linking note's folder, and a bare `[[Note]]` only where the
+vault holds more than one note with that stem, since moving one changes which
+is nearest the root. `get_backlinks` plus `get_links` names those sources
+before the move, which is also the only thing that says the job is finished.
+
+The fix was the tool description, not the default. Both are stated in
+`move_note`'s docstring now, because an agent that cannot see this reaches for
+the destructive option to protect against damage that was never going to
+happen — and destructive-by-default on the write surface is precisely what
+this codebase does not do.
+
 ### 2. Tags
 
 The old grammar was `#([a-zA-Z][a-zA-Z0-9_/-]*)`, and three of its four

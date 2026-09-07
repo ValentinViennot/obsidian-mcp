@@ -927,6 +927,105 @@ def search_history(
     )
 
 
+def last_commit_times(
+    repo: Repo,
+    *,
+    timeout: float | None = None,
+    max_bytes: int | None = None,
+) -> tuple[dict[str, int], bool]:
+    """`{vault-relative path: epoch seconds of the commit that last wrote it}`.
+
+    **Why the indexer needs this at all.** `notes_metadata.modified_at` was the
+    file's `st_mtime`, which is a true edit time only while the vault is a
+    directory somebody edits in place. Under git it is not: `git clone` and
+    `git checkout` stamp *every* file with the moment of the checkout, so a
+    freshly-deployed server reports one identical timestamp for the whole
+    vault and `get_recent` — whose entire job is ordering by recency — returns
+    an arbitrary slice in an arbitrary order, with no error anywhere to say
+    so. The vault's real dates are in its history; this reads them.
+
+    **One invocation for the whole vault, not one per note.** A per-file
+    `git log -1` over a few thousand notes is a few thousand process spawns on
+    every pass. This walks the history once — newest commit first — and takes
+    each path's *first* appearance, which is by definition the last commit
+    that wrote it. On the maintainer's vault (1,314 commits, 1,222 notes) that
+    is ~70 KB of output in about half a second.
+
+    `--diff-filter=AMR` drops deletions, so a path that was deleted and never
+    restored contributes nothing and simply is not in the map. `--no-renames`
+    is deliberate rather than incidental: with rename detection on, a rename
+    reports only the *new* path against the commit that renamed it, and the
+    path's own earlier edits then land under a name the caller never asks
+    about. Off, a rename is a delete plus an add, and the add is what a
+    caller holding the current path is looking for.
+
+    **The second element of the tuple is `True` when the answer is partial** —
+    git's output hit the byte cap and was cut off mid-history. Because the
+    walk is newest-first, truncation only ever loses the *oldest* paths, so
+    what survives is correct and the caller falls back to `st_mtime` for the
+    rest. Returning that flag rather than raising is the point: a partial map
+    is worth strictly more than no map, and the caller can say which it got.
+
+    **The map is a superset of what is on disk.** Dropping deletions means a
+    path that was deleted, or renamed away, keeps the time it was last
+    *written* rather than vanishing. Those entries are inert for the intended
+    caller — the indexer looks up only paths its own walk found — and the
+    alternative is worse: a deletion commit would date a note that a later
+    commit restored.
+
+    Callers must treat a path's absence as "no git answer", not as "never
+    modified". A note written but not yet committed — the window between an
+    MCP write and its commit, or between an out-of-band edit and the reconcile
+    sweep — is absent or carries its previous commit's time, and `st_mtime` is
+    the truer answer for exactly that window.
+    """
+    args = [
+        *_base_args(repo.root, repo.toplevel),
+        "log",
+        "-z",
+        # `%x01` is the record separator. It cannot occur in a path (git
+        # forbids control bytes in tracked names) and `-z` means git emits the
+        # names raw, so nothing here needs unquoting.
+        "--format=format:%x01%ct",
+        "--name-only",
+        "--diff-filter=AMR",
+        "--no-renames",
+        "HEAD",
+        # Confine the walk to the caller's vault root. Names still come back
+        # relative to the repository toplevel, so `prefix` is stripped below.
+        "--",
+        ".",
+    ]
+    result = _run(repo.root, args, timeout=timeout, max_bytes=max_bytes)
+    if result.returncode != 0 and not result._killed:
+        if _is_empty_history(result):
+            return {}, False
+        _classify(result)
+
+    prefix = repo.prefix
+    times: dict[str, int] = {}
+    for record in result.stdout.split("\x01"):
+        if not record:
+            continue
+        head, _, tail = record.partition("\n")
+        try:
+            when = int(head.strip())
+        except ValueError:
+            # A record cut in half by the byte cap. Newest-first means every
+            # complete record before it is already banked.
+            continue
+        for name in tail.split("\0"):
+            if not name:
+                continue
+            if prefix:
+                if not name.startswith(prefix):
+                    continue
+                name = name[len(prefix) :]
+            # First occurrence wins: the walk is newest-first.
+            times.setdefault(name, when)
+    return times, result.truncated
+
+
 def ignore_revs_file(root: Path) -> Path | None:
     """The vault's `.git-blame-ignore-revs`, when it is a real file.
 

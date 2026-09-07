@@ -118,7 +118,11 @@ having executed none of them. CI's `tests` job sets it against a
 claim that "the suite passes" is a claim about the offline subset unless
 `make test-integration` ran, which stands up the throwaway container and sets
 the URL. It shares `SCHEMA_TEST_CONTAINER` / `SCHEMA_TEST_PORT` with
-`test-schema`, so do not run the two concurrently.
+`test-schema`, so do not run the two concurrently. **It is Linux-only and
+refuses elsewhere**: unlike every other local test path it runs the host's own
+`pytest`, because these modules need a docker CLI as well as a Linux kernel
+and the test image has no docker client. On a Mac, CI's `tests` job is the
+gate — do not report "integration passes" from a machine that cannot run it.
 
 **`alembic check` must be clean** — "No new upgrade operations detected." Run
 it after any migration and after any deploy that ran one (`make db-check`, or
@@ -221,6 +225,15 @@ update it in the same change.** What stays here is the short list:
   reconcile sweep (out-of-band edits, `pull --rebase --autostash`, `push`), its
   systemd units, the bare-repo `post-receive` (a flag file, deliberately not a
   `checkout -f` — see the comment there), and the vault `.gitignore` template.
+- **`notes_metadata.modified_at` is a git commit time, not `st_mtime`, when
+  `GIT_VAULT_ENABLED`.** A checkout stamps every file with the moment of the
+  checkout, so on a server whose vault is a clone the mtime column carried one
+  identical value for the whole vault and `get_recent` / `list_notes` sorted
+  on noise while reporting nothing wrong. `git_history.last_commit_times`
+  answers it in one subprocess per pass; `st_mtime` stays the fallback for a
+  note git has not seen yet, and every git failure degrades to it rather than
+  failing the pass. See
+  [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - Wikilink graph extracted from note bodies into `note_links`; resolved at
   index time in Obsidian's own order — exact path, same folder, vault-wide
   stem, then the same three case-folded, then frontmatter `aliases:` — with an

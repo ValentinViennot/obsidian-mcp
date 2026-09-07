@@ -1,6 +1,7 @@
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import Icon
 from mcp.server.transport_security import TransportSecuritySettings
 
 from src.config import settings
@@ -93,6 +94,28 @@ def _origin_patterns(origins) -> list[str]:
 
 mcp = FastMCP(
     "obsidian-vault",
+    # Declared per MCP SEP-973 (spec 2025-11-25). A client that renders it can
+    # tell this connector apart from the others in a list at a glance, which
+    # matters when the list decides which system an agent is about to touch.
+    #
+    # **No client we use renders it yet.** Claude.ai shows a generic icon for
+    # every custom connector regardless of what the server declares, and serving
+    # a favicon does not help either — anthropics/claude-ai-mcp#152 is open and
+    # records that the icons field, data URIs and favicons were all tried. This
+    # is therefore a bet on an announced feature, not a fix: it costs a few
+    # lines and starts working the day that ships.
+    #
+    # By URL rather than data URI, deliberately: a base64 icon would ride along
+    # on every `initialize` response, and the URL is public and unauthenticated
+    # for exactly this purpose.
+    website_url=f"https://{settings.mcp_hostname}",
+    icons=[
+        Icon(
+            src=f"https://{settings.mcp_hostname}/icon.png",
+            mimeType="image/png",
+            sizes=["128x128"],
+        )
+    ],
     stateless_http=True,
     streamable_http_path="/",
     # Derived from the write caps rather than the SDK's 4 MiB default, which

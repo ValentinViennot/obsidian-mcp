@@ -35,11 +35,30 @@
 #   vars.VPS_SSH_PORT     SSH port (default: 22)
 name: Deploy
 
+# DEPLOYMENT IS MANUAL, BY CHOICE — 2026-09-07
+#
+# The automatic `workflow_run` trigger is commented out rather than deleted, so
+# turning it back on is uncommenting four lines.
+#
+# Why it is off: a GitHub runner is not on the tailnet, so `VPS_HOST` would have
+# to be the VPS's public address, and the deploy key has no passphrase (it
+# cannot — nothing is there to type one). That combination puts an
+# unlocked key to production on a publicly reachable port, which is a real cost
+# for a workload whose releases are infrequent and never urgent. Deploys go
+# through Komodo's DeployStack instead, which is already the fleet's convention
+# for every new stack.
+#
+# The alternative, if this ever becomes tedious: `tailscale/github-action` joins
+# the runner to the tailnet for the length of the job, and nothing new is
+# exposed. It needs an ephemeral auth key as a secret.
+#
+# Leaving the trigger enabled without the secrets would paint `main` red on
+# every push for a deployment nobody asked it to perform.
 on:
-  workflow_run:
-    workflows: ["Publish image"]
-    types: [completed]
-    branches: [main]
+  # workflow_run:
+  #   workflows: ["Publish image"]
+  #   types: [completed]
+  #   branches: [main]
   workflow_dispatch:
     inputs:
       sha:

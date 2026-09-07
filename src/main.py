@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -629,6 +630,38 @@ app.include_router(transfer_router)
 # the panel; a top-level `/static` would match no router on the production
 # deploy. `StaticFiles` serves GET/HEAD only and resolves nothing outside its
 # own directory.
+# Brand icons at the origin root.
+#
+# A custom MCP connector is identified in a client's UI by whatever icon it can
+# find at the server's origin, and every connector in this fleet rendered with
+# the same placeholder because all of them answered 404 here. These are served
+# from the root rather than under /admin/ because that is where clients look,
+# and unauthenticated because an icon is not a secret and a login wall would
+# defeat the point.
+#
+# Both files are palette-quantised and stripped: 5 KB and 15 KB, down from a
+# 2.8 MB source. An icon that loads slowly is worse than no icon.
+_BRAND_DIR = os.path.join(os.path.dirname(__file__), "control_panel", "static", "brand")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    return FileResponse(
+        os.path.join(_BRAND_DIR, "favicon.ico"),
+        media_type="image/x-icon",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/icon.png", include_in_schema=False)
+async def icon_png() -> FileResponse:
+    return FileResponse(
+        os.path.join(_BRAND_DIR, "icon-128.png"),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 app.mount(
     "/admin/static",
     StaticFiles(directory=os.path.join(os.path.dirname(__file__), "control_panel", "static")),

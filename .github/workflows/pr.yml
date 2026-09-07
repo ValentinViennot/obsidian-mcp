@@ -148,10 +148,24 @@ jobs:
       - name: scripts/check-vault-leak.py
         run: python3 scripts/check-vault-leak.py
 
-  # `docker compose config` resolves and validates every interpolation. All
-  # three files declare `env_file: .env`, and compose refuses outright when it
-  # is missing — so `.env.example` is copied into place, which validates the
+  # `docker compose config` resolves and validates every interpolation. The
+  # stack declares `env_file: .env` and compose refuses outright when it is
+  # missing — so `.env.example` is copied into place, which validates the
   # shipped example at the same time.
+  #
+  # **The two front-door files are overrides, not stacks**, and must be
+  # validated the way they are used: `-f docker-compose.yml -f <override>`.
+  # Each one alone declares no image and no build context, so a standalone
+  # `config` on it is not a weaker check, it is a different and meaningless
+  # one.
+  #
+  # This job named `docker-compose.simple.yml` and `docker-compose.proxy.yml`
+  # for as long as it existed. Those files were renamed to the base-plus-
+  # overrides model in 4cb449b, one commit before this workflow was added in
+  # 0614d91 — so `pr-gate`, the single required status check, failed on every
+  # pull request from its first day, on a missing file rather than on
+  # anything a contributor wrote. A required check that cannot pass is not a
+  # gate; it is a red X everyone learns to route around.
   compose-config:
     name: compose-config
     runs-on: ubuntu-latest
@@ -162,9 +176,11 @@ jobs:
       - name: Validate the compose files
         run: |
           cp .env.example .env
-          for file in docker-compose.yml docker-compose.simple.yml docker-compose.proxy.yml; do
-            echo "==> $file"
-            docker compose -f "$file" config --quiet
+          echo "==> base stack"
+          docker compose -f docker-compose.yml config --quiet
+          for override in docker-compose.caddy.yml docker-compose.traefik.yml; do
+            echo "==> base + $override"
+            docker compose -f docker-compose.yml -f "$override" config --quiet
           done
 
   # The single required status check. `if: always()` so it runs even when a

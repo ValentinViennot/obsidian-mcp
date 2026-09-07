@@ -112,6 +112,23 @@ fi
 [ -n "$VAULT_DIR" ] || die "VAULT_DIR is not set" "$EXIT_MISCONFIGURED"
 [ -d "$VAULT_DIR" ] || die "VAULT_DIR ($VAULT_DIR) is not a directory" "$EXIT_MISCONFIGURED"
 cd "$VAULT_DIR"
+
+# git refuses a repository owned by another uid ("dubious ownership") and there
+# is no way around that from a config file here: this unit runs with
+# ProtectHome=yes, so /root/.gitconfig is invisible to it. Declaring the
+# exemption through the environment reaches every git call in this script
+# without one of them being forgotten.
+#
+# This is not hypothetical. The vault working tree is chowned to the container's
+# uid so the server can write notes; the moment that happened, this script began
+# failing every two minutes with "is not a git working tree" — and kept failing
+# silently, because a timer that fails is still an active timer. The desktop
+# went on pushing to the bare repo and the server simply stopped catching up.
+GIT_CONFIG_COUNT=1
+GIT_CONFIG_KEY_0=safe.directory
+GIT_CONFIG_VALUE_0="$VAULT_DIR"
+export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
 git rev-parse --git-dir >/dev/null 2>&1 \
     || die "$VAULT_DIR is not a git working tree" "$EXIT_MISCONFIGURED"
 

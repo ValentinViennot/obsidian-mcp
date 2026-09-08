@@ -42,11 +42,27 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
 - Registry: `localhost:5000` (or change in `Makefile`); CI also publishes to
   GHCR (`.github/workflows/publish-image.yml`)
 - Deploy: `make deploy` (build → scan → push → backup → migrate → recreate)
-- **CI/CD:** a merge to `main` publishes the image and rolls production onto
-  its digest — backup, `alembic upgrade head`, `up -d`, wait for `/health`,
-  **roll the image back if health does not come up**. `pr.yml` is the pre-merge
-  gate (`pr-gate` is the one required check) and `scripts/vps-deploy.sh` is the
-  half that runs on the host. See
+- **CI/CD: a merge to `main` publishes an image. It does NOT deploy.**
+  `publish-image.yml` pushes to GHCR and prints the digest; that is where the
+  automation stops. **`deploy.yml`'s `workflow_run` trigger is commented out
+  on purpose** — a GitHub runner is not on the tailnet, so arming it would put
+  an unlocked, passphrase-less deploy key on a publicly reachable port for a
+  workload whose releases are infrequent and never urgent. The machinery is
+  real and re-armable (four lines, or `tailscale/github-action`), and
+  `workflow_dispatch` still redeploys a known-good SHA by hand.
+
+  **Production is rolled by Komodo**, the fleet's convention: repin
+  `x-obsidian-mcp-image` in the gitops stack to the new digest, merge, then
+  DeployStack. Resolve the digest with `docker buildx imagetools inspect` and
+  **check the image's `org.opencontainers.image.revision` label really is the
+  commit you think it is** before writing it down. Run the `obsidian-mcp-backup`
+  procedure first when the release carries a migration.
+
+  This bullet used to describe the automatic path as if it were live, and it
+  cost a session's worth of wrong conclusions — a merge was reported as a
+  deploy, twice, while production sat untouched. `pr.yml` is the pre-merge
+  gate (`pr-gate` is the one required check) and `scripts/vps-deploy.sh` is
+  the host half that the disarmed workflow would call. See
   [continuous deployment](docs/operations/continuous-deployment.md), including
   the three things a rollback does *not* fix.
 

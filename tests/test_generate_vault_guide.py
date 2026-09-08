@@ -106,22 +106,41 @@ def test_nested_vaults_are_detected_and_flagged(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+# `_describe_maturity` now takes the profile too, because its measured half is
+# dated like every other number in the guide. A fixed `scanned_on` keeps these
+# assertions exact instead of chasing today's date.
+def _profile(scanned_on: str = "2020-01-01") -> gvg.VaultProfile:
+    return gvg.VaultProfile(root=Path("/nowhere"), scanned_on=scanned_on)
+
+
 def test_a_thin_convention_is_reported_as_not_a_convention():
-    text = gvg._describe_maturity(3, 100, "YAML frontmatter")
-    assert "not a convention" in text
+    text = gvg._describe_maturity(3, 100, "YAML frontmatter", _profile())
+    assert "Not a convention" in text
     assert "Do NOT start adding" in text
 
 
 def test_a_partial_convention_says_match_the_neighbourhood():
-    text = gvg._describe_maturity(50, 100, "YAML frontmatter")
-    assert "partial" in text
+    text = gvg._describe_maturity(50, 100, "YAML frontmatter", _profile())
+    assert "Partial" in text
     assert "neighbourhood" in text
 
 
 def test_an_established_convention_says_follow_it():
-    text = gvg._describe_maturity(90, 100, "YAML frontmatter")
-    assert "established" in text
-    assert "Follow it" in text
+    text = gvg._describe_maturity(90, 100, "YAML frontmatter", _profile())
+    assert "Established" in text
+    assert "follow it" in text.lower()
+
+
+def test_the_verdict_leads_and_the_measurement_trails_it(vault):
+    """The rot this guards against: a percentage stated as present-tense fact.
+
+    The verdict is durable — a vault where frontmatter is not a convention
+    does not become one by drifting a few points — so it is the sentence an
+    agent reads first, and the number behind it is parenthetical and dated.
+    """
+    text = gvg._describe_maturity(3, 100, "YAML frontmatter", _profile("2020-01-01"))
+    assert text.startswith("**Not a convention.**")
+    assert "(3% of notes had YAML frontmatter at the 2020-01-01 scan.)" in text
 
 
 def test_sparse_frontmatter_does_not_become_a_schema(vault):
@@ -129,7 +148,7 @@ def test_sparse_frontmatter_does_not_become_a_schema(vault):
     p = gvg.profile_vault(vault)
     assert p.frontmatter_pct < 30
     guide = gvg.render_guide(p)
-    assert "not a convention" in guide
+    assert "Not a convention" in guide
     assert "do not treat" in guide.lower()
 
 
@@ -191,3 +210,91 @@ def test_the_generator_never_writes_to_the_vault(vault):
     gvg.render_guide(gvg.profile_vault(vault))
     after = {p: p.stat().st_mtime_ns for p in vault.rglob("*") if p.is_file()}
     assert before == after
+
+
+# ---------------------------------------------------------------------------
+# Durable rules vs. perishable measurements
+#
+# The rot this section exists to prevent, from the real vault: the guide said
+# "(root) | 108 | unfiled; treat as an inbox" and "1222 notes", "3854 links",
+# "92 inbound links" — every one stated as present-tense fact. A day later an
+# agent reorganised the vault, the root went from 108 notes to 6, and the
+# guide went on asserting 108 in a confident voice to every agent that
+# connected. Nothing was wrong with the *rules*; they held perfectly. What
+# rotted was every sentence that had a number in it and no date on it.
+# ---------------------------------------------------------------------------
+
+
+def test_every_measured_number_is_dated(vault):
+    """A count an agent cannot tell is stale will be trusted and acted on.
+
+    Not an exhaustive parse — a cheap structural proxy: the guide's numeric
+    claims live in table rows or in parenthetical clauses that carry the
+    scan phrase. What this really pins is that the phrase is present, uniform,
+    and explained, so a reader learns it once.
+    """
+    p = gvg.profile_vault(vault)
+    p.scanned_on = "2020-01-01"
+    guide = gvg.render_guide(p)
+    assert "at the 2020-01-01 scan" in guide
+    # Explained once, near the top, before any number relies on it.
+    explanation = guide.index("These were true when the vault was last profiled")
+    first_use = guide.index("at the 2020-01-01 scan")
+    assert explanation < guide.index("## Editing rules")
+    assert first_use < guide.index("## Editing rules")
+
+
+def test_the_vault_wins_when_the_guide_disagrees(vault):
+    """The instruction that makes a stale guide degrade instead of mislead."""
+    guide = gvg.render_guide(gvg.profile_vault(vault))
+    assert "the vault wins" in guide.lower()
+    assert "trust the tool" in guide.lower()
+    # And it must not tell an agent to "fix" the vault to match this file.
+    assert "Do not reorganise anything to make the vault match this file" in guide
+
+
+def test_the_root_rule_does_not_depend_on_the_current_count(vault):
+    """"The root is an inbox" is as true at six notes as at six hundred.
+
+    The old wording rendered the rule *inside* a table cell next to a count,
+    so the sentence a reader took away was "the root has 108 notes". The rule
+    now stands on its own in prose, and the table carries only the number.
+    """
+    guide = gvg.render_guide(gvg.profile_vault(vault))
+    assert "The root is an inbox, not a destination" in guide
+    assert "six notes or six hundred" in guide
+
+
+def test_hub_notes_are_named_without_freezing_their_counts(tmp_path):
+    """Hub *identity* is fairly durable; the inbound tally is not.
+
+    Quoting "92 inbound links" invites an agent to reason from it. Naming the
+    hubs and sending the agent to `get_backlinks` for the number keeps the
+    load-bearing part and drops the part that decays.
+    """
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "Hub.md").write_text("hub\n", encoding="utf-8")
+    for i in range(12):
+        (root / f"n{i}.md").write_text("see [[Hub]]\n", encoding="utf-8")
+    guide = gvg.render_guide(gvg.profile_vault(root))
+    # Link targets are case-folded by the profiler, so the guide names the hub
+    # the way the links spell it, not the way the file does.
+    assert "`[[hub]]`" in guide.lower()
+    assert "inbound links" in guide  # the concept is still explained
+    assert "12 inbound links" not in guide  # the frozen tally is not
+    assert "get_backlinks" in guide
+
+
+def test_the_renderer_is_a_pure_function_of_the_profile(vault):
+    """Same profile in, same bytes out — no clock read inside the renderer.
+
+    This is what lets the assertions above name an exact date instead of
+    matching whatever today happens to be, and it is why `scanned_on` lives on
+    the profile rather than being read from `datetime.now()` mid-render.
+    """
+    p = gvg.profile_vault(vault)
+    p.scanned_on = "1999-12-31"
+    assert gvg.render_guide(p) == gvg.render_guide(p)
+    assert "1999-12-31" in gvg.render_guide(p)
+    assert "Profiled 1999-12-31" in gvg.render_guide(p)

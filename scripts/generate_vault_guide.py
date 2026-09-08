@@ -78,6 +78,17 @@ class VaultProfile:
     daily_config: dict | None = None
     largest_folders: list[tuple[str, int]] = field(default_factory=list)
 
+    #: The date this profile was measured, carried on the profile rather than
+    #: read from the clock inside `render_guide`. Two reasons, and the second
+    #: is the one that matters: it makes the renderer a pure function of the
+    #: profile, so a test can assert the exact string a guide will contain
+    #: instead of matching a date that changes at midnight; and it means every
+    #: "as of" in the output names the moment the vault was *scanned*, not the
+    #: moment the markdown was assembled.
+    scanned_on: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
+
     @property
     def frontmatter_pct(self) -> float:
         return 100.0 * self.frontmatter_notes / self.total_notes if self.total_notes else 0.0
@@ -216,45 +227,109 @@ def profile_vault(vault: Path) -> VaultProfile:
 # ---------------------------------------------------------------------------
 
 
-def _describe_maturity(count: int, total: int, noun: str) -> str:
+def _describe_maturity(count: int, total: int, noun: str, p: VaultProfile) -> str:
     """Say honestly how established a practice is.
 
     The failure mode this guards against: an agent reads "notes use frontmatter",
     adds frontmatter everywhere, and makes a 3%-consistent vault 100%
-    inconsistent with its own past. Percentages, and an explicit instruction,
+    inconsistent with its own past. The verdict, and an explicit instruction,
     prevent that.
+
+    **The instruction leads and the percentage trails**, in parentheses and
+    dated. The verdict is the durable part — a vault where frontmatter is not
+    a convention does not become one by drifting a few points — while the
+    number behind it is a measurement like any other here and must not read as
+    current fact.
     """
     pct = 100.0 * count / total if total else 0.0
+    measured = f"({pct:.0f}% of notes had {noun} {_as_of(p)}.)"
     if pct >= 80:
-        return f"**established** — {pct:.0f}% of notes have {noun}. Follow it."
+        return f"**Established — follow it.** {measured}"
     if pct >= 30:
         return (
-            f"**partial** — {pct:.0f}% of notes have {noun}. Match the local "
-            "neighbourhood rather than applying it globally."
+            "**Partial — match the local neighbourhood rather than applying it "
+            f"globally.** {measured}"
         )
     return (
-        f"**not a convention** — only {pct:.0f}% of notes have {noun}. "
-        f"Do NOT start adding {noun} to notes that lack it, and do not treat "
-        "the few existing examples as a schema to conform to."
+        f"**Not a convention.** Do NOT start adding {noun} to notes that lack "
+        "it, and do not treat the few existing examples as a schema to conform "
+        f"to. {measured}"
     )
 
 
+def _as_of(p: VaultProfile) -> str:
+    """The one phrase every measured number carries.
+
+    Stated identically everywhere so a reader learns it once and then knows,
+    at a glance, which sentences in this guide are allowed to be out of date.
+    """
+    return f"at the {p.scanned_on} scan"
+
+
 def render_guide(p: VaultProfile) -> str:
+    """Render the guide, keeping durable rules and perishable counts apart.
+
+    **Why the separation is the design.** The first version of this guide
+    stated every measurement as a present-tense fact: "1222 notes", "108
+    unfiled", "3854 links", "92 inbound links". Every one of those was true on
+    the day it was generated and false soon after — the vault was reorganised
+    a day later and the root went from 108 notes to 6, while the guide went on
+    asserting 108 in a confident voice to every agent that connected. A number
+    an agent cannot tell is stale is worse than no number, because it will be
+    trusted and acted on.
+
+    The rules, meanwhile, did not rot at all. "The root is an inbox, file
+    things out of it" is as true at 6 notes as at 108. "Do not invent a
+    frontmatter schema" survives any amount of reorganisation. So the two are
+    now visibly different kinds of sentence: rules are stated plainly and
+    unconditionally, and every measured quantity carries `_as_of()` and lives
+    where a reader expects something perishable.
+
+    The header says which is which, and says that the vault wins — an agent
+    that finds this guide disagreeing with `list_files` should believe the
+    vault and say so, rather than trying to reconcile the two.
+    """
     out: list[str] = []
     add = out.append
 
     add("# Vault guide for AI agents")
     add("")
     add(
-        "This file is served to every agent that connects to this vault through "
-        "the MCP server. It describes how this vault is actually organised — "
-        "measured from its contents, not aspirational. Follow it."
+        "This file is served to every agent that connects to this vault "
+        "through the MCP server. It describes how this vault is actually "
+        "organised — measured from its contents, not aspirational. Follow it."
+    )
+    add("")
+    add("## How to read this guide")
+    add("")
+    add(
+        "It holds two kinds of statement, and they age differently:"
     )
     add("")
     add(
-        f"_Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d')} from "
-        f"{p.total_notes} notes. Regenerate with `scripts/generate_vault_guide.py` "
-        "after any large reorganisation._"
+        "- **Rules** — where a new note goes, how to name it, what not to "
+        "invent, what not to break. These are stated plainly and do not "
+        "expire. Follow them."
+    )
+    add(
+        f"- **Measurements** — every count, percentage and list marked *{_as_of(p)}*. "
+        "These were true when the vault was last profiled and drift from that "
+        "moment onward. Read them as orientation, never as current fact."
+    )
+    add("")
+    add(
+        "**Where this guide and the vault disagree, the vault wins.** The "
+        "tools see the vault as it is now: `list_files` for what is on disk, "
+        "`list_notes` for what is indexed, `get_backlinks` for who links to "
+        "what. If a number here is contradicted by a tool, trust the tool, "
+        "carry on with the task, and mention the discrepancy to the vault "
+        "owner so the guide can be regenerated. Do not reorganise anything to "
+        "make the vault match this file."
+    )
+    add("")
+    add(
+        f"_Profiled {p.scanned_on}. Regenerate with "
+        "`scripts/generate_vault_guide.py` after any large reorganisation._"
     )
     add("")
 
@@ -286,41 +361,43 @@ def render_guide(p: VaultProfile) -> str:
     add("## Where notes live")
     add("")
     add(
-        f"{p.total_notes} notes across {len(p.folders)} top-level locations. "
         "**Put a new note in the folder its subject belongs to; do not default "
-        "to the vault root.**"
+        "to the vault root.** The root is an inbox, not a destination — that "
+        "holds whether it currently contains six notes or six hundred."
     )
-    add("")
-    add("| Location | Notes | |")
-    add("|---|---:|---|")
-    for name, count in p.largest_folders:
-        share = 100.0 * count / p.total_notes if p.total_notes else 0
-        note = ""
-        if name in p.nested_vaults:
-            note = "nested vault — see below"
-        elif name == "(root)":
-            note = "unfiled; treat as an inbox, not a destination"
-        add(f"| `{name}` | {count} | {note or f'{share:.0f}% of notes'} |")
     add("")
     add(
         "Before creating a note for an existing project or topic, **check "
         "whether a folder for it already exists** and use that folder's own "
-        "naming. Folder names and any short codes used inside filenames do not "
-        "always match each other — search for both before inventing either."
+        "naming. `list_files` shows the folders that exist right now, which is "
+        "the authority; the table below is orientation. Folder names and any "
+        "short codes used inside filenames do not always match each other — "
+        "search for both before inventing either."
     )
+    add("")
+    add(f"Top-level locations, {_as_of(p)}:")
+    add("")
+    add(f"| Location | Notes ({p.scanned_on}) | |")
+    add("|---|---:|---|")
+    for name, count in p.largest_folders:
+        note = ""
+        if name in p.nested_vaults:
+            note = "nested vault — see below"
+        elif name == "(root)":
+            note = "inbox; file notes out of here, do not add to it"
+        add(f"| `{name}` | {count} | {note} |")
     add("")
 
     if p.nested_vaults:
         add("### Nested vaults")
         add("")
         for name in p.nested_vaults:
-            count = p.folders.get(name, 0)
             add(
-                f"- `{name}` ({count} notes) contains its own `.obsidian/` "
-                "directory, so Obsidian treats it as a **separate vault**. Its "
-                "notes are indexed and searchable here, but its conventions are "
-                "its own. Do not reorganise it, and do not assume links resolve "
-                "across the boundary."
+                f"- `{name}` contains its own `.obsidian/` directory, so "
+                "Obsidian treats it as a **separate vault**. Its notes are "
+                "indexed and searchable here, but its conventions are its own. "
+                "Do not reorganise it, and do not assume links resolve across "
+                "the boundary."
             )
         add("")
 
@@ -337,27 +414,24 @@ def render_guide(p: VaultProfile) -> str:
         )
         add("")
     if p.filename_patterns:
-        add("Date-prefix conventions in use, most common first:")
+        dominant = p.filename_patterns.most_common(1)[0][0]
+        add(
+            f"**For a new dated note, use `{dominant}`.** Several older shapes "
+            "coexist; do not propagate them, and do not rename existing notes "
+            "to match — renaming breaks inbound links."
+        )
         add("")
-        add("| Shape | Notes using it |")
+        add(f"Shapes observed, most common first, {_as_of(p)}:")
+        add("")
+        add(f"| Shape | Notes ({p.scanned_on}) |")
         add("|---|---:|")
         for label, count in p.filename_patterns.most_common():
             add(f"| `{label}` | {count} |")
         add("")
-        dominant = p.filename_patterns.most_common(1)[0][0]
-        add(
-            f"For a new dated note, use `{dominant}`. Several older shapes "
-            "coexist; do not propagate them, and do not rename existing notes "
-            "to match — renaming breaks inbound links."
-        )
-    add("")
-    if p.total_notes:
-        add(
-            f"{p.undated_names} notes "
-            f"({100.0 * p.undated_names / p.total_notes:.0f}%) have no date "
-            "prefix. Evergreen or reference notes should be titled by subject, "
-            "with no date."
-        )
+    add(
+        "**Evergreen or reference notes should be titled by subject, with no "
+        "date prefix** — that is the majority of this vault."
+    )
     add("")
     add("Never create a note called `Untitled`, `Untitled 1`, or similar.")
     add("")
@@ -365,11 +439,11 @@ def render_guide(p: VaultProfile) -> str:
     # ---- Frontmatter ------------------------------------------------------
     add("## Frontmatter")
     add("")
-    add(_describe_maturity(p.frontmatter_notes, p.total_notes, "YAML frontmatter"))
+    add(_describe_maturity(p.frontmatter_notes, p.total_notes, "YAML frontmatter", p))
     add("")
     if p.frontmatter_keys:
         common = ", ".join(f"`{k}`" for k, _ in p.frontmatter_keys.most_common(10))
-        add(f"Keys that appear at all: {common}.")
+        add(f"Keys seen at all, {_as_of(p)}: {common}.")
         add("")
         if p.frontmatter_pct < 30:
             add(
@@ -385,59 +459,64 @@ def render_guide(p: VaultProfile) -> str:
     add("## Tags")
     add("")
     genuine = [(t, c) for t, c in p.inline_tags.most_common(20) if c >= 2]
-    total_tag_uses = sum(p.inline_tags.values())
-    # Judge by the share of notes that carry a tag, not by raw uses: one heavily
-    # tagged note does not make tagging a vault-wide convention. Same measure
-    # used for frontmatter, so the two sections stay comparable.
     tagged_pct = 100.0 * p.notes_with_tags / p.total_notes if p.total_notes else 0.0
     if tagged_pct < 20:
         add(
-            f"**Not a convention** — only {p.notes_with_tags} of {p.total_notes} "
-            f"notes ({tagged_pct:.0f}%) carry an inline tag. Do not build a "
-            "tagging scheme, and do not add tags to notes as a side effect of "
-            "editing them."
+            "**Not a convention.** Do not build a tagging scheme, and do not "
+            "add tags to notes as a side effect of editing them. "
+            f"({p.notes_with_tags} of {p.total_notes} notes — "
+            f"{tagged_pct:.0f}% — carried an inline tag {_as_of(p)}.)"
         )
     else:
         add(
-            f"{tagged_pct:.0f}% of notes carry inline tags "
-            f"({total_tag_uses} uses). Existing vocabulary:"
+            "**Reuse an existing tag rather than coining a near-duplicate.** "
+            f"({tagged_pct:.0f}% of notes carried inline tags {_as_of(p)}.) "
+            "Vocabulary in use:"
         )
         add("")
         add(", ".join(f"`#{t}`" for t, _ in genuine) or "_none in common use_")
-        add("")
-        add("Reuse an existing tag rather than coining a near-duplicate.")
     add("")
 
     # ---- Links ------------------------------------------------------------
     add("## Links")
     add("")
     add(
-        f"Wikilinks are a core convention here: {p.link_instances} links across "
-        f"{p.notes_with_links} notes ({p.linked_pct:.0f}% of the vault). "
-        "**Link by bare title** — `[[Note Title]]` — not by path; that is how "
-        "the existing links are written and how Obsidian resolves them."
+        "Wikilinks are a core convention here. **Link by bare title** — "
+        "`[[Note Title]]` — not by path; that is how the existing links are "
+        "written and how Obsidian resolves them. A bare title keeps resolving "
+        "after the note is moved to another folder, which a path-style link "
+        "does not."
+    )
+    add("")
+    add(
+        f"({p.link_instances} links across {p.notes_with_links} notes, "
+        f"{p.linked_pct:.0f}% of the vault, {_as_of(p)}.)"
     )
     add("")
     if p.hubs:
         add(
-            "These notes are **hubs**: many others link into them. Never rename, "
-            "move or delete one without being asked explicitly — doing so breaks "
-            "every inbound link at once."
+            "These notes are **hubs**: many others link into them. **Never "
+            "rename, move or delete one without being asked explicitly** — "
+            "doing so breaks every inbound link at once. Check the current "
+            "count with `get_backlinks` before touching any note; a note not "
+            "on this list may have become a hub since."
         )
         add("")
-        for title, count in p.hubs:
-            add(f"- `[[{title}]]` — {count} inbound links")
+        add(f"Ranked by inbound links {_as_of(p)}:")
+        add("")
+        for title, _count in p.hubs:
+            add(f"- `[[{title}]]`")
         add("")
     add(
-        f"{p.broken_targets} distinct link targets currently resolve to nothing. "
-        "Broken links are normal here — they are often intentional placeholders "
-        "for notes not yet written. **Do not mass-fix them**, and do not create "
-        "stub notes to satisfy them unless asked."
+        "**Broken links are normal here** — they are often intentional "
+        "placeholders for notes not yet written. Do not mass-fix them, and do "
+        "not create stub notes to satisfy them unless asked. "
+        f"({p.broken_targets} distinct targets resolved to nothing {_as_of(p)}.)"
     )
     add("")
     add(
-        f"{p.orphans} notes have no inbound links. That is not a defect to "
-        "correct."
+        "**A note with no inbound links is not a defect to correct.** "
+        f"({p.orphans} such notes {_as_of(p)}.)"
     )
     add("")
 

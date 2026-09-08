@@ -374,6 +374,54 @@ and is planning work. A test asserts the primer really is identical across calls
 — if that ever stops holding, the parameter is a false economy and should be
 revisited rather than kept.
 
+## Why there are two listing tools, and why they disagree about dates (#213)
+
+The overlap is real enough to be worth answering directly, because the obvious
+tidy-up — deprecate `list_files`, keep `list_notes` — loses four things and
+gains one line of tool list.
+
+| | `list_notes` | `list_files` |
+| --- | --- | --- |
+| Source | the index | the filesystem |
+| Sees | markdown only | every file type |
+| Folders | never enumerated | listed, so you can navigate |
+| `folder` | a path **prefix**, always descends | immediate children unless `recursive` |
+| Filters | tags, frontmatter | glob on the filename |
+| Freshness | up to one index interval behind | now |
+| Dates | real edit dates | filesystem mtimes |
+
+What deprecating `list_files` would cost:
+
+1. **Every non-markdown file becomes undiscoverable.** Only `.md` is indexed,
+   so attachments, PDFs, images and canvases do not exist as far as
+   `list_notes` is concerned — and `read_file` / `write_file` / `delete_file`
+   would be left with no way to find their operands except guessing paths.
+2. **Folder discovery goes with it.** `list_notes` never names a folder; you
+   can infer one from a note's path, but only for folders that already contain
+   notes. An empty folder, or one holding only attachments, is invisible.
+3. **There is no non-recursive view.** `folder` is a `LIKE 'prefix%'` match, so
+   `list_notes("")` is the whole vault. "Show me the top level" has no
+   expression.
+4. **Ground truth disappears.** `list_files` sees the disk as it is, which is
+   what confirms a write or an upload landed. `list_notes` can be a full index
+   interval behind, and after `check_upload` reports bytes written that lag is
+   exactly when a caller needs to look.
+
+So both stay. What was actually wrong was that nothing said which to reach
+for, and that is now stated in both docstrings rather than left to be worked
+out.
+
+**The dates diverge on purpose, and the divergence became visible when
+`modified_at` started coming from git.** `list_files` reports `st_mtime`,
+which under a git vault is the time of the *checkout* — potentially identical
+across every file in the vault. `list_notes`, `get_recent` and `note_history`
+report the real edit date. Making `list_files` agree would mean a git
+subprocess per listing, or a cache with its own invalidation, to improve a
+column whose actual job is letting a caller gauge a file's size before a
+token-expensive `read_file`. Instead the docstring says plainly what the
+column is, what it is not, and which tool to ask for recency. A number
+explained is worth more than a number silently repaired.
+
 ## File-access tools (non-markdown)
 Raw read/write/browse of arbitrary vault files, distinct peers to the note tools (note tools stay markdown-only). Pure byte transport — no server-side PDF/text extraction, no embedding or indexing of non-markdown files.
 - `read_file(path, encoding="auto", offset=0, limit=None, hash_only=False)` — `auto` resolves text-like MIME → text, image → inline MCP image content block (renders in-client), everything else → base64 string. `text` forces UTF-8 decode (errors on non-UTF-8); `base64` forces raw-bytes base64. Capped by `MAX_FILE_READ_BYTES` (default 10 MB), checked against on-disk size before reading. Text results are additionally bounded by `MAX_READ_RESPONSE_CHARS` and page via `offset`; base64 and image results are not windowed. Base64 reads are token-heavy — check size with `list_files` first.

@@ -265,6 +265,17 @@ async def list_notes(
 ) -> str:
     """List notes in a vault folder, sorted by most recently modified.
 
+    Markdown only, and `folder` is a **path prefix**, so this always descends
+    into subfolders — `list_notes("projects/")` returns every note anywhere
+    under `projects/`. The dates are real edit dates (the note's last commit
+    where the vault is a git repository, otherwise its mtime), so sorting by
+    recency here is meaningful.
+
+    Peer to `list_files`, which reads the filesystem instead: use that one to
+    see non-markdown files, to discover folders, or to confirm a write landed
+    before the indexer has caught up. Its dates are filesystem timestamps and
+    are not comparable to these.
+
     Results come from the index, so a note that exists on disk but has not yet been
     picked up by the indexer will not appear (lag is bounded by the index interval,
     typically up to 5 minutes).
@@ -1250,9 +1261,26 @@ async def list_files(
     limit: int = 200,
 ) -> str:
     """Browse the vault filesystem (`ls`-style), including non-markdown files.
-    Peer to `list_notes`, which lists indexed markdown only; `list_files` reads
-    the filesystem directly and reports sizes so you can gauge a binary before
-    `read_file`.
+
+    **Which of the two listing tools to use.** `list_notes` reads the *index*:
+    markdown only, filterable by tag and frontmatter, folder is a path prefix
+    so it always descends, sorted by edit date. `list_files` reads the *disk*:
+    every file type, subfolders listed so you can navigate, glob-filterable,
+    non-recursive by default, with byte sizes. Reach for `list_notes` to find
+    notes by meaning or recency, and for `list_files` to see what is actually
+    there — attachments, PDFs, images and canvases are invisible to
+    `list_notes` because only markdown is indexed, and it is the only way to
+    discover folders or to confirm a write landed before the indexer has
+    caught up.
+
+    **The two report different dates for the same note, on purpose.** The
+    times here are filesystem mtimes. When the vault is a git repository —
+    which it may well be — a clone or checkout stamps every file with the
+    moment of the checkout, so these can be identical across the whole vault
+    and say nothing about when anything was written. `list_notes`,
+    `get_recent` and `note_history` report the real edit date. Use those to
+    reason about recency; use the sizes here to gauge a file before
+    `read_file`, which is what this column is good for.
 
     By default lists the immediate children of `folder` — subdirectories and
     files, each file with size and modification time. `pattern` is a glob that

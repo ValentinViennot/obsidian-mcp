@@ -61,6 +61,38 @@ ReadWritePaths=/srv/obsidian-vault
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
+
+# ── RestrictSUIDSGID and `core.sharedRepository` cannot both be on ───────────
+#
+# Keep this one, and make sure the bare repo this pushes to is NOT a
+# `git init --shared=group` repository:
+#
+#     git -C <bare>.git config --unset core.sharedRepository
+#
+# `--shared=group` makes git set the **setgid bit** on every object fan-out
+# directory it creates. `RestrictSUIDSGID=yes` forbids this process from
+# setting setgid on anything. So the moment a push needs a fan-out directory
+# that does not exist yet, git fails with
+#
+#     remote: error: unable to create temporary file: Operation not permitted
+#     remote: fatal: failed to write object
+#     ! [remote rejected] main -> main (unpacker error)
+#
+# and the reconcile exits 4. This is a **latent** incompatibility, which is
+# what makes it nasty: pushes into already-existing fan-out directories
+# succeed, so the loop can run green for days and then break on the first
+# push that happens to touch a new one — for us, a bulk `move_note` of 25
+# notes. Nothing about the failure points at either setting.
+#
+# It is fixed on the repository rather than by dropping the sandbox flag,
+# because `--shared=group` is buying nothing here: every writer of the bare
+# repo is root (this unit, and the desktop pushing over SSH), and there is no
+# second user for a shared group to admit. If one is ever added, give it a
+# real group and ownership — do not reach back for the setgid trick, which
+# this unit will still refuse.
+#
+# The failure was caught by `OnFailure=` above, which is the whole reason that
+# alert exists: the previous incident of this shape ran silently for hours.
 RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 LockPersonality=yes

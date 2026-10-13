@@ -74,3 +74,14 @@ The primary regression suite uses actual bare remotes, actual native macOS and
 Linux syscalls, and independent in-place/atomic-save/open-descriptor writes.
 The application suite remains Linux-only because its vault containment uses
 `openat2`; desktop engine qualification additionally runs natively on macOS.
+
+### Desktop recovery alerts
+
+The desktop sweep shows a generic macOS notification when recovery review is
+required. Note names, saved content and vault paths stay in private status/log
+output. A private digest marker inside `.git` suppresses repeated alerts for the
+same recovery state; changed retained bytes trigger a new alert. Successful sync
+clears the notification marker, without deleting recovery versions. A busy writer
+lock stays a silent retry. Failed notification delivery leaves the next sweep
+eligible to retry; the original engine exit status is preserved. Notification
+availability follows macOS user permissions, so use `status` when diagnosing sync.

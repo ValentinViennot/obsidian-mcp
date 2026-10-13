@@ -2088,3 +2088,31 @@ async def test_download_still_404s_when_openat2_is_unavailable(
     gone = await client.get("/transfer/download/file", headers=auth(harness))
     assert gone.status_code == 404
     assert gone.content == response.content
+
+
+async def test_busy_vault_sync_releases_capability_and_same_upload_retries(client, harness, monkeypatch):
+    import fcntl
+    import subprocess
+    from pathlib import Path
+    from src.services import vault_sync
+
+    root = Path(harness.row.vault_root)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    monkeypatch.setattr(vault_sync.settings, "git_vault_enabled", True)
+    monkeypatch.setattr(vault_sync.settings, "git_commit_timeout_seconds", 0.01)
+    descriptor = os.open(root / ".git/obsidian-sync.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "5"
+        assert harness.row.state == "pending"
+        assert harness.released == 1
+        assert not harness.completed
+        assert not (root / harness.row.path).exists()
+    finally:
+        os.close(descriptor)
+    retry = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+    assert retry.status_code == 200, retry.text
+    assert harness.row.state == "completed"
+    assert (root / harness.row.path).read_bytes() == PNG

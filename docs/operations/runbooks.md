@@ -304,29 +304,135 @@ optimisation, not a dependency.
 
 ## The vault sync loop
 
-```bash
-# Server side
-ssh odoo 'systemctl status obsidian-vault-reconcile.timer'
-ssh odoo 'journalctl -u obsidian-vault-reconcile.service -n 50'
+The server timer and desktop script automatically merge local and incoming
+history without checking out files in the live vault. Ordinary Obsidian saves
+may continue: displaced file inodes are retained so saves through already-open
+descriptors can be recovered. See [the preservation contract](../architecture/vault-sync.md).
 
-# Desktop side
-launchctl list | grep obsidian-vault
-tail -20 ~/Library/Logs/obsidian-vault-reconcile.log
-```
+Use the branch's configured upstream, including a private hosted SSH/HTTPS
+repository and any branch. Neither reconciler assumes `origin/main`.
+Set `VAULT_DIR` on the server and `VAULT_PATH` on the desktop. Use Git credential
+helpers/SSH agents; never put tokens in remote URLs or tracked environment files.
 
-**A conflict is the failure mode to expect.** Both ends commit and both rebase,
-so a conflict means the same lines changed in both places. The reconcile scripts
-abort the rebase and leave a usable tree rather than parking mid-rebase; resolve
-by hand:
+For a clean environment, clone into a **new** directory as the service owner:
 
 ```bash
-ssh odoo 'cd /srv/obsidian/vaults/<user> && git status'
-# resolve, then:
-ssh odoo 'cd /srv/obsidian/vaults/<user> && git add -A && git rebase --continue && git push origin main'
+VAULT_PATH=/path/to/new-vault VAULT_GIT_REMOTE=git@example.invalid:owner/vault.git \
+  VAULT_GIT_BRANCH=main python3 deploy/clone-vault.py
 ```
 
-Never force-push the vault. The desktop clone and the server clone both hold
-history; a force-push strands one of them.
+The helper refuses an existing destination, even an empty directory. It never
+replaces a vault, creates a hosted repository or migrates a live one. Those are
+separate authorized operator actions. The sync engine requires a regular clone
+with a `.git` directory; submodules and linked working clones are unsupported.
+
+For desktop installation, create a **new** relocatable bundle containing the
+entry point and its standard-library modules:
+
+```bash
+bash deploy/desktop/install.sh /path/to/new-sync-bundle
+VAULT_PATH=/path/to/vault LOG_PATH=/path/to/sync.log \
+  bash /path/to/new-sync-bundle/deploy/desktop/obsidian-vault-reconcile.sh
+```
+
+Python 3.12+ and Git 2.36+ are required. Timer activation is separate. Disable
+Obsidian Git plugin automatic pull/push for this clone; independent Git writers
+must use `.git/obsidian-sync.lock` or run while the timer and MCP writers are
+paused. Kernel locks release on process exit: never unlink one to unlock it.
+A busy sweep exits75, leaves the success marker unchanged, and retries on the
+next tick. MCP publication briefly waits for an active sweep before asking for
+retry; recovered versions pause commits rather than preventing note edits.
+
+Inspect the intended vault's status and saved versions:
+
+```bash
+python3 deploy/vault-reconcile.py --vault /path/to/vault status
+python3 deploy/vault-reconcile.py --vault /path/to/vault recovery-list
+```
+
+Status includes transaction/date, incoming commit, candidate worktree, original
+note path, retained location and latest SHA-256. `local_edit_recovered` means a
+saved editor version differs from the prior committed content. An incomplete
+transaction requires recovery even when the retained bytes are unchanged.
+Export the latest version outside the vault before choosing what to keep:
+
+```bash
+python3 deploy/vault-reconcile.py --vault /path/to/vault \
+  recovery-export TRANSACTION 'daily/Today.md' /path/to/new-recovered-note.md
+```
+
+Export never overwrites an existing destination. Retained versions can change
+when an editor's already-open descriptor saves later. Reinspect the latest hash
+before resolution. Close editors and pause independent Git writers first:
+
+```bash
+python3 deploy/vault-reconcile.py --vault /path/to/vault \
+  recovery-resolve TRANSACTION 'daily/Today.md' --keep recovered \
+  --sha256 LATEST_HASH --editors-quiesced
+# Or choose --keep live after comparing/exporting the retained version.
+```
+
+Both choices retain saved inodes. Choosing `recovered` keeps the displaced live
+version too and leaves the chosen local edit ready for the next normal commit.
+A subsequent late save changing an acknowledged hash reopens review. These
+commands never delete recovery storage or force-push history.
+
+After an interrupted sync, keep editors closed and continue its transaction:
+
+```bash
+python3 deploy/vault-reconcile.py --vault /path/to/vault \
+  recovery-continue TRANSACTION --editors-quiesced
+```
+
+Recovery classifies completed/native exchanges by inode identity. It does not
+replay an ambiguous exchange. If names changed unexpectedly, export retained
+versions and compare them with the pinned incoming/local commits; leave the
+transaction pending for operator review rather than using `reset --hard`.
+Git `index.lock` needs a separate check that no Git process remains before an
+operator removes it; automation never removes it based only on age here.
+
+For a same-note merge conflict, status shows a **private candidate worktree**.
+Resolve notes there, not in the live vault. All non-conflicting incoming notes
+are already present in that candidate. The usual Git conflict workflow applies:
+
+```bash
+git -C /path/from/status/merge status
+# Edit the candidate note to combine both versions, then:
+git -C /path/from/status/merge add -- daily/Today.md
+git -C /path/from/status/merge commit -m 'vault: resolve reviewed note conflict'
+python3 deploy/vault-reconcile.py --vault /path/to/vault \
+  recovery-continue TRANSACTION --editors-quiesced
+```
+
+The engine verifies that the candidate retains both original histories before
+publishing it. Live local bytes are displaced into recovery, not discarded.
+Review any recovered edit and then let the normal timer push. Detached or
+unmerged live Git states pause commits/sync; supported note writes still stand.
+
+Run sweeps as the mounted vault's service UID/GID. Replacement preserves POSIX
+owner/group and permissions; shared additions inherit parent write access.
+The systemd template retains its set-ID restriction: the kernel inherits
+shared directory groups during creation, without explicit set-ID chmod.
+Configure ownership before enabling the timer. Extended ACL metadata is outside this
+contract. Private `.git/obsidian-recovery` storage and recovery refs are never
+indexed or sent in ordinary branch pushes. Include them in filesystem backups;
+there is intentionally no automatic cleanup while editor descriptors may live.
+
+To inspect retained pre-sync staging:
+
+```bash
+git -C /path/to/vault for-each-ref refs/obsidian-recovery/ --format='%(refname)'
+git -C /path/to/vault show 'ACTUAL_STAGED_REF:daily/Today.md'
+# Or use the staged_snapshot commit SHA shown by status when present.
+```
+
+Staged snapshot refs use their own UUID, which can differ from the sync
+transaction. Copy the actual ref from the listing; do not construct one from
+the sync transaction ID.
+
+This preserves disk-published edits, not unsaved buffers or disk failure. Keep
+editor/device backups too. No production timer, hosted repository, permissions
+or vault migration is changed by installing this source update.
 
 ---
 

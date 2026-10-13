@@ -24,7 +24,7 @@
 # single source of truth. The failure would be invisible: no error anywhere, and
 # the note simply reverts.
 #
-# `vault-reconcile.sh` instead commits the local work FIRST and then rebases the
+# `vault-reconcile.sh` instead commits the local work FIRST and then merges in a private worktree, retaining displaced live inodes from the
 # incoming commits onto it, stopping and shouting if the two genuinely conflict.
 # It can only do that because it runs in the working clone and knows about those
 # writes. This hook runs in the bare repo and knows nothing about them, so the

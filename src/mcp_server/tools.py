@@ -67,7 +67,7 @@ from src.services.filters import apply_embedding_validity, apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
 from src.services.search import full_text_search
 from src.services.usage_stats import OVER_QUOTA_PARAM
-from src.services import git_history, transfer, vault_fs
+from src.services import git_history, transfer, vault_fs, vault_sync
 from src.services.vault import (
     MAX_PATH_CHARS,
     VAULT_ROOT_NOT_READY_ERROR,
@@ -1422,6 +1422,7 @@ def _tracked(
             # — which path it just published — and the decorator contributes
             # the identity, once, after the body has finished.
             git_token = git_vault.begin() if write_class else None
+            sync_guard = None
 
             def named_params() -> dict:
                 """The row's named arguments, truncated. No outcome markers.
@@ -1625,6 +1626,10 @@ def _tracked(
                     # shutdown must not be recorded as a tool failure or write a
                     # row.
                     try:
+                        if write_class and settings.git_vault_enabled:
+                            guard = vault_sync.writing(_vault_root(current_user_id.get()))
+                            await guard.__aenter__()
+                            sync_guard = guard
                         result = await fn(*args, **kwargs)
                     except Exception as exc:
                         # Guarded: a `transforms` entry that raises on a value
@@ -1709,6 +1714,8 @@ def _tracked(
                     await _commit_vault_writes(tool_name)
                 return result
             finally:
+                if sync_guard is not None:
+                    await sync_guard.__aexit__(None, None, None)
                 timing.clear(token)
                 _current_tool_name.reset(name_token)
                 if git_token is not None:

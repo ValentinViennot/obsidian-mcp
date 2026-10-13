@@ -10,6 +10,8 @@ anything Python can stand in for.
 All content here is synthetic and invented.
 """
 import os
+import json
+import fcntl
 import shutil
 import subprocess
 from pathlib import Path
@@ -205,7 +207,7 @@ def test_a_run_with_nothing_to_do_is_a_no_op(world, tmp_path):
 
     assert (first.returncode, second.returncode) == (0, 0)
     assert subjects(server) == before
-    assert "nothing to commit" in first.stderr
+    assert json.loads(first.stdout)["state"] == "complete"
 
 
 def test_the_gitignore_is_honoured_by_the_sweep(world, tmp_path):
@@ -224,7 +226,7 @@ def test_the_gitignore_is_honoured_by_the_sweep(world, tmp_path):
 # ── The conflict path ───────────────────────────────────────────────────────
 
 
-def test_a_conflict_aborts_the_rebase_and_exits_loudly(world, tmp_path):
+def test_a_conflict_is_retained_outside_the_live_vault_and_exits_loudly(world, tmp_path):
     """Both sides changed the same line. Nothing is resolved automatically."""
     bare, server, desktop = world
     (desktop / "Alpha.md").write_text("the laptop's version\n", encoding="utf-8")
@@ -236,8 +238,8 @@ def test_a_conflict_aborts_the_rebase_and_exits_loudly(world, tmp_path):
     result = run_sweep(server, tmp_path)
 
     assert result.returncode == EXIT_CONFLICT
-    assert "did not sync" in result.stderr
-    assert "rebase aborted" in result.stderr
+    assert "incoming conflict retained" in result.stderr
+    assert "live notes unchanged" in result.stderr
 
     # The tree is USABLE: no rebase in progress, nothing in conflict, and the
     # server's own commit still on the branch. An agent calling `edit_note` a
@@ -275,7 +277,7 @@ def test_an_unreachable_remote_fails_without_starting_a_rebase(world, tmp_path):
     result = run_sweep(server, tmp_path)
 
     assert result.returncode == EXIT_CONFLICT
-    assert "pull --rebase failed" in result.stderr
+    assert "git fetch failed" in result.stderr
     # Nothing to abort, so nothing pretends to have been aborted.
     assert "rebase aborted" not in result.stderr
     # The out-of-band edit is committed locally regardless: the commit happens
@@ -298,7 +300,7 @@ def test_a_push_race_is_reported_rather_than_swallowed(world, tmp_path):
     result = run_sweep(server, tmp_path)
 
     assert result.returncode == EXIT_PUSH_FAILED
-    assert "push to" in result.stderr
+    assert "push failed" in result.stderr
     # Safe locally, which is what the message promises.
     assert subjects(server)[0].startswith("vault(sweep):")
 
@@ -306,25 +308,21 @@ def test_a_push_race_is_reported_rather_than_swallowed(world, tmp_path):
 # ── Concurrency, the flag, and misconfiguration ─────────────────────────────
 
 
-def test_a_second_sweep_finding_the_lock_held_exits_zero(world, tmp_path):
+def test_busy_sweep_never_updates_the_success_marker(world, tmp_path):
     _bare, server, _desktop = world
-    lock = tmp_path / "reconcile.lock"
-    lock.touch()
-    (server / "Beta.md").write_text("new\n", encoding="utf-8")
-
-    # Hold the lock the way a running sweep would, then start another.
-    holder = subprocess.Popen(
-        ["flock", str(lock), "sleep", "10"],
-    )
+    (server / "Beta.md").write_text("new local edit\n")
+    marker = tmp_path / "success-marker"
+    marker.write_text("prior successful sync")
+    before = marker.stat().st_mtime_ns
+    fd = os.open(server / ".git/obsidian-sync.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        result = run_sweep(server, tmp_path)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = run_sweep(server, tmp_path, VAULT_RECONCILE_MARKER=str(marker))
     finally:
-        holder.kill()
-        holder.wait()
-
-    assert result.returncode == 0
-    assert "another reconcile holds" in result.stderr
-    # It really did nothing: the edit is still uncommitted for the holder.
+        os.close(fd)
+    assert result.returncode == 75
+    assert "holds the sync lock" in result.stderr
+    assert marker.stat().st_mtime_ns == before
     assert subjects(server) == ["seed"]
 
 
@@ -337,7 +335,7 @@ def test_the_flag_is_cleared_at_the_start_of_a_run(world, tmp_path):
 
     assert result.returncode == 0
     assert not flag.exists()
-    assert "a push requested this sweep" in result.stderr
+    assert json.loads(result.stdout)["state"] == "complete"
 
 
 def test_a_missing_flag_is_not_an_error(world, tmp_path):
@@ -360,7 +358,7 @@ def test_a_vault_with_no_remote_commits_locally_and_succeeds(tmp_path):
     result = run_sweep(solo, tmp_path)
 
     assert result.returncode == 0
-    assert "tracks no remote" in result.stderr
+    assert json.loads(result.stdout)["state"] == "local_only"
     assert subjects(solo)[0].startswith("vault(sweep):")
 
 
@@ -369,7 +367,7 @@ def test_a_non_repository_is_refused(tmp_path):
     plain.mkdir()
     result = run_sweep(plain, tmp_path)
     assert result.returncode == EXIT_MISCONFIGURED
-    assert "not a git working tree" in result.stderr
+    assert "regular working clone" in result.stderr
 
 
 def test_a_missing_vault_dir_is_refused(tmp_path):
@@ -392,7 +390,7 @@ def test_a_subdirectory_of_a_repository_is_refused(world, tmp_path):
     result = run_sweep(inner, tmp_path)
 
     assert result.returncode == EXIT_MISCONFIGURED
-    assert "is inside the repository rooted at" in result.stderr
+    assert "regular working clone" in result.stderr
 
 
 def test_a_detached_head_is_refused(world, tmp_path):

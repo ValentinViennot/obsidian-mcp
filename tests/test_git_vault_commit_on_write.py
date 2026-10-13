@@ -335,7 +335,7 @@ async def test_a_failing_git_does_not_fail_the_write(vault, monkeypatch, caplog)
 
     assert result.startswith("Created note: Alpha.md")
     assert (vault / "Alpha.md").read_text(encoding="utf-8") == "one\n"
-    assert "git add failed" in caplog.text
+    assert "index could not be retained" in caplog.text
 
 
 async def test_a_git_that_raises_does_not_fail_the_write(vault, monkeypatch, caplog):
@@ -398,7 +398,7 @@ async def test_concurrent_writes_do_not_corrupt_the_index(vault):
 
 
 async def test_concurrent_writes_survive_a_stale_index_lock(vault, monkeypatch):
-    """A crashed git's leftover lock is cleared once, not once per waiter."""
+    """An old lock never rolls back concurrent published writes or gets removed."""
     import os
     import time
 
@@ -411,9 +411,9 @@ async def test_concurrent_writes_survive_a_stale_index_lock(vault, monkeypatch):
         *(tools.create_note_impl(f"n{i}.md", f"body {i}\n") for i in range(4))
     )
 
-    assert not lock.exists()
-    assert len(log_subjects(vault)) == 5
-    assert porcelain(vault) == ""
+    assert lock.exists()
+    assert log_subjects(vault) == ["seed"]
+    assert all(f"n{i}.md" in porcelain(vault) for i in range(4))
 
 
 # ── Attribution ─────────────────────────────────────────────────────────────

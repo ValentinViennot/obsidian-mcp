@@ -2182,3 +2182,36 @@ async def test_pool_exhaustion_fails_after_the_configured_pool_timeout(
         await small.dispose()
 
     assert 0.4 <= waited < 10, waited
+
+
+async def test_busy_git_sync_releases_real_claim_and_same_capability_retries(clean, vault_root, wired, monkeypatch):
+    import fcntl
+    import subprocess
+    from src.services import vault_sync
+
+    subprocess.run(["git", "init", "-q", str(vault_root)], check=True)
+    monkeypatch.setattr(vault_sync.settings, "git_vault_enabled", True)
+    monkeypatch.setattr(vault_sync.settings, "git_commit_timeout_seconds", 0.01)
+    async with clean() as session:
+        _, _, token, row = await _mint_upload(session, vault_root)
+    headers = {"Authorization": f"Bearer {token}"}
+    descriptor = os.open(vault_root / ".git/obsidian-sync.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        async with _client("203.0.113.80") as client:
+            response = await client.put("/transfer/upload", headers=headers, content=PAYLOAD)
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "5"
+        assert not (vault_root / row.path).exists()
+        async with wired() as session:
+            state = (await session.execute(select(TransferToken.state).where(TransferToken.id == row.id))).scalar_one()
+        assert state == "pending"
+    finally:
+        os.close(descriptor)
+    async with _client("203.0.113.80") as client:
+        retry = await client.put("/transfer/upload", headers=headers, content=PAYLOAD)
+    assert retry.status_code == 200, retry.text
+    assert (vault_root / row.path).read_bytes() == PAYLOAD
+    async with wired() as session:
+        state = (await session.execute(select(TransferToken.state).where(TransferToken.id == row.id))).scalar_one()
+    assert state == "completed"

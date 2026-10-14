@@ -38,6 +38,8 @@ encoding alone, which is what keeps `GET` and `HEAD` agreeing on
 """
 from __future__ import annotations
 
+from src.services import vault_sync
+
 import datetime
 import errno
 import hashlib
@@ -734,14 +736,14 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
     # `row` because that is the existing signature, and they read only `row.id`
     # from it.
 
-    async def release() -> None:
+    async def release() -> bool:
         # Best-effort, like phase 1's: every caller below has already chosen
         # its status code, and `PrePublishAborted` in particular releases and
         # *then* emits `transfer_refused` — a raise here would lose the record
         # and answer 500 where the design promises a fixed 404.
         try:
             async with async_session() as s:
-                await _release_quietly(s, row, request)
+                return await _release_quietly(s, row, request)
         except Exception as exc:  # noqa: BLE001 - even opening a session
             security_events.emit(
                 "transfer_claim_release_failed",
@@ -754,6 +756,8 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
                 route=request.url.path,
                 method=request.method,
             )
+
+        return False
 
     async def consume() -> None:
         async with async_session() as s:
@@ -813,15 +817,23 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
                 )
 
     try:
-        result = await transfer.stream_to_vault(
-            row,
-            request.stream(),
-            max_bytes=_upload_max_bytes(row),
-            content_length=_content_length(request),
-            deadline=_upload_deadline(row),
-            idle_timeout=30.0,
-            before_publish=gate,
-        )
+        async with vault_sync.writing(row.vault_root):
+            result = await transfer.stream_to_vault(
+                row,
+                request.stream(),
+                max_bytes=_upload_max_bytes(row),
+                content_length=_content_length(request),
+                deadline=_upload_deadline(row),
+                idle_timeout=30.0,
+                before_publish=gate,
+            )
+    except vault_sync.VaultSyncBusy as exc:
+        # A committed capability claim must actually be restored before we
+        # promise same-link retry. Nothing was streamed or published yet.
+        if not await release():
+            return _not_found()
+        return JSONResponse({"error": str(exc)}, status_code=503,
+                            headers={"Retry-After": "5"})
     except transfer.TooLarge as exc:
         await release()
         return JSONResponse({"error": str(exc)}, status_code=413)

@@ -41,18 +41,15 @@ travels in the environment of the one `git commit` invocation
 steps, and the second can fail. A staged-but-uncommitted path would be swept
 into whatever the *sweep* commits next, under the sweep's identity and message —
 silently mis-attributing an agent write to "out-of-band edit". So a failed
-commit unstages exactly the paths this call staged, and nothing else.
+commit restores the initial index tree, including pre-existing staged versions.
 
-**4. One git process at a time, in this process.** Concurrent `git add`s against
-one index corrupt it. The lock is a process-local `asyncio.Lock`: this server
-already documents `--workers 1` as part of its contract (the `/mcp` rate
-limiter's token buckets live in worker memory — see
-`docs/architecture/rate-limits.md`), so a process-local lock is exactly as
-strong as the guarantees the server already makes, and no stronger. **A second
-uvicorn worker would break this the same way it breaks the rate limits**, and
-the mitigation is the same one: don't run two. A cross-process file lock would
-not help anyway — the desktop clone and a human's shell are other processes
-entirely, which is why `_clear_stale_index_lock` exists.
+**4. Supported writers and synchronization share a kernel lock.**
+`vault_sync.writing` surrounds each write-class tool body through its commit,
+and transfer upload publication. The reconcile sweep holds the same
+`.git/obsidian-sync.lock` through journaled integration. The process-local
+commit lock still serializes direct commit callers. Independent plugins and
+manual shell commands must coordinate with the kernel lock; they cannot be
+made safe by deleting a lock file because it looks old.
 
 ## What is NOT here
 
@@ -407,7 +404,8 @@ def _run(git: str, root: str, args: list[str], env: dict, timeout: float):
     is for. Command-line scope means it applies to this invocation and leaves no
     trace in any config file.
     """
-    argv = [git, "-c", f"safe.directory={root}", "-C", root, *args]
+    argv = [git, "-c", f"safe.directory={root}", "-c", "core.fsync=committed,index,reference",
+             "-c", "core.fsyncMethod=fsync", "-C", root, *args]
     try:
         return subprocess.run(  # noqa: S603 - explicit argv, never shell=True
             argv,
@@ -439,59 +437,11 @@ def _run(git: str, root: str, args: list[str], env: dict, timeout: float):
 
 
 def _clear_stale_index_lock(root: str) -> None:
-    """Remove `.git/index.lock` when it can only be a crashed git's leftover.
-
-    A git killed by this module's own timeout — or by the container's OOM
-    killer, or by a `docker compose down` mid-commit — leaves the lock behind,
-    and every subsequent commit then fails identically for ever. That is a
-    silent, permanent end to commit-on-write, recoverable only by an operator
-    who happens to read the logs.
-
-    Two conditions, and both are deliberately conservative, because deleting a
-    **live** git's lock corrupts the index this module exists to protect:
-
-    * we hold the process-local commit lock, so it is not one of ours; and
-    * the lock is older than `STALE_INDEX_LOCK_SECONDS`, which is far longer
-      than any commit this module can make.
-
-    A human's `git rebase` in a shell on this clone can still hold a lock for
-    longer than that. It is the accepted residual: five minutes is well past
-    any interactive command's normal life, the loss if we are wrong is one
-    operator command, and the alternative — never clearing it — is the
-    permanent outage above.
-
-    Only attempted when `.git` is a real directory. For a `git worktree` or a
-    submodule gitlink, `.git` is a *file* naming the real git directory
-    elsewhere, and guessing at that path is how a tool deletes something it did
-    not understand.
-    """
-    git_dir = os.path.join(root, ".git")
-    if not os.path.isdir(git_dir):
-        return
-    lock = os.path.join(git_dir, "index.lock")
-    try:
-        age = time.time() - os.stat(lock).st_mtime
-    except OSError:
-        return  # No lock, or we cannot see it. Either way, nothing to do.
-    if age < STALE_INDEX_LOCK_SECONDS:
-        return
-    try:
-        os.unlink(lock)
-    except OSError as exc:
-        logger.warning(
-            "Found a %.0fs-old .git/index.lock in the vault and could not "
-            "remove it (%s); commits will keep failing until it is cleared.",
-            age,
-            exc,
-            extra={"reason": "stale_lock", "error_type": type(exc).__name__},
-        )
-        return
-    logger.warning(
-        "Removed a stale .git/index.lock (%.0fs old) from the vault. A git "
-        "process was killed mid-commit; every commit since then has failed.",
-        age,
-        extra={"reason": "stale_lock_cleared"},
-    )
+    """Report an index lock; age never proves an independent Git writer died."""
+    lock = os.path.join(root, ".git", "index.lock")
+    if os.path.isfile(lock):
+        logger.warning("Vault index.lock exists; verify no Git process remains before operator removal. The write stands.",
+                       extra={"reason": "index_lock_pending"})
 
 
 #: What `git commit` says when the staged paths turn out to hold no change.
@@ -522,7 +472,23 @@ _ADD_NON_FAILURES = (
 )
 
 
-def commit_paths(
+def commit_paths(paths, message, author_name, author_email, vault_root) -> bool:
+    """Keep published writes; defer every Git commit while recovery is pending."""
+    try:
+        from src.services.vault_sync import committing
+        with committing(vault_root) as allowed:
+            if not allowed:
+                logger.warning("Vault commit deferred: sync is busy or recovery needs review; the write stands.",
+                               extra={"reason": "sync_recovery_pending"})
+                return False
+            return _commit_paths_unlocked(paths, message, author_name, author_email, vault_root)
+    except Exception:  # bookkeeping never rolls back or fails a published write
+        logger.warning("Vault commit deferred; published bytes remain available.",
+                       extra={"reason": "sync_gate_failed"})
+        return False
+
+
+def _commit_paths_unlocked(
     paths,
     message: str,
     author_name: str,
@@ -546,8 +512,8 @@ def commit_paths(
     staged something by hand in a shell must not have it swept into a commit
     signed by the agent identity and captioned with a tool name.
 
-    On a failed commit the staging is undone for these paths and these paths
-    alone (`git reset -q --`). Rule 3: a path left staged would be swept into
+    On a failed commit the initial index tree is restored, including a different
+    pre-existing staged version of the same path. Rule 3: a path left staged would be swept into
     the sweep's next commit under the sweep's message, which reads "out-of-band
     edit" — mis-attributing an agent write in the exact record this exists to
     make honest.
@@ -575,6 +541,16 @@ def commit_paths(
     _clear_stale_index_lock(root)
     specs = [_pathspec(p) for p in rel_paths]
 
+    initial_index = _run(git, root, ["write-tree"], env, timeout)
+    if initial_index is None or initial_index.returncode:
+        logger.warning("Vault index could not be retained; no paths staged.", extra={"reason": "index_snapshot_failed"})
+        return False
+    initial_tree = initial_index.stdout.strip()
+    def restore_index():
+        restored = _run(git, root, ["read-tree", initial_tree], env, timeout)
+        if restored is None or restored.returncode:
+            logger.warning("Could not restore pre-commit staging; inspect the index.", extra={"reason": "index_restore_failed"})
+
     added = _run(git, root, ["add", "-A", "--", *specs], env, timeout)
     if added is None or added.returncode != 0:
         if added is not None:
@@ -598,7 +574,7 @@ def commit_paths(
         # failed" does not imply "nothing is staged" — and a path left staged
         # is swept into the sweep's next commit under a message claiming it was
         # edited outside the MCP server (rule 3).
-        _unstage(git, root, specs, env, timeout)
+        restore_index()
         return False
 
     committed = _run(
@@ -636,7 +612,7 @@ def commit_paths(
             # warning: the tool did what it was asked, and the tree already
             # says so.
             logger.debug("Nothing to commit for %s in the vault.", rel_paths)
-            _unstage(git, root, specs, env, timeout)
+            restore_index()
             return False
         logger.warning(
             "git commit failed in the vault (exit %d): %s. The write stands; "
@@ -645,7 +621,7 @@ def commit_paths(
             _first_line(committed.stderr) or _first_line(committed.stdout),
             extra={"reason": "commit_failed"},
         )
-    _unstage(git, root, specs, env, timeout)
+    restore_index()
     return False
 
 

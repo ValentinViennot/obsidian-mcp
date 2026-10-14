@@ -347,7 +347,7 @@ def test_a_broken_repository_never_reaches_the_caller(repo, caplog):
     with caplog.at_level("WARNING"):
         assert commit(repo, ["note.md"]) is False
 
-    assert "git add failed" in caplog.text
+    assert "index could not be retained" in caplog.text
     assert (repo / "note.md").read_text(encoding="utf-8") == "hello\n"
 
 
@@ -390,19 +390,17 @@ def test_a_fresh_index_lock_is_left_alone(repo):
     assert lock.exists()
 
 
-def test_a_stale_index_lock_is_cleared_and_the_commit_proceeds(repo, caplog):
-    """A git killed mid-commit would otherwise end commit-on-write for ever."""
+def test_an_old_index_lock_is_retained_until_operator_verifies_process_exit(repo, caplog):
     lock = repo / ".git" / "index.lock"
-    lock.write_text("", encoding="utf-8")
+    lock.write_text("independent writer may still be alive")
     old = time.time() - git_vault.STALE_INDEX_LOCK_SECONDS - 60
     os.utime(lock, (old, old))
-    (repo / "note.md").write_text("hello\n", encoding="utf-8")
-
+    (repo / "note.md").write_text("published bytes remain")
     with caplog.at_level("WARNING"):
-        assert commit(repo, ["note.md"]) is True
-
-    assert "stale .git/index.lock" in caplog.text
-    assert not lock.exists()
+        assert commit(repo, ["note.md"]) is False
+    assert lock.read_text() == "independent writer may still be alive"
+    assert (repo / "note.md").read_text() == "published bytes remain"
+    assert "verify no Git process" in caplog.text
 
 
 def test_a_gitlink_worktree_is_never_guessed_at(tmp_path):
@@ -619,3 +617,42 @@ async def test_commit_recorded_swallows_an_unexpected_failure(repo, monkeypatch,
         git_vault.clear(token)
 
     assert "failed unexpectedly" in caplog.text
+
+
+
+def test_failed_commit_preserves_older_staged_version_of_same_path(repo, monkeypatch):
+    (repo / "same.md").write_text("older staged version")
+    git(repo, "add", "same.md")
+    (repo / "same.md").write_text("newer published version")
+    _fail_the_commit(monkeypatch)
+    assert commit(repo, ["same.md"]) is False
+    assert git(repo, "show", ":same.md").stdout == "older staged version"
+    assert (repo / "same.md").read_text() == "newer published version"
+
+
+def test_direct_commit_deferred_after_delayed_editor_save(repo):
+    from src.services.vault_reconcile import Reconciler
+    peer = repo.parent / "peer"
+    bare = repo.parent / "remote.git"
+    git(repo, "clone", "--bare", str(repo), str(bare))
+    git(repo, "remote", "add", "origin", str(bare))
+    git(repo, "push", "-u", "origin", "HEAD")
+    git(repo, "clone", str(bare), str(peer))
+    branch = git(repo, "branch", "--show-current").stdout.strip()
+    tracked = git(repo, "ls-files").stdout.splitlines()[0]
+    fd = os.open(repo / tracked, os.O_RDWR)
+    try:
+        (peer / tracked).write_text("incoming synthetic update")
+        git(peer, "add", "-A")
+        git(peer, "commit", "-qm", "incoming synthetic change")
+        git(peer, "push", "origin", branch)
+        Reconciler(repo, desktop=True).run()
+        os.ftruncate(fd, 0)
+        os.write(fd, b"late descriptor save")
+        before = git(repo, "rev-parse", "HEAD").stdout
+        (repo / "Note.md").write_text("new MCP-published bytes")
+        assert commit(repo, ["Note.md"]) is False
+        assert git(repo, "rev-parse", "HEAD").stdout == before
+        assert (repo / "Note.md").read_text() == "new MCP-published bytes"
+    finally:
+        os.close(fd)

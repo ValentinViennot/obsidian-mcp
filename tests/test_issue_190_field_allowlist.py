@@ -577,8 +577,11 @@ _BARE_LOGGER_EXEMPTIONS: dict[str, dict[str, str]] = {
         "Could not record": _VAULT_COMMIT,
         "git %s in the vault timed out": _VAULT_COMMIT,
         "Could not run git": _VAULT_COMMIT,
-        "Found a %.0fs-old .git/index.lock": _VAULT_COMMIT,
-        "Removed a stale .git/index.lock": _VAULT_COMMIT,
+        "Vault index.lock exists": _VAULT_COMMIT,
+        "Vault commit deferred: sync is busy": _VAULT_COMMIT,
+        "Vault commit deferred; published bytes": _VAULT_COMMIT,
+        "Vault index could not be retained": _VAULT_COMMIT,
+        "Could not restore pre-commit staging": _VAULT_COMMIT,
         "GIT_VAULT_ENABLED is set but no git binary": _VAULT_COMMIT,
         "git add failed in the vault": _VAULT_COMMIT,
         "git commit failed in the vault": _VAULT_COMMIT,
@@ -773,7 +776,7 @@ def test_the_exemption_list_is_exactly_what_the_design_says_it_is():
     # The third shape, added with `feat/git-vault`: a post-publication failure
     # whose *record* is the audit trail's own gap notice. Every entry quotes
     # `_VAULT_COMMIT` by reference, so the decision is one string.
-    assert len(_BARE_LOGGER_EXEMPTIONS["src/services/git_vault.py"]) == 11
+    assert len(_BARE_LOGGER_EXEMPTIONS["src/services/git_vault.py"]) == 14
     assert set(_BARE_LOGGER_EXEMPTIONS["src/services/git_vault.py"].values()) == {
         _VAULT_COMMIT
     }

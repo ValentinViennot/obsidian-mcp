@@ -1,64 +1,30 @@
 #!/usr/bin/env bash
-# Desktop-side vault reconcile: commit local edits, rebase on the server, push.
-#
-# The obsidian-git plugin already does this — but only while Obsidian is
-# running. Close the app for a week and nothing syncs, and the server's own
-# agent writes pile up unseen. This runs on a launchd timer so the desktop
-# behaves the same whether or not the app is open, and so the plugin is a
-# convenience rather than a load-bearing component.
-#
-# Safe to run concurrently with the plugin: the lock below means whichever gets
-# there first wins and the other backs off, and both use rebase, so history
-# stays linear either way.
-set -uo pipefail
-
-VAULT="${VAULT_PATH:-$HOME/Code/vault}"
-LOCK="$VAULT/.git/obsidian-reconcile.lock"
+# Desktop and server use the same inode-preserving engine.
+# Disable independent Git plugin pulls: ordinary editor saves remain supported.
+set -euo pipefail
+: "${VAULT_PATH:?Set VAULT_PATH to the intended working clone}"
 LOG="${LOG_PATH:-$HOME/Library/Logs/obsidian-vault-reconcile.log}"
-
-log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG"; }
-
-[ -d "$VAULT/.git" ] || { log "no git repo at $VAULT"; exit 1; }
-
-# mkdir is atomic on every filesystem we care about; macOS has no flock(1).
-if ! mkdir "$LOCK" 2>/dev/null; then
-  # A lock older than an hour is a crashed run, not a live one.
-  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
-    log "removing stale lock"
-    rmdir "$LOCK" 2>/dev/null || true
-    mkdir "$LOCK" 2>/dev/null || { log "lock still held, skipping"; exit 0; }
-  else
-    exit 0
-  fi
+mkdir -p "$(dirname "$LOG")"
+ENGINE="$(dirname "$0")/../vault-reconcile.py"
+MARKER="$VAULT_PATH/.git/obsidian-desktop-recovery-notified"
+result=0
+python3 "$ENGINE" --vault "$VAULT_PATH" --desktop sync >>"$LOG" 2>&1 || result=$?
+if [[ "$result" == 0 ]]; then
+    rm -f "$MARKER" 2>>"$LOG" || true
+elif [[ "$result" == 3 ]] && command -v osascript >/dev/null 2>&1; then
+    # Hash private status instead of putting note names or paths into an alert.
+    # A failed/busy status read must not consume the notification opportunity.
+    status=""
+    if status=$(python3 "$ENGINE" --vault "$VAULT_PATH" --desktop status 2>>"$LOG"); then
+        fingerprint=$(printf '%s' "$status" | python3 -c 'import hashlib,json,sys; s=json.load(sys.stdin); print(hashlib.sha256(json.dumps(s,sort_keys=True).encode()).hexdigest() if s["review_required"] else "")') || fingerprint=""
+        prior=""
+        [[ ! -f "$MARKER" ]] || prior=$(cat "$MARKER") || prior=""
+        if [[ -n "$fingerprint" && "$fingerprint" != "$prior" ]]; then
+            if osascript -e 'display notification "Saved note versions need review. Use vault sync status and recovery tools; details are in your private sync log." with title "Obsidian sync needs review"' >>"$LOG" 2>&1; then
+                # A digest-only private marker suppresses unchanged recovery alerts.
+                (umask 077; temporary=$(mktemp "$MARKER.XXXXXX"); printf '%s\n' "$fingerprint" >"$temporary"; mv -f "$temporary" "$MARKER") || true
+            fi
+        fi
+    fi
 fi
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
-
-cd "$VAULT" || exit 1
-
-# Commit whatever the human changed while the app was closed. Authored as the
-# human: this is their edit, and blame should say so. The server commits under
-# its own identity, which is what keeps "did I write this, or did an agent?"
-# answerable.
-if [ -n "$(git status --porcelain)" ]; then
-  git add -A
-  if git commit -q -m "vault: desktop sync $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
-    log "committed local changes"
-  fi
-fi
-
-if ! git pull -q --rebase --autostash origin main; then
-  # Leave the tree usable rather than parked mid-rebase, and be loud: a
-  # conflict needs a human, and silently retrying every 5 minutes would bury
-  # that fact in a log nobody reads.
-  git rebase --abort 2>/dev/null || true
-  log "ERROR rebase conflict — resolve by hand in $VAULT"
-  osascript -e 'display notification "Vault sync needs manual conflict resolution" with title "Obsidian vault"' 2>/dev/null || true
-  exit 1
-fi
-
-if ! git push -q origin main; then
-  log "ERROR push failed (server unreachable?)"
-  exit 1
-fi
-
-log "ok"
+exit "$result"

@@ -56,7 +56,9 @@ bcrypt==5.0.0
 # the failure is a refusal and never an unverified token. Writing out the
 # `cryptography` pin beside it keeps the deploy's Trivy gate reading one
 # explicit version rather than resolving an extra.
-pyjwt[crypto]==2.13.0
+# 2.15.0 carries upstream token/key validation fixes required by the
+# dependency audit and Trivy gates; keep RS256 login coverage with this pin.
+pyjwt[crypto]==2.15.0
 cryptography==50.0.1
 
 # Rate limiting (Phase 8)

@@ -1788,3 +1788,11 @@ This is a working system, not a generic platform.
 ## License
 
 MIT. See `LICENSE`.
+
+### Hosted vault synchronization
+
+A Git-backed vault can use a private hosted remote and any configured upstream
+branch. See [vault sync and recovery](docs/operations/runbooks.md#the-vault-sync-loop)
+for clean cloning, editor/timer coordination, local-edit preservation, conflict
+recovery, and service ownership. Creating the hosted repository and migrating
+an existing vault remain explicit operator actions.

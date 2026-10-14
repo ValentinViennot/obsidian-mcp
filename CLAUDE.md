@@ -229,16 +229,15 @@ update it in the same change.** What stays here is the short list:
   cloned on the owner's desktop where commits must stay attributable to the
   human, so identity travels in `GIT_AUTHOR_*`/`GIT_COMMITTER_*` per
   invocation); **the index is never left half-staged** (a failed commit
-  unstages exactly the paths it staged, or the sweep would later commit them
-  under "changed outside the MCP server"); and **one git process at a time**,
-  behind a process-local `asyncio.Lock` — which is sound for the same
+  restores its initial index tree, preserving pre-existing staged versions); and **supported publications and sweeps share a kernel lock** (`vault_sync.py`),
+  with a process-local `asyncio.Lock` additionally serializing git commits — which is sound for the same
   `--workers 1` reason the rate limiter is, and breaks the same way with a
   second worker. The hook is at the eight write-class `_impl` call sites, which
   know the path, feeding a per-call ContextVar that `_tracked` — which already
   resolves the tool and the principal — flushes into one commit; **not** in
   `vault._atomic_write_at`, which knows neither and is also the write path for
   internal machinery that must produce no commits. `deploy/` holds the
-  reconcile sweep (out-of-band edits, `pull --rebase --autostash`, `push`), its
+  reconcile sweep (out-of-band edits, isolated-worktree merge, inode-preserving publication, push), its
   systemd units, the bare-repo `post-receive` (a flag file, deliberately not a
   `checkout -f` — see the comment there), and the vault `.gitignore` template.
 - **`notes_metadata.modified_at` is a git commit time, not `st_mtime`, when
@@ -340,6 +339,7 @@ summaries.
 
 | Note | Read it before you touch |
 | --- | --- |
+| [vault-sync.md](docs/architecture/vault-sync.md) | Git-backed vault publication, editor autosaves, retained inodes, interrupted recovery and automatic commit gates |
 | [schema-and-migrations.md](docs/architecture/schema-and-migrations.md) | any alembic migration; `alembic check` is the cheap gate, not the whole gate |
 | [oauth-and-grants.md](docs/architecture/oauth-and-grants.md) | `src/oauth/`, the consent page, anything minting/rotating/revoking a token |
 | [vault-roots-and-tenancy.md](docs/architecture/vault-roots-and-tenancy.md) | `APIKeyMiddleware`, `_vault_root`, owner predicates, publication confirmation, the vault-root overlap guard (`src/services/vault_overlap.py`, the snapshot, the five pass entry points) |

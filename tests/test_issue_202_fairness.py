@@ -408,7 +408,7 @@ def test_the_scan_and_the_link_backfill_are_not_budgeted(monkeypatch):
     work. The residual is declared on #202 rather than half-solved, so the two
     functions must carry no budget at all.
     """
-    for name in ("index_vault", "_index_vault_pinned",
+    for name in ("index_vault", "_index_vault_pinned", "_index_vault_attempt",
                  "link_backfill_pass", "_link_backfill_pinned"):
         source = inspect.getsource(getattr(indexer, name))
         assert "EmbedBudget" not in source, f"{name} grew a budget"

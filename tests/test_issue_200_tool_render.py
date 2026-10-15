@@ -117,7 +117,7 @@ class _Chunk:
 
 
 def _semantic_row(note, *, text="SUPERSEDED SENTENCE from the stored chunk", d=0.1):
-    return (_Chunk(note.id, text), note, d)
+    return _projected_row(_Chunk(note.id, text), note, d)
 
 
 def _related_row(
@@ -495,7 +495,7 @@ async def test_the_not_embedded_branch_is_unchanged(monkeypatch, captured):
 
     out = await tools.find_related_impl("Source.md", limit=5)
 
-    assert out == (
+    assert out.prose == (
         "`Source.md` has not been embedded yet — "
         "the indexer is still catching up. Try again in a few minutes."
     )
@@ -512,7 +512,7 @@ async def test_the_not_found_branch_is_unchanged(monkeypatch, captured):
 
     out = await tools.find_related_impl("Nope.md", limit=5)
 
-    assert out == "Note not found: Nope.md"
+    assert out.prose == "Note not found: Nope.md"
     assert captured.params_for("find_related")["error"] == (
         tools._RELATED_SOURCE_NOT_FOUND_MARKER
     )
@@ -595,3 +595,26 @@ async def test_find_related_adds_no_usage_params_key(monkeypatch, captured):
     assert "stale" not in params
     assert "source_stale" not in params
     assert "embedding_truncated" not in params
+
+
+def _projected_row(chunk, note, distance):
+    """One row of `semantic_search`'s projected select (#280, D6).
+
+    The statement selects columns, not entities, so a row is flat. It carries
+    no `embedding`: similarity comes from the database's distance (D7), and a
+    service that reached for a stored vector would fail here.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        note_id=chunk.note_id,
+        chunk_index=chunk.chunk_index,
+        chunk_text=chunk.chunk_text,
+        file_path=note.file_path,
+        title=note.title,
+        tags=note.tags,
+        content_hash=note.content_hash,
+        embedded_content_hash=note.embedded_content_hash,
+        chunks_truncated=note.chunks_truncated,
+        distance=distance,
+    )

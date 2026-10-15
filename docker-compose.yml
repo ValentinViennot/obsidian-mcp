@@ -20,9 +20,8 @@
 #                     `openssl rand -hex 32`.
 #   VAULT_HOST_PATH   Absolute host path to your Obsidian vault. Bind-mounted
 #                     read-write at /obsidian; the write tools mutate it.
-#   POSTGRES_PASSWORD Also put the same value in DATABASE_URL — the app reads
-#                     the URL, Postgres reads the password, and nothing
-#                     reconciles them for you.
+#   OBSIDIAN_DB_PASSWORD Application role password. The separate superuser
+#                     password belongs only in postgres.env; see DEPLOYMENT.md.
 #   MCP_HOSTNAME      Your public hostname. base_url / allowed_origins /
 #                     allowed_hosts derive from it, so OAuth discovery breaks
 #                     without it (clients get http://localhost:8000).
@@ -49,11 +48,14 @@ services:
   postgres:
     image: pgvector/pgvector:pg16-bookworm
     restart: unless-stopped
+    entrypoint: ["bash", "/usr/local/bin/obsidian-mcp-postgres-entrypoint.sh"]
+    command: ["postgres"]
+    env_file:
+      - postgres.env
 
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-obsidian_mcp}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: ${POSTGRES_DB:-obsidian_mcp}
+      POSTGRES_USER: postgres
+      OBSIDIAN_DB_PASSWORD: ${OBSIDIAN_DB_PASSWORD:?set OBSIDIAN_DB_PASSWORD in .env}
       # Stated rather than inherited. The image's default for host connections
       # is already scram-sha-256 when a password is set, but `trust` is one
       # empty POSTGRES_PASSWORD away and this makes that impossible to reach
@@ -64,7 +66,8 @@ services:
       - pg_data:/var/lib/postgresql/data
       # Creates the vector extension on first init. Runs ONCE, on an empty
       # data directory — an existing volume ignores it entirely.
-      - ./docker/db-init-vector.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./docker/postgres-entrypoint.sh:/usr/local/bin/obsidian-mcp-postgres-entrypoint.sh:ro
+      - ./docker/db-init-compose.sh:/docker-entrypoint-initdb.d/10-obsidian-mcp.sh:ro
 
     # No `ports:`. Deliberately, and asserted by tests/test_container_hardening.py:
     # the only client is the app container on the internal network, so there is
@@ -75,7 +78,7 @@ services:
       - mcp_internal
 
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-obsidian_mcp} -d ${POSTGRES_DB:-obsidian_mcp}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U obsidian_mcp -d obsidian_mcp"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -154,6 +157,8 @@ services:
       # Set it to false if you migrate as a separate ordered step — the
       # `make deploy` pipeline does, because it backs up BEFORE it migrates.
       RUN_MIGRATIONS: "true"
+      DATABASE_URL: postgresql+asyncpg://obsidian_mcp:${OBSIDIAN_DB_PASSWORD:?set OBSIDIAN_DB_PASSWORD in .env}@postgres:5432/obsidian_mcp
+      POSTGRES_PASSWORD: ""
 
     # Note what is NOT here: a `command:`. The uvicorn invocation lives in the
     # image's CMD, once, with the comment explaining why `--workers 1` is a

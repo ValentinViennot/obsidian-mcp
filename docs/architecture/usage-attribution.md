@@ -47,7 +47,8 @@ credential and then opens the Usage page to see what it did was shown
   the one caller that has to *report* the audit could not otherwise tell:
   `_tracked`'s exception handler emits `tool_usage_log_failed` on `False`, so
   the log distinguishes "the tool failed and here is its row" from "the tool
-  failed and the row is missing". Every other caller ignores the value. The
+  failed and the row is missing". Coalesced refusal writers also retain their
+  pending counts when a row does not land. The
   error arrives wrapped twice and the layers carry different things: SQLAlchemy's
   `.orig` is the asyncpg *dialect's* error (SQLSTATE, no constraint name),
   whose `__cause__` is asyncpg's own (constraint name). `_error_chain` walks
@@ -56,6 +57,25 @@ credential and then opens the Usage page to see what it did was shown
   `user_id`". An unresolvable name deliberately clears all three: losing the
   scoping beats losing the row. The broad `except` stays last: usage logging
   must never fail a call that already did its work.
+- **`True` means "committed and visible", not "durable across a server
+  crash" (L2, performance-2026-09 #279).** `_insert_usage` issues
+  `SET LOCAL synchronous_commit = off` as the first statement of its
+  transaction, for the initial insert and the FK-cleared retry alike, so the
+  usage row no longer waits on a WAL flush (~40–50 ms when PGDATA was on an
+  HDD; ~2.5 ms since the reference deployment moved it to NVMe on 2026-09-23). An asynchronously committed row is visible to every other session
+  at commit, so `write_usage_row` still returns `True` only after a commit a
+  second session can read, and the writer lease, the single FK retry and the
+  #193 coalescer requeue are unchanged (save the #310 drop of an unstorable
+  row, below). What is weakened is durability across
+  a **PostgreSQL server or host crash**: rows committed in the preceding
+  ~600 ms (`3 × wal_writer_delay`) can be lost. An application crash or
+  restart loses nothing committed, and WAL is flushed in order, so a later
+  synchronous commit (a revocation, say) is never kept while an earlier async
+  row is lost. `SET LOCAL` ends with the transaction; it does not ride the
+  pooled connection into the next checkout
+  (`tests/integration/test_perf_async_commit_pg.py`). The same window applies
+  to the `api_keys.last_used_at` stamp, which is also written at most once per
+  60 s per key now (L5), so the panel's "last used" is accurate to a minute.
 - **It is a snapshot, not a view.** 015's backfill is guarded on
   `actor_kind IS NULL` and so is any re-run. Re-deriving the label from the
   credential's present state would rewrite history on every rename. A row
@@ -127,6 +147,85 @@ credential and then opens the Usage page to see what it did was shown
   barrier and no quiesce: the window is seconds long and the fallback works.
 
 
+## What reaches `params` is rendered, not trusted (#310)
+
+`usage_logs.params` is JSONB, and what goes into it is the caller's own
+arguments (bound by `named_params()`, top-level strings truncated by
+`_truncate_params`) plus server telemetry (`timing.current()`, which includes
+`result_paths` and `source_path`, which are vault paths). SQLAlchemy serialises it with a plain
+`json.dumps`, because no `json_serializer` is set on the engine. Python's JSON
+layer accepts three things PostgreSQL's `jsonb` refuses, each with a class-22
+SQLSTATE:
+
+- **U+0000** in a string. `json.dumps` writes `"\u0000"` and `jsonb` refuses it (22P05).
+- **An unpaired surrogate.** `json.dumps` writes the escape and `jsonb` refuses it.
+- **A non-finite float.** `json.dumps` writes the bare `NaN` / `Infinity`, which is not JSON (22P02).
+
+All three arrive over the wire, because the Streamable HTTP transport parses
+the body with `json.loads`. Unrendered, the row was lost. A NUL in any logged
+argument therefore kept a call out of `usage_logs`, and the
+`argument_not_encodable` refusal (#149) lost its own row because the row
+quoted the surrogate it refused. The coalesced refusal rows were also
+retried forever (see [rate limits](rate-limits.md)).
+
+**The renderer** is `render_usage_params` in `src/services/usage_params.py`.
+It runs **once**, at the top of `_write_usage_row_admitted`, which is the one
+function every MCP-side row passes through after every telemetry and
+observation merge. The FK-cleared retry is built from its output. It does not
+run in `named_params()`, the place the issue first suggested, because that
+would have missed the telemetry merge, and a telemetry path such as `source_path` can hold a
+surrogate-escaped non-UTF-8 filename. An absent `params` stays absent and
+`None` stays `None`.
+
+- **The decision is per top-level key.** A top-level value is stored byte for
+  byte unless it contains, at any depth, an unstorable string (key or value),
+  a non-finite float, a non-string key, or a non-JSON type. A clean row is
+  unchanged and has no marker.
+- **Inside a rendered value, every string follows one grammar:** `\` → `\\`,
+  U+0000 → `\x00`, an unpaired surrogate → `\udXXX` (lowercase, what
+  `backslashreplace` emits). Every backslash then begins exactly one of those
+  sequences, so a NUL the caller sent (`\x00`) cannot be confused with the
+  literal four characters `\x00` (stored `\\x00`). `\0` was rejected because it
+  is ambiguous against a following octal digit.
+- **Other conversions.** Non-finite floats take the #154 tokens `.nan` / `.inf`
+  / `-.inf` (`vault.non_finite_token`). Tuples and sets become lists. Any other
+  non-JSON value becomes its escaped `str()`. Non-string keys become their
+  string form, and **the first key wins** a post-render collision, which is
+  the indexer's `_jsonb_value` rule.
+- **`params["rendered_params"]`** is a sorted list of the rendered top-level
+  keys. The name is reserved, and a test enumerates every tool parameter and
+  marker to prove it.
+- **Total and unbounded in depth.** The walk is iterative with no depth limit.
+  A container already on the current path becomes `<cycle>`. A value that
+  cannot be rendered (a raising `__str__`) becomes `<unrenderable>` and is
+  listed, and the server's markers on the row survive.
+- **Length.** Truncation runs first and counts code points, so a stored
+  top-level string is at most 6 × 200 + 1 characters. Nested strings were
+  never truncated, and they grow by at most 6×.
+- **Not covered: the transfer rows** (`upload_file`, `download_file`,
+  `src/transfer/routes.py` `_log_row`). They are written in their own session
+  from a `transfer_tokens.path` that PostgreSQL already stored as `text`, plus
+  an integer, so they cannot carry any of the three values. A test pins the
+  shape.
+
+Accepted, audit-only ambiguities:
+
+- **L1.** A rendered NaN (`".nan"`) and a caller-sent string `".nan"` in the
+  same value look the same.
+- **L2.** A non-string key can collide with a string key. That is reachable
+  only through `transforms` or in-process callers, because JSON keys are
+  strings.
+- **L4.** A non-finite *server-measured* timing would render as a token and
+  break the unguarded `::double precision` cast in
+  `usage_stats.phase_breakdown`. Those timings are monotonic-clock deltas, so
+  this cannot happen.
+
+`write_usage_row` still returns a bool. `write_usage_row_outcome` returns
+`landed | failed | unstorable`, and `unstorable` (class 22, 54000, a bare
+`UnicodeEncodeError`, classified by the indexer's `poison_sqlstate`) is what
+the refusal coalescer drops instead of requeueing.
+
+
 ## The read-only consumer (#160)
 
 `/admin/performance` aggregates `usage_logs` and writes nothing. The SQL lives
@@ -143,14 +242,15 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   hand-written predicates agree until somebody adds a third marker to one of
   them.
 
-  It matches exactly eight things and nothing else: `over_quota: true` (the
+  It matches exactly nine things and nothing else: `over_quota: true` (the
   quota gate, #162, declared here ahead of the gate that writes it so the two
   land as one contract), `error = 'no_vault_assigned'`,
   `error = 'argument_not_encodable'`, the three vault-root quarantine
   markers the same admission gate writes (#199) —
   `error = 'vault_root_overlap'`, `error = 'vault_root_unexaminable'` and
   `error = 'vault_root_not_ready'` — and the rate controls' two (#188, #194),
-  `error = 'rate_limited'` and `error = 'argument_too_long'`. A broad match — `params ? 'error'`, or
+  `error = 'rate_limited'` and `error = 'argument_too_long'`, plus enforced
+  concurrency admission's `error = 'slot_timeout'` (#261; `enforce` only — a queue-mode overrun is not a refusal). A broad match — `params ? 'error'`, or
   `params->>'error' IS NOT NULL` — is wrong in a way that is invisible on the
   page: `_VAULT_REASSIGNED_MARKER`, `_CONFIRMATION_UNAVAILABLE_MARKER` and
   `_ANCHOR_LOST_AT_PUBLISH_MARKER` are written by tools whose bodies *ran*,
@@ -174,14 +274,15 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   string; a new value costs nothing and a shared one mis-measures in a
   direction nobody can see from the page.
 
-  **The register, as of #194.** Pre-body: `no_vault_assigned`,
+  **The register, as of #261.** Pre-body: `no_vault_assigned`,
   `argument_not_encodable`, the three vault-root quarantine markers
   `vault_root_overlap`, `vault_root_unexaminable` and `vault_root_not_ready`
   (#199), the boolean `over_quota` (#162), and the rate controls' two —
   `rate_limited` (either per-principal token bucket, with `rate_limit_scope`
   saying which) and `argument_too_long` (the declarative argument length cap),
   both written by gates that run *above* the tool body and neither of which
-  did any work at all (#188, #194). Post-body:
+  did any work at all (#188, #194), plus `slot_timeout` for an enforced tool
+  admission miss before quota. Post-body:
   `vault_assignment_changed`, `vault_confirmation_unavailable`,
   `vault_anchor_lost_at_publish`, `find_related`'s two operational
   failures, `related_source_not_found` and `related_source_not_embedded`, and
@@ -211,6 +312,98 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   deliberately **not** coalesced: it is refused below the general bucket, so
   its rate is already bounded by that bucket and a second mechanism would buy
   nothing.
+
+  `slot_timeout` uses the same coalescer and guarded refusal weight, with
+  `concurrency_scope` naming the saturated dimension and `queue_ms` recording
+  the measured wait. An immediate miss has a zero wait budget; positive waits
+  share one deadline. The admission gate precedes quota and opens no database
+  session while waiting. Its permit, once granted, covers quota, the body and
+  the audit tail, and is released even on cancellation. Only `enforce` writes
+  this marker; `queue` never does (below).
+
+  **Provenance: which mode and configuration wrote the row (#188 D8).**
+  Whenever `MCP_CONCURRENCY_MODE` is not `off`, **every** row `_tracked`
+  writes carries `params.concurrency = {"v": 2, "mode": "<mode>", "epoch":
+  "<12 hex>"}` — executed calls, unpressured calls, every pre-body refusal,
+  the coalesced `rate_limited` / `slot_timeout` templates, `tool_exception`
+  rows and writer-merged rows. It is stamped by one helper
+  (`_with_provenance`), and a coalescer template captures it **when the window
+  opens**, so a deferred flush carries the mode and epoch the refusal happened
+  under, not the ones live at flush time. `epoch` hashes every
+  `mcp_concurrency_*` setting except `mode`, plus the tool-class mapping
+  version: a mode change keeps it, any limit change moves it. The readiness
+  evaluator reads **only** rows where `params->'concurrency'->>'v' = '2'` and
+  requires one mode and one epoch per window, so a row without the object —
+  anything written before #188, or in `off` — is invisible to every count and
+  denominator rather than read as "no pressure". It is unconditional on
+  purpose: marking only pressured rows would leave the denominator undefined
+  (SR1-2).
+
+  **`concurrency_shadow` (schema 2)** is attached only to the existing real
+  usage row:
+
+  ```json
+  {"shadow": true, "schema": 2, "code": "auth_concurrency_limited",
+   "basis": "observed_occupancy_zero_wait",
+   "configured_wait_ms": {"transport": 2000, "tool": 5000},
+   "observations": [{"stage": "auth", "scope": "global", "limit": 2},
+                    {"stage": "tool", "scope": "light", "limit": 4}]}
+  ```
+
+  Observations are deduplicated, ordered by pipeline stage (request, auth,
+  tool, writer) and capped at four, and the deciding observation is never the
+  one truncated. Every shadow observation is a zero-wait capacity miss, so
+  `code` is the **earliest** stage's — `slot_timeout` for the tool stage,
+  `<stage>_concurrency_limited` otherwise. Before #188 it was the *last*
+  observation's, which under-reported tool pressure about 11× to anyone
+  counting by `code`; **tool pressure is counted from `observations`, never
+  from `code`** (the evaluator's containment test is `observations @>
+  [{"stage": "tool"}]`). `configured_wait_ms` reports the waits shadow did
+  *not* apply. Earlier calls still ran, so this is an occupancy projection,
+  not a replay of which requests enforcement would have admitted.
+
+  **`concurrency_queue` (schema 2)** is the queue-mode counterpart:
+
+  ```json
+  {"schema": 2, "overrun": true, "code": "slot_timeout",
+   "observations": [{"stage": "auth", "scope": "global", "limit": 2,
+                     "waited_ms": 40, "overrun": false},
+                    {"stage": "tool", "scope": "light", "limit": 4,
+                     "waited_ms": 5000, "overrun": true}]}
+  ```
+
+  Observations include ordinary waits (`waited_ms > 0`, `overrun: false`) and
+  overruns, ordered the same way. `code` is the earliest **overrun**'s, and
+  `null` when nothing overran: an ordinary wait never sets a code, so the
+  example's auth wait followed by a tool overrun reads `slot_timeout`.
+  Truncation keeps the earliest overrun even behind four earlier waits.
+
+  Both objects **annotate and never classify.** They replace no actual
+  `error`, `body_outcome` or quota field and enter neither `executed_sql` nor
+  `pre_body_refusal_sql`. A queue overrun whose body ran is executed work; an
+  overrun the quota gate then refused carries `over_quota: true` and is an
+  ordinary pre-body refusal. Request and auth observations reach a row only
+  when the request got as far as a tool call; transport pressure without one
+  goes to the bounded security event and the request-level
+  `concurrency_counters` instead of an invented, unattributed usage row.
+
+  **Timing keys.** `queue_ms` (the tool-stage wait) is recorded whenever the
+  mode is not `off` — zero in shadow, which never waits — and is what E4/E5
+  read in queue. `transport_queue_ms` (request plus auth wait, from
+  `APIKeyMiddleware`) is recorded in queue and enforce only. Both are plain
+  JSON numbers read through a `jsonb_typeof` guard.
+
+  Every `write_usage_row` caller, including background coalescer flushes,
+  acquires the shared writer permit before opening any database connection.
+  The permit covers initial insert, rollback and FK retry; the failed session
+  closes before the retry opens. The writer's own observation is merged into
+  the same row through the same stage-ordered function — never a second row.
+  Enforced writer-capacity failure returns `False`, counts `writer_refused`
+  and emits `usage_log_failed` with `reason=concurrency_capacity`; a queue
+  writer overrun **still writes the row** and counts `writer_overrun`.
+  Coalesced counts remain pending on either `False` or cancellation;
+  cancellation still propagates. Writer shadow pressure does not delay or drop
+  a row.
 
   **What the page does with that, concretely.** The per-tool refusal count on
   `/admin/performance` is `sum(1 + suppressed) FILTER (WHERE <the predicate>)`,
@@ -311,12 +504,23 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   the marker is a closed vocabulary this register enumerates, and the class
   name is not.
 
-  **In-band refusals outside this register stay unmarked** (residual R1).
-  `create_note` on an existing path, a path-validation refusal, a size refusal
-  and a write conflict each return a message and write an ordinary row, exactly
-  as they did before #192. That is deliberate: a typed outcome for every tool
-  return is a change of its own, and half-marking the set would leave the
-  register looking complete when it is not.
+  **Returned body outcomes are typed and post-body** (#263, closing R1).
+  `tool_outcomes.BodyOutcome` carries a closed marker, caller Refusal and
+  `refused`/`partial` disposition. Only the terminal result reaches the existing
+  usage row as `error` and `body_outcome`; constructing a discarded helper
+  outcome records nothing. The register is `BODY_MARKERS` in that module,
+  including the six write-precondition codes and broad `validation_failed`
+  where an existing ValueError catch cannot honestly name a narrower cause.
+  These markers do **not** join the pre-body predicate: the body ran and quota
+  admission already happened. Empty results, no-op edits, status lookups and
+  ordinary note text containing a forged sentinel stay successful. Structured
+  reads carry their outcome privately, outside their wire schema. A move that
+  committed its rename but lost rewrites or metadata repair is `partial`;
+  a later publication failure retains its existing usage-marker precedence
+  even when the caller needs the moved note's `concurrent_write` code.
+  Concurrency shadow metadata is namespaced separately and cannot replace an
+  actual error or create a second request. Body exceptions still take
+  `tool_exception` precedence; cancellation does not invent completion.
 
   Both halves are `COALESCE(..., false)`: `params` is nullable and `->>` on a
   missing key yields NULL, so without them the negation used by the executed

@@ -50,25 +50,23 @@ def test_embed_batch_takes_no_timeout_argument():
 @pytest.mark.asyncio
 async def test_a_batch_past_the_old_aggregate_budget_completes(monkeypatch):
     """Many chunks, each individually healthy, at a simulated latency whose
-    sum exceeds the retired 300 s budget.
-
-    400 chunks is 13 requests at `OLLAMA_BATCH_LIMIT`; none of them may inherit
-    a deadline from the ones before it.
-    """
-    requests: list[int] = []
-    # 400 chunks at a nominal 30 simulated seconds per request = 390 simulated
-    # seconds, well past the retired 300 s. The clock is faked rather than
-    # slept through: this must stay a unit test.
+    sum exceeds the retired 300 s budget."""
+    calls = {"n": 0}
+    # 400 chunks at one input per request (the pre-batching shape,
+    # `OLLAMA_EMBED_BATCH_SIZE=1`) × a nominal 1 s each = 400 simulated
+    # seconds, well past 300. The clock is faked rather than slept through:
+    # this must stay a unit test.
     fake_now = {"t": 0.0}
     monkeypatch.setattr(embeddings.time, "monotonic", lambda: fake_now["t"])
+    monkeypatch.setattr(embeddings.settings, "ollama_embed_batch_size", 1)
 
-    async def _post(payload_input, *, timeout):  # noqa: ARG001
-        requests.append(len(payload_input))
-        fake_now["t"] += 30.0
-        return [[0.1, 0.2, 0.3]] * len(payload_input)
+    async def _request(inputs):
+        calls["n"] += 1
+        fake_now["t"] += 1.0
+        return [[0.1, 0.2, 0.3] for _ in inputs]
 
     provider = embeddings.OllamaProvider()
-    monkeypatch.setattr(provider, "_post", _post)
+    monkeypatch.setattr(provider, "_embed_inputs", _request)
 
     out = await provider.embed_batch([f"chunk {i}" for i in range(400)])
 
@@ -79,18 +77,14 @@ async def test_a_batch_past_the_old_aggregate_budget_completes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_hung_request_still_fails_at_the_per_request_timeout(monkeypatch):
-    """The per-request bound is the liveness guarantee that replaces the
-    aggregate — and it is the *only* one, so it must still fire.
-
-    A one-chunk batch must still ask for exactly 30 s: that is the call this
-    provider made before batching existed, and its deadline may not drift.
-    """
-    async def _hangs(_payload_input, *, timeout):  # noqa: ARG001
+async def test_a_hung_chunk_still_fails_at_the_per_call_timeout(monkeypatch):
+    """The per-call bound is the liveness guarantee that replaces the
+    aggregate — and it is the *only* one, so it must still fire."""
+    async def _hangs(_inputs):
         await asyncio.sleep(3600)
 
     provider = embeddings.OllamaProvider()
-    monkeypatch.setattr(provider, "_post", _hangs)
+    monkeypatch.setattr(provider, "_embed_inputs", _hangs)
 
     real_wait_for = asyncio.wait_for
     seen: list[float] = []
@@ -106,7 +100,7 @@ async def test_a_hung_request_still_fails_at_the_per_request_timeout(monkeypatch
     with pytest.raises((asyncio.TimeoutError, TimeoutError)):
         await provider.embed_batch(["a"])
 
-    assert seen == [30.0], "the one-chunk request timeout must stay at 30 s"
+    assert seen == [30.0], "the per-request timeout must stay at 30 s"
 
 
 @pytest.mark.asyncio
@@ -118,10 +112,27 @@ async def test_partial_coverage_is_not_certified_on_the_certified_path(monkeypat
         def __init__(self):
             self.executed = []
             self.added = []
+            self.lookup_probes = 0
+            self.commits = 0
 
         async def execute(self, stmt, *_a, **_k):
+            # The chunk-reuse lookup's table probe (#281, D16) is the one
+            # statement allowed: it runs before the provider call, in a
+            # read-only transaction that is committed. Answering "no state
+            # table" disables reuse, so every chunk goes to the provider.
+            if "to_regclass" in str(stmt):
+                self.lookup_probes += 1
+
+                class _Absent:
+                    def scalar(self):
+                        return None
+
+                return _Absent()
             self.executed.append(stmt)
             raise AssertionError("no statement may run for a partial batch")
+
+        async def commit(self):
+            self.commits += 1
 
         def add(self, obj):
             self.added.append(obj)
@@ -157,4 +168,5 @@ async def test_partial_coverage_is_not_certified_on_the_certified_path(monkeypat
     assert result.failure.requested == result.chunks_submitted
     assert result.failure.received == result.chunks_submitted - 1
     assert session.executed == [] and session.added == []
+    assert session.lookup_probes == 1 and session.commits == 1
     assert note.embedded_content_hash == "old"

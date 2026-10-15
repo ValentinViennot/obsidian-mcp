@@ -1,0 +1,508 @@
+"""panel-csp (#195) — the templates are written to survive a nonce-only policy.
+
+Static checks over every file in `src/control_panel/templates/` and over
+`panel.js`; no app, no database. The header itself is tested through the real
+middleware stack in `tests/test_panel_csp_headers.py`; this module holds the
+markup to the contract that header relies on (design D1, D2, D6, D9):
+
+- no inline event handler, no `javascript:` URL, no `hx-` attribute;
+- every `<script>` and `<style>` carries the response nonce;
+- every script is same-origin under `/admin/static/`, every stylesheet link is
+  Google Fonts;
+- the eight destructive confirmations fail closed: a `type="button"` with
+  `data-confirm`, in a form with no other submit control;
+- `panel.js` never evaluates or renders markup from an attribute value.
+- no `style` attribute in any template, and no script that builds one
+  (panel-csp-style-attrs, #289: the policy carries `style-src-attr 'none'`).
+
+Jinja (`{# … #}`) and HTML (`<!-- … -->`) comments are stripped first, with
+their newlines kept so a failure still names the right line.
+"""
+import re
+from pathlib import Path
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[1]
+_TEMPLATES = _ROOT / "src" / "control_panel" / "templates"
+_STATIC = _ROOT / "src" / "control_panel" / "static"
+_PANEL_JS = _STATIC / "panel.js"
+
+_TRANSFER = {"transfer_upload.html", "transfer_download.html"}
+_PANEL_NONCE = 'nonce="{{ csp_nonce }}"'
+_TRANSFER_NONCE = 'nonce="{{ nonce }}"'
+
+_TEMPLATE_FILES = sorted(_TEMPLATES.glob("*.html"))
+
+# An opening tag, tolerant of `>` inside quoted attribute values.
+_TAG = re.compile(r"<([a-zA-Z][a-zA-Z0-9-]*)((?:[^>\"']|\"[^\"]*\"|'[^']*')*)>")
+
+
+def _blank(match: re.Match) -> str:
+    """Replace a match with whitespace of the same shape, keeping newlines."""
+    return re.sub(r"[^\n]", " ", match.group(0))
+
+
+def _strip_comments(text: str) -> str:
+    text = re.sub(r"\{#.*?#\}", _blank, text, flags=re.S)
+    return re.sub(r"<!--.*?-->", _blank, text, flags=re.S)
+
+
+def _strip_element_bodies(text: str) -> str:
+    """Blank the bodies of `<script>` and `<style>` elements.
+
+    Attribute checks look at markup only; JavaScript such as
+    `var onSystemChange = …` is not an HTML attribute.
+    """
+    def body(m: re.Match) -> str:
+        return m.group(1) + re.sub(r"[^\n]", " ", m.group(2)) + m.group(3)
+
+    return re.sub(
+        r"(?is)(<(?:script|style)\b[^>]*>)(.*?)(</(?:script|style)\s*>)", body, text
+    )
+
+
+def _line(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def _source(path: Path) -> str:
+    return _strip_comments(path.read_text())
+
+
+def _markup(path: Path) -> str:
+    return _strip_element_bodies(_source(path))
+
+
+def _ids(paths):
+    return [p.name for p in paths]
+
+
+def test_the_template_set_is_not_empty():
+    # A moved directory must not turn every check below into a vacuous pass.
+    assert len(_TEMPLATE_FILES) >= 20
+
+
+@pytest.mark.parametrize("path", _TEMPLATE_FILES, ids=_ids(_TEMPLATE_FILES))
+def test_no_inline_event_handler(path):
+    text = _markup(path)
+    offenders = [
+        f"{path.name}:{_line(text, m.start())}: {m.group(0).strip()}"
+        for m in re.finditer(r"\son[a-z]+\s*=", text, flags=re.I)
+    ]
+    assert offenders == []
+
+
+@pytest.mark.parametrize("path", _TEMPLATE_FILES, ids=_ids(_TEMPLATE_FILES))
+def test_no_javascript_url(path):
+    text = _markup(path)
+    offenders = [
+        f"{path.name}:{_line(text, m.start())}: {m.group(0).strip()}"
+        for m in re.finditer(
+            r"\b(?:href|src|action|formaction)\s*=\s*[\"']?\s*javascript:", text, flags=re.I
+        )
+    ]
+    assert offenders == []
+
+
+@pytest.mark.parametrize("path", _TEMPLATE_FILES, ids=_ids(_TEMPLATE_FILES))
+def test_no_htmx_attribute_or_reference(path):
+    text = _markup(path)
+    offenders = [
+        f"{path.name}:{_line(text, m.start())}: {m.group(0).strip()}"
+        for m in re.finditer(r"\s(?:data-)?hx-[a-z]", text, flags=re.I)
+    ]
+    source = _source(path)
+    offenders += [
+        f"{path.name}:{_line(source, m.start())}: references htmx"
+        for m in re.finditer(r"htmx", source, flags=re.I)
+    ]
+    assert offenders == []
+
+
+@pytest.mark.parametrize("path", _TEMPLATE_FILES, ids=_ids(_TEMPLATE_FILES))
+def test_every_script_and_style_carries_the_nonce(path):
+    expected = _TRANSFER_NONCE if path.name in _TRANSFER else _PANEL_NONCE
+    text = _source(path)
+    offenders = [
+        f"{path.name}:{_line(text, m.start())}: {m.group(0)}"
+        for m in _TAG.finditer(text)
+        if m.group(1).lower() in ("script", "style") and expected not in m.group(2)
+    ]
+    assert offenders == []
+
+
+@pytest.mark.parametrize("path", _TEMPLATE_FILES, ids=_ids(_TEMPLATE_FILES))
+def test_every_script_src_is_same_origin_static(path):
+    text = _source(path)
+    offenders = []
+    for m in _TAG.finditer(text):
+        if m.group(1).lower() != "script":
+            continue
+        src = re.search(r"\bsrc\s*=\s*[\"']([^\"']*)[\"']", m.group(2), flags=re.I)
+        if src and not src.group(1).startswith("/admin/static/"):
+            offenders.append(f"{path.name}:{_line(text, m.start())}: {src.group(1)}")
+    assert offenders == []
+
+
+@pytest.mark.parametrize("path", _TEMPLATE_FILES, ids=_ids(_TEMPLATE_FILES))
+def test_every_stylesheet_link_is_google_fonts(path):
+    text = _source(path)
+    offenders = []
+    for m in _TAG.finditer(text):
+        if m.group(1).lower() != "link":
+            continue
+        attrs = m.group(2)
+        if not re.search(r"\brel\s*=\s*[\"']?[^\"'>]*stylesheet", attrs, flags=re.I):
+            continue
+        href = re.search(r"\bhref\s*=\s*[\"']([^\"']*)[\"']", attrs, flags=re.I)
+        if not href or not href.group(1).startswith("https://fonts.googleapis.com/"):
+            offenders.append(f"{path.name}:{_line(text, m.start())}: {m.group(0)}")
+    assert offenders == []
+
+
+# --- D2: the eight confirm() controls fail closed ---------------------------
+
+# Where the eight pre-change `confirm()` controls live (spec: "The eight
+# existing confirm() controls MUST fail closed"). A ninth needs a deliberate
+# edit here; so does losing one.
+# #309 added a ninth: the "Confirm vault is empty" page's final control.
+_EXPECTED_CONFIRMS = {
+    "keys.html": 3,
+    "oauth.html": 2,
+    "settings.html": 1,
+    "user_edit.html": 2,
+    "empty_vault_confirm.html": 1,
+}
+
+
+def _type_of(attrs: str) -> str | None:
+    t = re.search(r"\btype\s*=\s*[\"']?([a-zA-Z]+)", attrs, flags=re.I)
+    return t.group(1).lower() if t else None
+
+
+def _submit_controls(form_body: str):
+    """Tags in a form body that would submit it: `type="submit"`, an image
+    input, or a `<button>` without a type (whose default is submit)."""
+    for m in _TAG.finditer(form_body):
+        name, attrs = m.group(1).lower(), m.group(2)
+        kind = _type_of(attrs)
+        if kind in ("submit", "image"):
+            yield m
+        elif name == "button" and kind is None:
+            yield m
+
+
+def _implicit_submitters(form_body: str):
+    """Fields through which Enter can submit a form with no submit button
+    (HTML implicit submission): any non-hidden `<input>`, `<select>` or
+    `<textarea>`. The eight confirm forms carry only the hidden CSRF field."""
+    for m in _TAG.finditer(form_body):
+        name, attrs = m.group(1).lower(), m.group(2)
+        if name in ("select", "textarea"):
+            yield m
+        elif name == "input" and _type_of(attrs) != "hidden":
+            yield m
+
+
+def test_the_eight_confirm_controls_are_where_the_spec_says():
+    counts = {}
+    for path in _TEMPLATE_FILES:
+        n = len(re.findall(r"\sdata-confirm\s*=", _markup(path)))
+        if n:
+            counts[path.name] = n
+    assert counts == _EXPECTED_CONFIRMS
+
+
+@pytest.mark.parametrize("path", _TEMPLATE_FILES, ids=_ids(_TEMPLATE_FILES))
+def test_confirm_controls_are_buttons_in_forms_with_no_other_submit(path):
+    text = _markup(path)
+    offenders = []
+    forms = [
+        (m.start(), m.end(), m.group(0))
+        for m in re.finditer(r"(?is)<form\b.*?</form\s*>", text)
+    ]
+    for m in _TAG.finditer(text):
+        if not re.search(r"\sdata-confirm\s*=", m.group(2)):
+            continue
+        where = f"{path.name}:{_line(text, m.start())}"
+        if m.group(1).lower() != "button" or _type_of(m.group(2)) != "button":
+            offenders.append(f"{where}: data-confirm must be on a <button type=\"button\">")
+        enclosing = [f for f in forms if f[0] <= m.start() < f[1]]
+        if not enclosing:
+            offenders.append(f"{where}: data-confirm control is not inside a <form>")
+            continue
+        start, _, body = enclosing[0]
+        for s in _submit_controls(body):
+            offenders.append(
+                f"{path.name}:{_line(text, start + s.start())}: "
+                f"submit control in a confirm-guarded form: {s.group(0)}"
+            )
+        for s in _implicit_submitters(body):
+            offenders.append(
+                f"{path.name}:{_line(text, start + s.start())}: "
+                f"a user-editable field lets Enter submit a confirm-guarded "
+                f"form without the confirm: {s.group(0)}"
+            )
+    assert offenders == []
+
+
+def test_the_other_confirmation_mechanisms_keep_native_submits():
+    # D2: the reset-embeddings modal and the re-embed page are their own
+    # confirmation step and keep a real submit button.
+    settings = _markup(_TEMPLATES / "settings.html")
+    reset = re.search(r'(?is)<form[^>]*action="/admin/settings/reset-embeddings".*?</form>', settings)
+    assert reset and 'type="submit"' in reset.group(0)
+    assert "data-confirm" not in reset.group(0)
+
+    reembed = _markup(_TEMPLATES / "reembed_confirm.html")
+    form = re.search(r'(?is)<form[^>]*action="/admin/settings/reembed".*?</form>', reembed)
+    assert form and 'type="submit"' in form.group(0)
+    assert "data-confirm" not in reembed
+
+
+def test_vault_hover_is_css():
+    text = _source(_TEMPLATES / "vault.html")
+    assert ".vault-crumb:hover" in text
+    assert ".vault-link:hover" in text
+
+
+# --- D1/D6: the client script -----------------------------------------------
+
+
+def test_panel_js_evaluates_and_renders_nothing():
+    js = _PANEL_JS.read_text()
+    for needle in ("eval(", "Function(", "innerHTML", "insertAdjacentHTML", "document.write"):
+        assert needle not in js, f"panel.js contains {needle}"
+
+
+def test_panel_js_is_loaded_by_base_with_the_nonce():
+    base = _source(_TEMPLATES / "base.html")
+    assert '<script src="/admin/static/panel.js" nonce="{{ csp_nonce }}" defer></script>' in base
+
+
+@pytest.mark.parametrize(
+    "attribute",
+    [
+        "data-confirm",
+        "data-modal-open",
+        "data-modal-close",
+        "data-modal-backdrop",
+        "data-autosubmit",
+        "data-copy-from",
+        "data-limit-edit",
+        "data-key-id",
+        "data-limit",
+        "data-sidebar-open",
+        "data-sidebar-close",
+        "data-async-reindex",
+    ],
+)
+def test_every_behaviour_attribute_has_a_listener_and_a_user(attribute):
+    # Seam check: a template attribute with no listener is a dead control,
+    # a listener with no template user is dead code.
+    assert attribute in _PANEL_JS.read_text()
+    assert any(
+        re.search(rf"\s{re.escape(attribute)}(?:\s*=|[\s>])", _markup(p)) for p in _TEMPLATE_FILES
+    ), f"no template uses {attribute}"
+
+
+def test_the_theme_toggle_listener_lives_in_the_bootstrap():
+    theme = _source(_TEMPLATES / "_theme.html")
+    assert "[data-theme-toggle]" in theme
+    assert "addEventListener('click'" in theme
+    assert "data-theme-toggle" in (_TEMPLATES / "_theme_toggle.html").read_text()
+
+
+def test_htmx_is_not_vendored():
+    assert not list(_STATIC.rglob("htmx*"))
+
+
+# --- panel-csp-style-attrs (#289) D7: no inline style attributes -------------
+#
+# The panel policy carries `style-src-attr 'none'`, so a `style=""` anywhere in
+# panel, auth or consent markup is refused by the browser and the element
+# silently loses its presentation. These gates keep the attribute out at the
+# source: in template markup (every branch of every Jinja conditional, since
+# the scan reads the template, not a render), in markup built by a script, and
+# in the vendored Chart.js. CSSOM (`el.style.*`, `style.setProperty`) is the
+# sanctioned dynamic path and is never flagged.
+
+_CHART_FILES = sorted((_STATIC / "vendor").glob("chart-*.umd.min.js"))
+
+# An attribute named `style`, preceded by whitespace, a quote, or the close of
+# a Jinja tag or expression (`%}style=`, `}}style=`). `data-style=`,
+# `:style=` and `<style ` are not matches.
+_STYLE_ATTR = re.compile(r"""(?:(?<=\s)|(?<=["'}]))style\s*=""", re.I)
+
+# `setAttribute` whose first argument is the literal name `style`.
+_SET_STYLE = re.compile(r"""setAttribute\s*\(\s*(["'`])style\1""", re.I)
+
+_SCRIPT_BODY = re.compile(r"(?is)<script\b[^>]*>(.*?)</script\s*>")
+
+
+def _style_attribute_offenders(name: str, text: str) -> list[str]:
+    """`file:line` for each `style` attribute in template text.
+
+    Comments are stripped and `<script>`/`<style>` bodies blanked first, so
+    JavaScript and CSS are never read as markup; newlines survive both, so
+    the line number is the file's.
+    """
+    markup = _strip_element_bodies(_strip_comments(text))
+    return [
+        f"{name}:{_line(markup, m.start())}: {markup[max(0, m.start() - 30):m.end() + 30].strip()}"
+        for m in _STYLE_ATTR.finditer(markup)
+    ]
+
+
+def _scan_js(js: str) -> tuple[list[tuple[int, str]], str]:
+    """`(literals, code)`: every string and template literal in `js` as
+    `(offset, body)`, and `js` with its `//` and `/* */` comments blanked
+    (newlines kept). A tokenizer, not a parser: regex literals are not
+    recognised, which is fine for the panel's own scripts."""
+    literals: list[tuple[int, str]] = []
+    code = list(js)
+    i, n = 0, len(js)
+    while i < n:
+        c = js[i]
+        if js.startswith("//", i) or js.startswith("/*", i):
+            if js[i + 1] == "/":
+                end = js.find("\n", i)
+                end = n if end == -1 else end
+            else:
+                end = js.find("*/", i + 2)
+                end = n if end == -1 else end + 2
+            for k in range(i, end):
+                if code[k] != "\n":
+                    code[k] = " "
+            i = end
+        elif c in "'\"`":
+            start, i = i, i + 1
+            while i < n and js[i] != c:
+                if js[i] == "\\":
+                    i += 1
+                elif c != "`" and js[i] == "\n":
+                    break  # unterminated: not a string after all
+                i += 1
+            literals.append((start, js[start + 1:i]))
+            i += 1
+        else:
+            i += 1
+    return literals, "".join(code)
+
+
+def _script_offenders(name: str, js: str) -> list[str]:
+    """A `style=` inside a string literal (markup built as a string), or a
+    `setAttribute` with the literal name `style`."""
+    literals, code = _scan_js(js)
+    offenders = [
+        f"{name}:{_line(js, offset)}: string literal builds a style attribute: {body[:60]!r}"
+        for offset, body in literals
+        if re.search(r"\bstyle\s*=", body, flags=re.I)
+    ]
+    offenders += [
+        f"{name}:{_line(code, m.start())}: setAttribute('style', …)"
+        for m in _SET_STYLE.finditer(code)
+    ]
+    return offenders
+
+
+def _template_scripts(path: Path):
+    """`(name, body)` for each inline `<script>` body, the body padded with
+    the newlines before it so a line number is the template's."""
+    text = _source(path)
+    for m in _SCRIPT_BODY.finditer(text):
+        pad = "\n" * text.count("\n", 0, m.start(1))
+        yield path.name, pad + m.group(1)
+
+
+@pytest.mark.parametrize("path", _TEMPLATE_FILES, ids=_ids(_TEMPLATE_FILES))
+def test_no_style_attribute_in_templates(path):
+    assert _style_attribute_offenders(path.name, path.read_text()) == []
+
+
+def test_no_script_builds_a_style_attribute():
+    offenders = _script_offenders(_PANEL_JS.name, _PANEL_JS.read_text())
+    for path in _TEMPLATE_FILES:
+        for name, body in _template_scripts(path):
+            offenders += _script_offenders(name, body)
+    assert offenders == []
+
+
+def test_chart_js_renders_no_markup_or_style_attribute():
+    """A tripwire on a Chart.js upgrade, not a proof: the enforce-mode
+    browser pass that renders every chart is the real check."""
+    assert _CHART_FILES, "no vendored chart-*.umd.min.js"
+    for path in _CHART_FILES:
+        text = path.read_text()
+        for needle in (
+            "innerHTML",
+            "insertAdjacentHTML",
+            'setAttribute("style"',
+            "setAttribute('style'",
+            "style=",
+        ):
+            assert needle not in text, f"{path.name} contains {needle}"
+
+
+# Self-tests: each spec-delta scenario, fed to the scanner as a synthetic
+# string. They prove the scanner, not the templates.
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        '<div style="margin:0">',
+        "<div class=\"a\" STYLE='margin:0'>",
+        '<tr {% if revoked %}style="opacity:0.5"{% endif %}>',
+        '<td class="x"{{ extra }}style="color:red">',
+        '<svg><polygon points="0,0" style="fill:var(--gem-facet)"/></svg>',
+    ],
+    ids=["static", "upper-case", "conditional", "after-expression", "svg"],
+)
+def test_the_template_scan_catches(markup):
+    offenders = _style_attribute_offenders("t.html", "<p>\n" + markup)
+    assert offenders and offenders[0].startswith("t.html:2:"), offenders
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        '<div class="a" data-style="x">',
+        '<style nonce="{{ csp_nonce }}">.a { color: red }</style>',
+        "<script nonce=\"n\">el.style.display = 'flex';</script>",
+        '{# <div style="margin:0"> #}',
+        '<!-- <div style="margin:0"> -->',
+    ],
+    ids=["data-attribute", "style-element", "cssom-in-script", "jinja-comment", "html-comment"],
+)
+def test_the_template_scan_passes(markup):
+    assert _style_attribute_offenders("t.html", markup) == []
+
+
+@pytest.mark.parametrize(
+    "js",
+    [
+        "el.setAttribute('style', 'display:none');",
+        'el.setAttribute( "style" , css);',
+        "row.innerHTML = '<td style=\"color:red\">' + v + '</td>';",
+        "var html = `<div style=\"${css}\">`;",
+    ],
+    ids=["setattribute-single", "setattribute-double", "markup-string", "template-literal"],
+)
+def test_the_script_scan_catches(js):
+    assert _script_offenders("x.js", js)
+
+
+@pytest.mark.parametrize(
+    "js",
+    [
+        "el.style.display = 'flex';",
+        "el.style.setProperty('width', pct + '%');",
+        "el.setAttribute('data-theme', choice);",
+        "// el.setAttribute('style', 'x');  and 'style=' in a comment\nel.style.opacity = '1';",
+    ],
+    ids=["cssom-write", "set-property", "other-attribute", "comment"],
+)
+def test_the_script_scan_passes(js):
+    assert _script_offenders("x.js", js) == []

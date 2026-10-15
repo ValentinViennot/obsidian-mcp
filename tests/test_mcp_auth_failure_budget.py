@@ -89,17 +89,28 @@ class _Session:
         sql = str(stmt)
         if sql.startswith("UPDATE"):
             return _Result()
+        # The user's `is_active`/`vault_path` ride the credential statement
+        # (performance-2026-09 D3), so each branch answers one row.
         if "FROM api_keys" in sql:
-            return _Result(scalar=self.api_key)
+            row = (
+                None
+                if self.api_key is None
+                else (self.api_key, self.user_active, "/vaults/probe")
+            )
+            return _Result(first=row)
         if "FROM oauth_tokens" in sql:
             row = (
                 None
                 if self.oauth is None
-                else (self.oauth, self.client_owner, self.client_name)
+                else (
+                    self.oauth,
+                    self.client_owner,
+                    self.client_name,
+                    self.user_active,
+                    "/vaults/probe",
+                )
             )
             return _Result(first=row)
-        if "FROM users" in sql:
-            return _Result(scalar=self.user_active)
         return _Result()
 
 
@@ -132,6 +143,7 @@ def _token(**kwargs):
         expires_at=kwargs.pop(
             "expires_at", datetime.now(timezone.utc) + timedelta(hours=1)
         ),
+        grant_issued_at=kwargs.pop("grant_issued_at", datetime.now(timezone.utc)),
     )
 
 
@@ -182,10 +194,9 @@ def _drive(
             mp.setattr(mcp_auth, "async_session", factory)
             mp.setattr(mcp_auth.settings, "multi_user_mode", multi_user, raising=False)
 
-            async def _warm(_session, _uid):
-                return None
-
-            mp.setattr(mcp_auth, "warm_user_vault_cache", _warm)
+            mp.setattr(
+                mcp_auth, "apply_user_vault_row", lambda _uid, _a, _v: None
+            )
             app = mcp_auth.APIKeyMiddleware(_downstream)
             await app(scope, _receive, _send)
         finally:
@@ -247,6 +258,17 @@ BRANCHES = [
         "no_vault_scope",
         dict(token="tok", session=_Session(oauth=_token(scope="offline_access"))),
     ),
+    (
+        "grant_lifetime_exceeded",
+        dict(
+            token="tok",
+            session=_Session(
+                oauth=_token(
+                    grant_issued_at=datetime.now(timezone.utc) - timedelta(days=400)
+                )
+            ),
+        ),
+    ),
 ]
 
 
@@ -299,8 +321,9 @@ def test_the_charge_sites_are_structural_not_remembered():
                     "to the failed-authentication budget"
                 )
 
-    assert blocks_with_401 == 11, (
-        f"expected 11 branches that answer 401, found {blocks_with_401} — "
+    # 12 since #326 added the grant-lifetime refusal on the OAuth branch.
+    assert blocks_with_401 == 12, (
+        f"expected 12 branches that answer 401, found {blocks_with_401} — "
         "if a branch was added or removed, say so here"
     )
 

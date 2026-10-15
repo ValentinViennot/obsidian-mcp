@@ -32,6 +32,7 @@ from src.models.db import NoteMetadata
 from src.services import indexer
 from src.services.fts import index_tsvector_sql
 import _harness
+import _poison
 
 pytestmark = [
     _harness.requires_pgvector,
@@ -159,44 +160,84 @@ async def test_a_term_past_the_old_slice_becomes_searchable(sessionmaker, vault)
     assert "Long.md" in await matches(sessionmaker, f"{NEEDLE}beyond")
 
 
-async def test_a_floor_failure_aborts_the_pass_with_nothing_committed(
-    sessionmaker, vault, caplog
-):
-    """The terminal behaviour is deliberately unchanged from before the change.
+@pytest_asyncio.fixture(loop_scope="module")
+async def poison_triggers(sessionmaker):
+    await _poison.install(sessionmaker)
+    yield
+    await _poison.uninstall(sessionmaker)
 
-    A statement that fails at the 100,000-character floor also failed at
-    `content[:100000]` before it. The pass aborts, nothing commits, and the
-    note's `content_hash` therefore does not advance — so the next tick retries
-    it rather than leaving a committed hash beside a stale keyword vector,
-    which is what the first draft's skip list would have done, permanently.
-    """
+
+async def _clean(sessionmaker, root) -> None:
     async with sessionmaker() as session:
         await session.execute(text("DELETE FROM note_links"))
         await session.execute(text("DELETE FROM notes_metadata"))
         await session.commit()
-    for f in vault.iterdir():
+    for f in root.iterdir():
         f.unlink()
 
-    # A NUL byte: PostgreSQL text cannot carry one, so the statement fails at
-    # every prefix length including the floor. A genuine driver-level failure,
-    # not a monkeypatched one.
-    (vault / "Bad.md").write_text("short body \x00 with a nul\n", encoding="utf-8")
+
+async def test_a_poison_floor_failure_quarantines_the_note_and_commits_the_rest(
+    sessionmaker, vault, poison_triggers, caplog
+):
+    """#308, D3: the incremental pass no longer aborts on a poison floor.
+
+    A genuine server-side failure (a trigger raising `program_limit_exceeded`
+    on this one note's keyword-vector UPDATE) fails at every prefix length,
+    the floor included. The note is quarantined — no row, so no committed hash
+    beside a stale keyword vector — and the pass re-runs and commits the rest.
+    Before #308 this test used a NUL note as its fixture; D1 now strips NUL,
+    so the failure has to be planted.
+    """
+    await _clean(sessionmaker, vault)
+    (vault / "Bad.md").write_text("short body that the server refuses\n", encoding="utf-8")
     (vault / "Good.md").write_text(NORMAL, encoding="utf-8")
+    await _poison.poison(sessionmaker, "tsvector", "Bad.md", "54000")
 
     with caplog.at_level("ERROR", logger="src.services.indexer"):
-        with pytest.raises(Exception):
-            await indexer.index_vault(user_id=None)
+        result = await indexer.index_vault(user_id=None)
 
-    # The failure really is the floor attempt, not something upstream of it.
-    assert [
-        r for r in caplog.records
-        if "at or below the 100000-character floor" in r.getMessage()
-    ], [r.getMessage() for r in caplog.records]
+    # The failure really is the keyword-vector write, not something upstream
+    # of it. A poison floor failure is reported by the quarantine's own ERROR
+    # only — the helper's floor `logger.exception`, whose driver text can
+    # quote the note, is not emitted for it (#308 review round 1, F4).
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        m.startswith("Quarantined Bad.md") and "keyword-vector" in m
+        for m in messages
+    ), messages
+    assert not any("at or below the 100000-character floor" in m for m in messages)
+    assert result.quarantined == ("Bad.md",)
+    async with sessionmaker() as session:
+        rows = (await session.execute(select(NoteMetadata.file_path))).scalars().all()
+    assert rows == ["Good.md"], "the rest commits; the poison note has no row"
+    assert "Good.md" in await matches(sessionmaker, NEEDLE)
+
+
+async def test_a_non_poison_floor_failure_still_aborts_the_pass(
+    sessionmaker, vault, poison_triggers, caplog
+):
+    """Outside the poison SQLSTATE set (here 55P03, lock_not_available) the
+    floor failure propagates exactly as before: nothing committed."""
+    await _clean(sessionmaker, vault)
+    (vault / "Bad.md").write_text("short body\n", encoding="utf-8")
+    (vault / "Good.md").write_text(NORMAL, encoding="utf-8")
+    await _poison.poison(sessionmaker, "tsvector", "Bad.md", "55P03")
+
+    with caplog.at_level("ERROR", logger="src.services.indexer"):
+        with pytest.raises(Exception) as excinfo:
+            await indexer.index_vault(user_id=None)
+    assert indexer.poison_sqlstate(excinfo.value) is None
+    # A non-poison floor failure keeps the helper's floor log (F4 is scoped
+    # to the quarantine path).
+    assert any(
+        "at or below the 100000-character floor" in r.getMessage()
+        for r in caplog.records
+    )
 
     async with sessionmaker() as session:
         rows = (await session.execute(select(NoteMetadata.file_path))).all()
-    assert rows == [], "a floor failure must leave the pass with nothing committed"
-
+    assert rows == [], "a non-poison floor failure leaves nothing committed"
+    assert indexer.quarantine_count() == 0
 
 # ── the full rebuild ────────────────────────────────────────────────────────
 def content_hash(body: str) -> str:
@@ -215,9 +256,11 @@ async def _seed_many(
 ):
     """`count` indexed notes on disk and in the table, tsvectors left NULL.
 
-    `bad_index` names the one note whose body cannot be turned into a tsvector
-    at any length. It sits **past 500** so the failure lands where the removed
-    intermediate commit used to be. `overrides` replaces individual bodies, with
+    `bad_index` names the one note whose keyword-vector UPDATE the server
+    refuses at any length — a trigger raising `program_limit_exceeded` (see
+    `_poison`; the caller installs the triggers). It used to be a NUL body,
+    which #308's D1 now strips. It sits **past 500** so the failure lands
+    where the removed intermediate commit used to be. `overrides` replaces individual bodies, with
     the row's `content_hash` following the file — the two must agree or the
     rebuild refuses to certify the row.
     """
@@ -234,8 +277,6 @@ async def _seed_many(
             name = f"n{i:04d}.md"
             if i in overrides:
                 body = overrides[i]
-            elif i == bad_index:
-                body = "body with a nul \x00 in it\n"
             else:
                 body = f"ordinary body number {i} mentioning {NEEDLE}\n"
             (root / name).write_text(body, encoding="utf-8")
@@ -244,10 +285,12 @@ async def _seed_many(
                 frontmatter={}, content_hash=content_hash(body),
             ))
         await session.commit()
+    if bad_index is not None:
+        await _poison.poison(sessionmaker, "tsvector", f"n{bad_index:04d}.md")
 
 
 async def test_a_floor_failure_past_the_old_commit_boundary_rolls_everything_back(
-    sessionmaker, vault
+    sessionmaker, vault, poison_triggers
 ):
     """`_rebuild_tsvectors_single_scope_for_tests` is atomic (D4).
 
@@ -261,8 +304,12 @@ async def test_a_floor_failure_past_the_old_commit_boundary_rolls_everything_bac
     await _seed_many(sessionmaker, vault, 600, bad_index=550)
 
     async with sessionmaker() as session:
-        with pytest.raises(Exception):
+        with pytest.raises(Exception) as excinfo:
             await indexer._rebuild_tsvectors_single_scope_for_tests(session, user_id=None)
+    # A poison SQLSTATE, and still fatal: the rebuild is excluded from the
+    # quarantine (#308, D3) and stays atomic.
+    assert indexer.poison_sqlstate(excinfo.value) == "54000"
+    assert indexer.quarantine_count() == 0
 
     async with sessionmaker() as session:
         written = (await session.execute(text(

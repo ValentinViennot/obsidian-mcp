@@ -128,15 +128,19 @@ _user_vault_cache: dict[int, Path] = {}
 async def warm_user_vault_cache(session, user_id: int | None = None) -> Path | None:
     """Populate `_user_vault_cache` for one user (or every active user).
 
-    Called by the indexer at the start of each multi-user pass, by the API-key
-    middleware after authenticating a user, and (in phase 4) by panel routes
-    before they hit vault tools. In single-user mode the cache is unused so
-    callers can skip the warmup; nothing breaks if they don't.
+    Called by the indexer at the start of each multi-user pass and by panel
+    routes before they hit vault tools. `APIKeyMiddleware` no longer calls it:
+    it reads the same two columns in its credential statement and applies them
+    through `apply_user_vault_row` below, which has this function's
+    single-user semantics exactly (performance-2026-09 D3). In single-user mode
+    the cache is unused so callers can skip the warmup; nothing breaks if they
+    don't.
 
     The **single-user form returns the freshly read root, or None** when the
-    user has no usable assignment. `APIKeyMiddleware` binds that answer to the
-    request via `current_vault_root`, which is what makes admission immune to
-    the bulk warm racing it — see `_vault_root`. The bulk form returns None.
+    user has no usable assignment. A caller binds that answer to the request
+    (the middleware via `current_vault_root`, from `apply_user_vault_row`),
+    which is what makes admission immune to the bulk warm racing it — see
+    `_vault_root`. The bulk form returns None.
     """
     from src.models.db import User
 
@@ -174,6 +178,32 @@ async def warm_user_vault_cache(session, user_id: int | None = None) -> Path | N
     for row in result.all():
         _user_vault_cache[row.id] = Path(row.vault_path)
     return None
+
+
+def apply_user_vault_row(
+    user_id: int, is_active: bool | None, vault_path: str | None
+) -> Path | None:
+    """Apply an already-read `users` row to the cache, exactly as the
+    single-user form of `warm_user_vault_cache` does, and return the root.
+
+    `APIKeyMiddleware` reads `users.is_active` and `users.vault_path` in the
+    credential statement itself (an outer join, performance-2026-09 D3) and
+    hands them here, instead of issuing a second read through
+    `warm_user_vault_cache`. The columns are still read fresh on every
+    request and the return value is still bound to the request via
+    `current_vault_root`, so #66's revocation-on-next-request holds.
+
+    Write-or-evict, identical to the warm's single-user predicate
+    (`is_active IS TRUE AND vault_path IS NOT NULL`): a NULL from the outer
+    join (the `users` row is gone), an inactive user or an unassigned vault
+    **evicts** the cached entry and returns None.
+    """
+    if is_active is not True or vault_path is None:
+        _user_vault_cache.pop(user_id, None)
+        return None
+    root = Path(vault_path)
+    _user_vault_cache[user_id] = root
+    return root
 
 
 def clear_user_vault_cache(user_id: int | None = None) -> None:
@@ -1989,10 +2019,18 @@ def note_title(frontmatter: dict | None, filename: str) -> str:
 
     Safe by the scrub's invariant: `_partition_frontmatter` has already removed
     anything `str()` would refuse, so nothing here can raise.
+
+    **U+0000 is removed from the result** (#308, D2): YAML's `"\\0"` escape
+    produces a NUL from NUL-free bytes, and PostgreSQL `text` cannot store one.
+    Removed here, in the one shared rule, so the indexer, `read_note`'s
+    metadata and `move_note` show the same title. A title that is nothing but
+    NULs falls back to the stem, as any other empty title does. The parsed
+    frontmatter mapping itself is not touched.
     """
     value = _title_value((frontmatter or {}).get("title"))
-    stem = os.path.splitext(filename)[0]
-    return str(value or stem)[:TITLE_MAX_CHARS]
+    stem = os.path.splitext(filename)[0].replace("\x00", "")
+    rendered = str(value).replace("\x00", "") if value else ""
+    return (rendered or stem)[:TITLE_MAX_CHARS]
 
 
 def _decode_note_bytes(data: bytes) -> str:
@@ -3956,7 +3994,9 @@ def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None,
     return new_text, None
 
 
-def extract_tags(body: str, frontmatter: dict) -> list[str]:
+def extract_tags(
+    body: str, frontmatter: dict, *, dropped: list[int] | None = None
+) -> list[str]:
     """Extract tags from a parsed frontmatter mapping and the body's inline #tags.
 
     **`body` is the post-frontmatter body, not the raw note.** Every caller has
@@ -3980,6 +4020,17 @@ def extract_tags(body: str, frontmatter: dict) -> list[str]:
     Precondition: `frontmatter` comes from the shared parser, so its values are
     already representable. Do not call this with a mapping straight out of
     `yaml.safe_load`.
+
+    **Two normalizations for the database's sake** (#308, D2), shared by every
+    surface: U+0000 is removed from each tag (a YAML `"\\0"` escape makes one
+    from NUL-free bytes), and a tag whose UTF-8 encoding exceeds
+    `MAX_TAG_BYTES` is dropped — `notes_metadata.tags` has a GIN index, and
+    one key over ~2.7 KB fails the row with 54000, taking the note's whole
+    index entry with it for the sake of one tag. The byte size of each dropped
+    tag is appended to `dropped` when the caller passes a list: the indexer
+    does, and logs one WARNING naming the note. The read path does not, so
+    `read_note` cannot be driven to write a log line per call (#190's rule
+    for request-path modules).
     """
     tags = set()
     # `frontmatter` MUST be a mapping from the shared parser, which has already
@@ -4021,7 +4072,7 @@ def extract_tags(body: str, frontmatter: dict) -> list[str]:
         tag = match.group(1).rstrip("/")
         if _is_tag(tag):
             tags.add(tag)
-    return sorted(tags)
+    return sorted(_bounded_tags(tags, dropped))
 
 
 def _clean_frontmatter_tag(value: str) -> list[str]:
@@ -4194,3 +4245,20 @@ def _mask_indented_code(masked: str) -> str:
         at = end
     out.append(masked[at:])
     return "".join(out)
+
+
+MAX_TAG_BYTES = 1024
+
+
+def _bounded_tags(tags, dropped: list[int] | None = None) -> set[str]:
+    """`tags` with NUL removed and over-long tags dropped (see `extract_tags`)."""
+    out: set[str] = set()
+    for tag in tags:
+        tag = tag.replace("\x00", "")
+        size = len(tag.encode("utf-8", "surrogatepass"))
+        if size > MAX_TAG_BYTES:
+            if dropped is not None:
+                dropped.append(size)
+            continue
+        out.add(tag)
+    return out

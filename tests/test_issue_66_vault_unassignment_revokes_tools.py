@@ -230,7 +230,7 @@ def test_single_user_mode_passes_the_gate(cold_cache):
     multi-user cache is completely empty."""
     ran = {}
 
-    @tools._tracked("fake_tool", ["q"])
+    @tools._tracked("fake_tool", ["q"], resource_class="light")
     async def fake_tool(q: str) -> str:
         ran["yes"] = True
         return "served"
@@ -260,7 +260,7 @@ def test_warm_cache_makes_an_assigned_user_pass(as_unassigned_user, tmp_path):
     cache the body runs. Guards against a gate that refuses everyone."""
     ran = {}
 
-    @tools._tracked("fake_tool", [])
+    @tools._tracked("fake_tool", [], resource_class="light")
     async def fake_tool() -> str:
         ran["yes"] = True
         return "served"
@@ -433,9 +433,14 @@ def test_stale_bulk_warm_cannot_readmit_a_revoked_user(as_unassigned_user):
 
 
 class _MiddlewareSession:
-    """Answers the four statements `APIKeyMiddleware` issues on the API-key
-    path, dispatching on the rendered SQL so the test does not depend on
-    call order."""
+    """Answers the statements `APIKeyMiddleware` issues on the API-key path,
+    dispatching on the rendered SQL so the test does not depend on call order.
+
+    The user's `is_active` and `vault_path` ride the credential statement
+    (performance-2026-09 D3): one joined row, `(key, is_active, vault_path)`,
+    where `vault_path` is None unless `vault_row` is given — the same answer
+    the separate warm query gave by returning no row.
+    """
 
     def __init__(self, api_key, user_active=True, vault_row=None):
         self.api_key = api_key
@@ -452,16 +457,18 @@ class _MiddlewareSession:
     async def commit(self):
         self.committed = True
 
+    def _vault_path(self):
+        return self.vault_row.vault_path if self.vault_row else None
+
     async def execute(self, stmt):
         sql = str(stmt)
-        if sql.startswith("UPDATE"):
+        if sql.startswith("UPDATE") or sql.startswith("SET LOCAL"):
             return _EmptyResult()
-        if "vault_path" in sql:
-            return _RowsResult([self.vault_row] if self.vault_row else [])
         if "FROM api_keys" in sql:
-            return _RowsResult([self.api_key])
-        # select(User.is_active)
-        return _ScalarResult(self.user_active)
+            return _RowsResult(
+                [(self.api_key, self.user_active, self._vault_path())]
+            )
+        raise AssertionError(f"unexpected statement: {sql}")
 
 
 class _ScalarResult:
@@ -666,17 +673,21 @@ class _OAuthMiddlewareSession(_MiddlewareSession):
         sql = str(stmt)
         if sql.startswith("UPDATE"):
             return _EmptyResult()
-        if "vault_path" in sql:
-            return _RowsResult([self.vault_row] if self.vault_row else [])
         if "FROM oauth_tokens" in sql:
-            # One statement joins `oauth_clients`, so the middleware reads
-            # `(token, client_owner, client_name)` with `.first()` — the owner
-            # for the cross-user check, the name for the denormalised
-            # `usage_logs` actor label (issue #77).
-            return _RowsResult(
-                [(self.api_key, self.client_owner, "Snapshot Test Client")]
-            )
-        return _ScalarResult(self.user_active)
+            # One statement joins `oauth_clients` and `users`, so the
+            # middleware reads `(token, client_owner, client_name, is_active,
+            # vault_path)` with `.first()` — the owner for the cross-user
+            # check, the name for the denormalised `usage_logs` actor label
+            # (issue #77), the user's columns for the refusal and the vault
+            # binding (performance-2026-09 D3).
+            return _RowsResult([(
+                self.api_key,
+                self.client_owner,
+                "Snapshot Test Client",
+                self.user_active,
+                self._vault_path(),
+            )])
+        raise AssertionError(f"unexpected statement: {sql}")
 
 
 def _run_middleware(credential, *, token_value, downstream=None, oauth=False,
@@ -777,6 +788,7 @@ def test_middleware_rejects_an_ownerless_oauth_token_in_multi_user_mode(
     from src.models.db import OAuthToken
 
     tok = OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=11,
         token_hash="x",
         token_type="access",
@@ -880,7 +892,7 @@ def test_admission_gate_issues_no_database_statements(cold_cache, tmp_path):
 
     ran = {}
 
-    @tools._tracked("fake_tool", [])
+    @tools._tracked("fake_tool", [], resource_class="light")
     async def fake_tool() -> str:
         ran["yes"] = True
         return "served"
@@ -940,6 +952,7 @@ def _oauth_token(user_id=UNASSIGNED_UID, scope="readwrite"):
     from src.models.db import OAuthToken
 
     return OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=21,
         token_hash="x",
         token_type="access",
@@ -1091,6 +1104,10 @@ class _RecordingSession:
     def add(self, obj):
         self.added.append(obj)
 
+    async def execute(self, stmt, *_a, **_kw):
+        # `_insert_usage`'s `SET LOCAL synchronous_commit = off`.
+        return None
+
     async def commit(self):
         self.commits += 1
 
@@ -1134,7 +1151,9 @@ def test_refused_call_persists_a_usage_log_row(as_unassigned_user):
     assert isinstance(row.duration_ms, int) and row.duration_ms >= 0
 
     # Exactly the tool's allow-list plus the marker — a refusal must not become
-    # a new disclosure channel, and the marker must actually be persisted.
+    # a new disclosure channel, and the marker must actually be persisted. The
+    # one addition is the #188 row provenance (mode and settings epoch only).
+    assert row.params.pop("concurrency")["v"] == 2
     assert row.params == {
         "folder": "Private",
         "limit": 50,
@@ -1149,7 +1168,7 @@ def test_successful_call_persists_no_error_marker(as_unassigned_user, tmp_path):
     shape *without* the marker, so the marker means what it says."""
     from src.models.db import UsageLog
 
-    @tools._tracked("fake_tool", ["q"])
+    @tools._tracked("fake_tool", ["q"], resource_class="light")
     async def fake_tool(q: str) -> str:
         return "served"
 
@@ -1167,5 +1186,6 @@ def test_successful_call_persists_no_error_marker(as_unassigned_user, tmp_path):
     row = recording.added[0]
     assert isinstance(row, UsageLog)
     assert row.tool == "fake_tool"
+    assert row.params.pop("concurrency")["v"] == 2  # #188 row provenance
     assert row.params == {"q": "hello"}
     assert "error" not in row.params

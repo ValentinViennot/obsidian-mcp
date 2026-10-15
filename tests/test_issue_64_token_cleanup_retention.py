@@ -48,8 +48,22 @@ class _FrozenDatetime(datetime.datetime):
         return FROZEN_NOW if tz is None else FROZEN_NOW.astimezone(tz)
 
 
+class _Scalars:
+    def all(self):
+        return []
+
+
 class _Result:
     rowcount = 0
+
+    def scalars(self):
+        """The client-expiry sweep (#194) reads its candidates with a SELECT.
+
+        An empty candidate set is the right answer for this module: these cases
+        are about the code/token/session DELETEs, and the sweep then does
+        nothing — `statement_for` below ignores its SELECT for the same reason.
+        """
+        return _Scalars()
 
 
 class _RecordingSession:
@@ -84,7 +98,11 @@ def run_cleanup(monkeypatch) -> _RecordingSession:
 
 def statement_for(session, entity) -> Delete:
     for stmt in session.statements:
-        assert isinstance(stmt, Delete), stmt
+        # The client-expiry sweep (#194) issues a SELECT of its own; this
+        # module is about the DELETEs, so anything else is skipped rather than
+        # rejected.
+        if not isinstance(stmt, Delete):
+            continue
         if stmt.table.name == entity.__tablename__:
             return stmt
     raise AssertionError(f"no DELETE emitted for {entity.__name__}")
@@ -115,19 +133,20 @@ def test_the_cutoff_is_seven_days_before_now(monkeypatch):
     assert params == {"expires_at_1": EXPECTED_CUTOFF}
 
 
-def test_auth_code_cleanup_is_deliberately_unchanged(monkeypatch):
-    """A used code is spent immediately and has no history value.
+def test_auth_code_cleanup_retains_spent_codes_until_seven_days_past_expiry(monkeypatch):
+    """A spent code carries the lineage a replay revokes (#325).
 
-    Pinned so the fix above is visibly scoped to tokens: an editor who
-    "simplified" both branches together would drop the `used` disjunct and
-    leave spent codes in the table until their expiry.
+    This used to pin `expires_at < cutoff OR used` — "a used code is spent
+    immediately and has no history value". It has one now: `oauth_codes.
+    grant_id` names the family its exchange issued, and a replay of the spent
+    code (RFC 6749 §4.1.2) revokes that family. So codes follow the token
+    rule exactly: one comparison on `expires_at`, spent or not, which keeps a
+    spent code for at least seven days after it was spent.
     """
     session = run_cleanup(monkeypatch)
     where = statement_for(session, OAuthCode).whereclause
 
-    assert where.compare(
-        or_(OAuthCode.expires_at < EXPECTED_CUTOFF, OAuthCode.used == True)  # noqa: E712
-    )
+    assert where.compare(OAuthCode.expires_at < EXPECTED_CUTOFF)
 
 
 # --- what that predicate does to actual rows ------------------------------

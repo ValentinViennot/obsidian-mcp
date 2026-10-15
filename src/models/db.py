@@ -1,4 +1,5 @@
 import datetime
+import uuid
 from typing import ClassVar
 
 from pgvector.sqlalchemy import Vector
@@ -19,7 +20,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from src.config import settings
@@ -376,6 +377,41 @@ _TEMPORAL_VALIDITY_COLUMN_MARKER = (
     "embedding validity interval (026_temporal_embeddings)"
 )
 
+# Same device, same rule: byte identical to `COLUMN_MARKER` in
+# `alembic/versions/025_oauth_client_last_used.py`.
+_OAUTH_CLIENT_LAST_USED_COLUMN_MARKER = (
+    "client use marker, stamped at code and token issuance "
+    "(025_oauth_client_last_used)"
+)
+
+# Same device, same rule: byte identical to `CODE_GRANT_MARKER` and
+# `ISSUED_AT_MARKER` in `alembic/versions/029_oauth_grant_lifetime.py`.
+_OAUTH_CODE_GRANT_ID_COLUMN_MARKER = (
+    "grant family the exchange of this code issued (029_oauth_grant_lifetime)"
+)
+_OAUTH_GRANT_ISSUED_AT_COLUMN_MARKER = (
+    "grant family issuance time, inherited by rotation (029_oauth_grant_lifetime)"
+)
+
+# Same device, same rule: byte identical to `MARKER` in
+# `alembic/versions/026_note_stat_columns.py`, stamped on each of the four
+# `notes_metadata.stat_*` columns (#282).
+_NOTE_STAT_COLUMN_MARKER = (
+    "stat of the bytes content_hash was computed from (026_note_stat_columns)"
+)
+# Migration 030's marker on `notes_metadata.derived_under`, byte identical to
+# its `MARKER`; declared as the column comment so `alembic check` compares it.
+_DERIVED_UNDER_COLUMN_MARKER = "re-derive progress digest (030_note_derived_under)"
+# The all-or-none CHECK over those four columns. The predicate is the
+# migration's `STAT_PREDICATE`, byte for byte.
+_NOTE_STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
+_NOTE_STAT_PREDICATE = (
+    "(stat_size IS NULL AND stat_mtime_ns IS NULL "
+    "AND stat_ctime_ns IS NULL AND stat_ino IS NULL) OR "
+    "(stat_size IS NOT NULL AND stat_mtime_ns IS NOT NULL "
+    "AND stat_ctime_ns IS NOT NULL AND stat_ino IS NOT NULL)"
+)
+
 
 class UsageLog(Base):
     __tablename__ = "usage_logs"
@@ -517,9 +553,56 @@ class NoteMetadata(Base):
         server_default=text("false"),
         comment=_CHUNKS_TRUNCATED_COLUMN_MARKER,
     )
-    content_tsvector: Mapped[str | None] = mapped_column(TSVECTOR, nullable=True)
+    # Deferred with raise-on-load (#280, design D5). No read path renders the
+    # tsvector: `keyword_search` uses it only server-side (`@@`, `ts_rank_cd`),
+    # and every writer is SQL text or `insert().values`, which deferral does
+    # not touch. Raise, not lazy-load: under `AsyncSession` a lazy load is an
+    # implicit-IO error anyway, and raising names the offending access in a
+    # test instead of surfacing as `MissingGreenlet` in production. A reader
+    # that genuinely needs it selects the column explicitly.
+    content_tsvector: Mapped[str | None] = mapped_column(
+        TSVECTOR, nullable=True, deferred=True, deferred_raiseload=True
+    )
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     modified_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The `(size, mtime_ns, ctime_ns, inode)` of the descriptor whose bytes
+    # produced `content_hash`, taken *before* the read (#282, migration 026).
+    # All NULL or all set (the CHECK below); NULL means "read and hash this
+    # file on the next pass" — a racy stat, a stat never recorded, and every
+    # row `move_note` rewrote. The scan skips a file's read only when all four
+    # equal its current stat; see "The stat shortcut" in
+    # docs/architecture/indexing-and-embeddings.md. Not `file_size` /
+    # `modified_at`, which keep their display meaning and whose microsecond
+    # precision is too coarse to compare. `stat_ino` is the inode
+    # reinterpreted as signed 64-bit.
+    stat_size: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment=_NOTE_STAT_COLUMN_MARKER
+    )
+    stat_mtime_ns: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment=_NOTE_STAT_COLUMN_MARKER
+    )
+    stat_ctime_ns: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment=_NOTE_STAT_COLUMN_MARKER
+    )
+    stat_ino: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment=_NOTE_STAT_COLUMN_MARKER
+    )
+    # Re-derive progress (#311, migration 030). SHA-256 hex of the root facts
+    # a **re-deriving** pass observed (assignment, real path, handle — the
+    # provenance stamp's triple) bound to this row's own `file_path`,
+    # `content_hash` and `extraction_version`; see
+    # `src.services.indexer.derived_under_digest`. Only a re-deriving pass's
+    # tail writes it non-NULL, for rows it fully derived. Every other write of
+    # the row's derived state or of its link rows' extracted state sets it
+    # NULL, and NULL means "not derived under the current root". A repeated
+    # re-derive skips rows whose marker matches the digest it expects; the
+    # provenance stamp is recorded only when every surviving row matches.
+    # No default and no backfill: a backfill would assert a derivation the
+    # migration never observed. See "Re-derive progress (#311)" in
+    # docs/architecture/indexing-and-embeddings.md.
+    derived_under: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_DERIVED_UNDER_COLUMN_MARKER
+    )
     indexed_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -535,6 +618,12 @@ class NoteMetadata(Base):
     )
     user: Mapped["User | None"] = relationship(back_populates="notes")
 
+    # Migration 027 sets `autovacuum_vacuum_scale_factor = 0.02` and
+    # `autovacuum_vacuum_insert_scale_factor = 0.02` on this table (#283, D17),
+    # so autovacuum keeps the dead tuples, the visibility map and the GIN
+    # metapage statistics current. They are storage parameters, which Alembic
+    # does not compare and this model cannot declare; the schema gate asserts
+    # them through `pg_class.reloptions`.
     __table_args__ = (
         # NULLS NOT DISTINCT so single-user-mode rows (user_id IS NULL)
         # collide on file_path alone and the indexer's upsert fires.
@@ -547,6 +636,9 @@ class NoteMetadata(Base):
         ),
         Index("ix_notes_metadata_tsvector", "content_tsvector", postgresql_using="gin"),
         Index("ix_notes_metadata_tags", "tags", postgresql_using="gin"),
+        # Migration 026. Alembic does not compare CHECK predicates; the schema
+        # gate asserts this one through `pg_constraint`.
+        CheckConstraint(_NOTE_STAT_PREDICATE, name=_NOTE_STAT_CHECK_NAME),
     )
 
 
@@ -589,15 +681,16 @@ class NoteEmbedding(Base):
 
     note: Mapped["NoteMetadata"] = relationship(back_populates="embeddings")
 
+    # The vector index is deliberately **not** declared here (#283, migration
+    # 027). It is the half-precision expression index
+    # `ix_note_embeddings_embedding_halfvec_hnsw` over
+    # `(embedding::halfvec(D)) halfvec_cosine_ops`, defined once in
+    # `src/services/vector_index.py`, built only when D <= 2000, excluded from
+    # autogenerate by `alembic/env.py`'s `include_object`, and verified by the
+    # schema gate through the catalogue. 008's `vector_cosine_ops` index that
+    # used to be declared here is dropped by 027.
     __table_args__ = (
         Index("ix_note_embeddings_note_id", "note_id"),
-        Index(
-            "ix_note_embeddings_embedding_hnsw",
-            "embedding",
-            postgresql_using="hnsw",
-            postgresql_ops={"embedding": "vector_cosine_ops"},
-            postgresql_with={"m": "16", "ef_construction": "64"},
-        ),
         # `valid_to` leads because every temporal predicate filters on it and
         # most filter on nothing else. Deliberately not partial on
         # `valid_to IS NULL`: today every row is current, so that index would
@@ -638,7 +731,42 @@ class NoteLink(Base):
 
 
 class OAuthClient(Base):
+    """One RFC 7591 dynamic registration.
+
+    ## Why `last_used_at` exists
+
+    `/register` is unauthenticated by design, so nothing but the maintenance
+    sweep bounds this table — and the sweep needs to know whether a
+    registration has ever been used. **No column that already existed can say
+    that**, which is why 025 added one rather than deriving the answer:
+
+    * `user_id` is the first authorizing user, but it is NULL for **every**
+      client in a single-user deployment — the configuration `DEPLOYMENT.md`
+      walks a new operator through — so "no owner" cannot mean "never used".
+    * Child rows cannot mean it either. An `OAuthCode`, spent or not, and an
+      `OAuthToken` are each deleted seven days after they expire (until 029 a
+      **used** code was deleted the moment it was spent). A client that was genuinely used,
+      whose grant was revoked and whose rows aged out, is indistinguishable
+      from one that never was.
+    * `usage_logs.actor_ref` survives credential deletion by design, but it
+      records *tool calls*, not issuance, so a client that authorized and never
+      called a tool has no row there.
+
+    The column is stamped in the same transaction that inserts an `OAuthCode`
+    at consent approval and again at each token issuance (code exchange and
+    refresh). Migration 025 stamped **every** row that existed when it ran, so
+    `last_used_at IS NULL` can only mean "registered after 025 and never
+    used" — the sweep therefore only ever acts on a registration whose entire
+    history is visible to it. The absence of child rows is still required as a
+    second, independent guard; see
+    `docs/architecture/oauth-and-grants.md`.
+    """
+
     __tablename__ = "oauth_clients"
+
+    # 025's ownership marker, reachable from the class so a caller checking
+    # model/migration agreement names the column it is checking.
+    _LAST_USED_COLUMN_MARKER: ClassVar[str] = _OAUTH_CLIENT_LAST_USED_COLUMN_MARKER
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int | None] = mapped_column(
@@ -656,6 +784,14 @@ class OAuthClient(Base):
     scope: Mapped[str] = mapped_column(String(50), nullable=False, default="read")
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+    # Nullable and with **no server default**, both load-bearing: NULL is the
+    # value that means "never used", and a default would hand every fresh
+    # registration a use it has not had. See the class docstring and 025.
+    last_used_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=_OAUTH_CLIENT_LAST_USED_COLUMN_MARKER,
     )
 
     user: Mapped["User | None"] = relationship(back_populates="oauth_clients")
@@ -686,6 +822,16 @@ class OAuthCode(Base):
     code_challenge_method: Mapped[str] = mapped_column(String(10), nullable=False, default="S256")
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used: Mapped[bool] = mapped_column(Boolean, default=False)
+    # The grant family this code's exchange issued (migration 029, #325).
+    # Written in the same transaction that sets `used = True` and inserts the
+    # tokens, so a replay of the spent code can revoke exactly that family
+    # (RFC 6749 §4.1.2). NULL means "unspent", or "spent before 029 / by a
+    # pre-029 process during a rollout" — a replay of such a code refuses and
+    # revokes nothing. No default, no index (codes are looked up by
+    # `code_hash`), no FK (there is no grants table).
+    grant_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_OAUTH_CODE_GRANT_ID_COLUMN_MARKER
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -834,6 +980,25 @@ class OAuthToken(Base):
     # in #64 was explicit that a nullable grant_id with a fallback "find the
     # family" path is how this bug comes back.
     grant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # When the grant family was first issued (migration 029, #326): the code
+    # exchange's time, copied verbatim from the locked refresh row by every
+    # rotation — the same inheritance rule `grant_id` follows — so it is
+    # uniform across a family and rotation never restarts the clock. The
+    # family's absolute deadline is this plus `OAUTH_GRANT_ABSOLUTE_LIFETIME_
+    # DAYS`, derived at use (`src/oauth/grants.py:grant_deadline`).
+    #
+    # The server default exists **only** so a process still running the
+    # previous image during a rolling deploy can insert a token without a NOT
+    # NULL violation. Application code must never rely on it: a mint site that
+    # forgot to copy the value would silently restart the family's clock,
+    # which is #326 again. `tests/test_oauth_grant_lifetime.py` requires every
+    # `OAuthToken(` construction under `src/` to pass it explicitly.
+    grant_issued_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment=_OAUTH_GRANT_ISSUED_AT_COLUMN_MARKER,
+    )
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
@@ -1278,4 +1443,114 @@ class UserSession(Base):
         # revoked_at < cutoff)` on every indexer tick.
         Index("ix_user_sessions_expires_at", "expires_at"),
         {"comment": _USER_SESSIONS_TABLE_MARKER},
+    )
+
+
+# ── migration 028: durable concurrency counters and run coverage (#188) ──
+#
+# Ownership markers, mirrored for the reason 019's through 024's are: `alembic
+# check` compares a table comment. Keep byte identical to `COUNTERS_MARKER` /
+# `RUNS_MARKER` in `alembic/versions/028_concurrency_counters.py`.
+_CONCURRENCY_COUNTERS_TABLE_MARKER = (
+    "event-time minute concurrency counters (028_concurrency_counters)"
+)
+_CONCURRENCY_RUNS_TABLE_MARKER = (
+    "one row per process run, coverage watermark (028_concurrency_counters)"
+)
+
+# The closed sets the CHECKs enforce. Mirrors `concurrency.METRICS` and the
+# `MCP_CONCURRENCY_MODE` literal; the schema gate pins all three together.
+CONCURRENCY_MODES = ("off", "shadow", "queue", "enforce")
+CONCURRENCY_METRICS = (
+    "requests",
+    "transport_pressured",
+    "transport_waited",
+    "transport_overrun",
+    "transport_refused",
+    "writer_overrun",
+    "writer_refused",
+    "pool_checkout_timeout",
+    "pool_high_water",
+    "transport_wait_max_ms",
+)
+
+
+def _closed_set(column: str, values) -> str:
+    return f"{column} IN (" + ", ".join(f"'{v}'" for v in values) + ")"
+
+
+class ConcurrencyCounter(Base):
+    """One event-time minute of one concurrency metric (design D8, #188).
+
+    `bucket_start` is the minute the event **happened** in, never the flush
+    time, and a failed flush merges back under the original key — so an
+    incident at 12:00:50 flushed at 12:01:10 stays in 12:00. Written only by
+    `src.services.concurrency_counters.flush`, one multi-row upsert per 60 s.
+    `max_value` is NULL except for the gauges (`pool_high_water`,
+    `transport_wait_max_ms`), where it is the bucket maximum.
+    """
+
+    __tablename__ = "concurrency_counters"
+    _TABLE_MARKER: ClassVar[str] = _CONCURRENCY_COUNTERS_TABLE_MARKER
+
+    bucket_start: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True
+    )
+    epoch: Mapped[str] = mapped_column(Text, primary_key=True)
+    mode: Mapped[str] = mapped_column(Text, primary_key=True)
+    metric: Mapped[str] = mapped_column(Text, primary_key=True)
+    count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    max_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            _closed_set("mode", CONCURRENCY_MODES), name="ck_concurrency_counters_mode"
+        ),
+        CheckConstraint(
+            _closed_set("metric", CONCURRENCY_METRICS),
+            name="ck_concurrency_counters_metric",
+        ),
+        # The window scan and the 35-day prune.
+        Index("ix_concurrency_counters_bucket_start", "bucket_start"),
+        {"comment": _CONCURRENCY_COUNTERS_TABLE_MARKER},
+    )
+
+
+class ConcurrencyRun(Base):
+    """One row per process run: the coverage record (design D8, SR2-3).
+
+    A run covers `[started_at, completed_through]` unless `lossy`. The gap to
+    the next run is covered only when this run's shutdown flush set
+    `clean_shutdown`; after a hard kill the gap is uncovered however short.
+    `completed_through` is the completed-interval watermark: every bucket that
+    ends by it is durable.
+    """
+
+    __tablename__ = "concurrency_runs"
+    _TABLE_MARKER: ClassVar[str] = _CONCURRENCY_RUNS_TABLE_MARKER
+
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    epoch: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    completed_through: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    clean_shutdown: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    lossy: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            _closed_set("mode", CONCURRENCY_MODES), name="ck_concurrency_runs_mode"
+        ),
+        Index("ix_concurrency_runs_started_at", "started_at"),
+        {"comment": _CONCURRENCY_RUNS_TABLE_MARKER},
     )

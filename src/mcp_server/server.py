@@ -3,6 +3,7 @@ from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP
 from mcp.types import Icon
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import ConfigDict
 
 from src.config import settings
 from src.mcp_server.read_result import ReadNoteResult
@@ -1449,7 +1450,8 @@ async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
     around.
 
     Args:
-        url: Public https URL of the file.
+        url: Public https URL of the file, at most 8,192 characters; a longer
+            one is refused with `argument_too_long` before anything is fetched.
         path: Vault-relative destination (e.g. "Attachments/paper.pdf").
         overwrite: If True, allow replacing an existing file at `path`.
     """
@@ -1491,3 +1493,41 @@ async def delete_file(
         expected_hash: Optional whole-file raw-byte digest of the incumbent.
     """
     return await delete_file_impl(path, permanent=permanent, expected_hash=expected_hash)
+
+
+def _forbid_unknown_arguments(server: FastMCP) -> None:
+    """Refuse undeclared tool arguments on every registered tool (#295).
+
+    FastMCP builds each tool's argument model on `ArgModelBase`, which sets no
+    `extra`, so pydantic's default `ignore` silently drops any name the tool
+    does not declare: `keyword_search(folders=...)` returned *unfiltered*
+    results that the calling agent took to be filtered. Each model is swapped
+    for a same-named subclass with `extra="forbid"` (other config inherited),
+    so the SDK's existing validation path refuses the call — naming the
+    argument — before any tool body runs; the published schema gets
+    `additionalProperties: false` so a client can catch it up front.
+
+    One pass after the last registration, so a tool added later is covered
+    without opting in. It reaches into SDK internals (`_tool_manager`,
+    `Tool.fn_metadata.arg_model`, `Tool.parameters`); an SDK upgrade that moves
+    them fails `tests/test_issue_295_unknown_arguments.py` rather than quietly
+    reverting to ignore.
+    """
+    for tool in server._tool_manager.list_tools():
+        base = tool.fn_metadata.arg_model
+        tool.fn_metadata.arg_model = type(
+            base.__name__,
+            (base,),
+            {
+                "__module__": base.__module__,
+                "__doc__": base.__doc__,
+                "model_config": ConfigDict({**base.model_config, "extra": "forbid"}),
+            },
+        )
+        tool.parameters["additionalProperties"] = False
+
+
+# `MCP_REJECT_UNKNOWN_ARGUMENTS=false` is the rollback: the SDK's ignore
+# behaviour and unmodified schemas. `src/main.py` logs it at WARNING on start.
+if settings.mcp_reject_unknown_arguments:
+    _forbid_unknown_arguments(mcp)

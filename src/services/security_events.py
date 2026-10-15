@@ -95,6 +95,17 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "panel_login_failed": frozenset(
         {"reason", "username_submitted", "user_id", "client_ip", "route"}
     ),
+    # The per-account failed-login budget's refusal. The subject is the client
+    # address, never `username_submitted` — a caller-supplied subject mints a
+    # fresh logging allowance for every value rotated through it. No `reason`:
+    # this event *is* the reason, and no `user_id` either, because the record
+    # would then confirm that the submitted name resolves to an account, which
+    # the response deliberately does not. `username_submitted` carries the
+    # formatter's existing 64-character bound (`src/logging_setup.py`), so the
+    # event introduces no unbounded field.
+    "panel_login_account_throttled": frozenset(
+        {"client_ip", "route", "username_submitted", "limit_count", "window_seconds"}
+    ),
     "panel_logout": frozenset({"user_id_session", "username_session", "client_ip"}),
     "panel_bootstrap_admin_created": frozenset({"user_id", "username", "client_ip"}),
     "panel_bootstrap_refused": frozenset({"reason", "client_ip"}),
@@ -227,6 +238,18 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "oauth_refresh_reuse_revocation_failed": frozenset(
         {"client_id", "grant_id", "user_id", "client_ip", "error_type"}
     ),
+    # The #325 authorization-code replay alarm: a spent code presented again
+    # *after* full revalidation (client, redirect URI, PKCE), which revoked the
+    # family its first exchange issued. Same fields and same reasoning as the
+    # refresh-reuse pair above; never a code, verifier, challenge or hash.
+    "oauth_code_replay_detected": frozenset(
+        {"client_id", "grant_id", "user_id", "revoked_tokens", "client_ip"}
+    ),
+    # Class name only, no `exc_info`: the failing statement's bound parameters
+    # include the code hash.
+    "oauth_code_replay_revocation_failed": frozenset(
+        {"client_id", "grant_id", "user_id", "client_ip", "error_type"}
+    ),
     "oauth_consent_granted": frozenset({"client_id", "user_id", "scope", "client_ip"}),
     "oauth_consent_denied": frozenset(
         {"client_id", "client_id_submitted", "user_id", "client_ip"}
@@ -281,6 +304,19 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "tool_write_refused": frozenset(
         {"tool", "user_id", "actor_kind", "key_id", "oauth_token_id"}
     ),
+    "tool_body_outcome": frozenset(
+        {"tool", "reason", "outcome", "user_id", "key_id", "oauth_token_id"}
+    ),
+    # #261 transport observer integration; no credential fingerprints.
+    # `reason` is the closed `<stage>:<scope>`; `outcome` is one of
+    # `MCP_CONCURRENCY_PRESSURE_OUTCOMES` below (#188): `shadow` (zero-wait
+    # would-refuse), `refused` (enforce, or shutdown), `overrun` (queue mode
+    # admitted where enforce would refuse) and `waited` (a granted transport
+    # wait over 100 ms).
+    "mcp_concurrency_pressure": frozenset(
+        {"reason", "outcome", "limit_count", "method", "route", "client_ip",
+         "user_id", "key_id", "oauth_token_id"}
+    ),
     "tool_exception": frozenset(
         {
             "tool",
@@ -324,6 +360,12 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     ),
     "usage_log_credential_gone": frozenset({"tool", "cleared_user_id"}),
     "usage_log_failed": frozenset({"tool", "error_type", "reason"}),
+    # The refusal coalescer dropping a planned row the database rejected for
+    # its data (#310): `reason` is the row's marker (`rate_limited` /
+    # `slot_timeout`), `count` its `1 + suppressed` weight. Best effort — the
+    # suppressor may withhold it and it names neither principal nor scope —
+    # so it reports dropped weight, it does not reconcile it.
+    "usage_refusal_row_dropped": frozenset({"tool", "reason", "count", "user_id"}),
     "tool_result_measure_failed": frozenset({"tool", "error_type"}),
     "move_rewrite_failed": frozenset({"tool", "error_type"}),
     # `move_note` aborting the whole move because one source holds a link
@@ -388,12 +430,38 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
         {"reason", "actor_user_id", "actor_username", "user_id", "route", "method"}
     ),
     "csrf_refused": frozenset({"route", "method", "user_id", "client_ip"}),
+    # The key-creation budget refused a create on either route (#323). The
+    # subject is the budget's own exact account identity — never the address,
+    # which in single-user mode would let a caller rotating addresses mint log
+    # allowance — so `client_ip` is a field only. `reason` names the refusing
+    # counter (`account_budget` / `address_budget`). Cap refusals are not this
+    # event, and a non-admin unlimited request is `panel_forbidden`.
+    "key_creation_throttled": frozenset(
+        {
+            "actor_user_id",
+            "actor_username",
+            "client_ip",
+            "route",
+            "method",
+            "reason",
+            "limit_count",
+            "window_seconds",
+        }
+    ),
     "panel_ondemand_index_failed": frozenset({"user_id", "error_type"}),
     "panel_ondemand_embed_failed": frozenset({"user_id", "error_type"}),
     "panel_health_strip_failed": frozenset({"error_type"}),
+    # ── Internal transport (#184, #185) ──
+    # At most once per hop per process start, from the lifespan. `reason` is
+    # the hop (`database` / `embedding`), `outcome` what admitted the plaintext
+    # session (`prefer` / `disable` / `override`). Never a host, port or URL.
+    "internal_transport_plaintext": frozenset({"reason", "outcome"}),
     # ── The suppressor's own record (this module) ──
     "events_suppressed": frozenset({"reason", "count", "window_seconds"}),
 }
+
+#: The closed `outcome` vocabulary of `mcp_concurrency_pressure` (#188).
+MCP_CONCURRENCY_PRESSURE_OUTCOMES = frozenset({"shadow", "refused", "overrun", "waited"})
 
 #: The suppressor's summary. Never itself suppressed, never counted.
 SUMMARY_EVENT = "events_suppressed"

@@ -1,0 +1,33 @@
+# Kubernetes base for obsidian-mcp. See docs/deployment-kubernetes.md.
+#
+#   kubectl apply -k deploy/kubernetes/base     # this base (app only)
+#   kubectl apply -k deploy/kubernetes/postgres # optional bundled Postgres
+#
+# Don't edit this directory for your deployment. Copy
+# ../overlays/example/ and set your hostname, image, vault storage and ingress
+# namespace there. Before the Deployment can start you also need:
+#   * the Secret `obsidian-mcp-secrets` (see secret.example.yaml; it is not
+#     listed below on purpose, so placeholder credentials cannot be applied
+#     by accident),
+#   * an image you can pull. Build it from the repo's Dockerfile, push it to
+#     your own registry, then set `images:` (name: obsidian-mcp) in your
+#     overlay. The base deliberately references the bare, unpullable name
+#     `obsidian-mcp`, so a forgotten override fails with ErrImagePull.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: obsidian-mcp
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: obsidian-mcp
+    includeSelectors: false
+    includeTemplates: true
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - pvc-vault.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml

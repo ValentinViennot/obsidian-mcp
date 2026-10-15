@@ -20,11 +20,14 @@
   Index usage is the expected plan for rare terms on a production-sized
   corpus, not a guarantee; a tiny table or a very common term may legitimately
   seq-scan.
-- Vector search via pgvector HNSW index on `note_embeddings.embedding`
-  (`vector_cosine_ops`, `m=16, ef_construction=64`); `semantic_search`
-  sets `hnsw.ef_search=80` per query and dedupes per note in Python
-  after a 5x overfetch. See "Filtered vector search" below — the
-  `SET LOCAL`s are load-bearing for *correctness*, not just speed.
+- Vector search via a pgvector HNSW **expression** index over
+  `(embedding::halfvec(D)) halfvec_cosine_ops` (`m=16, ef_construction=64`,
+  *D* = `EMBEDDING_DIMENSIONS`, built only when *D* ≤ 2000; migration 027,
+  #283). The query orders by that expression to pick candidates and re-ranks
+  them by the full-precision `vector` distance — see "The `halfvec` index"
+  below. `semantic_search` sets `hnsw.ef_search=80` per query and dedupes per
+  note in Python after a 5x overfetch. See "Filtered vector search" below —
+  the `SET LOCAL`s are load-bearing for *correctness*, not just speed.
 
 ## Filtered vector search — the SET LOCALs are correctness, not tuning
 
@@ -33,8 +36,13 @@ Both vector paths (`semantic_search` in `src/services/embeddings.py`,
 settings before the query, and all three matter:
 
 - `hnsw.ef_search = 80` — recall@10 ≈ 98%.
-- `random_page_cost = 1.1` — SSD costing; without it the planner prefers a
-  seq scan + sort, which is fine on a small table and degrades linearly.
+- `random_page_cost = 1.1` — a planner correction, **not** a claim about the
+  disk (D20, #283; the comment used to say "SSD"). The planner costs the join's
+  heap side at `relpages` and does not model the detoast I/O of a TOASTed
+  vector or tsvector, so at the default of 4 it overprices the index path and
+  prefers a seq scan + sort, which is fine on a small table and degrades
+  linearly. The working set is mostly cached, so the hint is right on an HDD
+  too. `full_text_search` issues it for the same reason (above).
 - `hnsw.iterative_scan = 'relaxed_order'` — **the recall fix.** With
   `random_page_cost` lowered, the planner picks HNSW → nested loop → filter.
   A non-iterative HNSW scan yields at most `ef_search` candidates; a `folder` /
@@ -46,9 +54,11 @@ settings before the query, and all three matter:
 Consequences that are easy to undo by accident:
 
 - **Re-sort before dedupe.** `relaxed_order` may emit rows slightly out of
-  distance order across iterations, so both paths select the cosine distance as
-  a column and sort by it before per-note dedupe/truncation. This is
-  presentation only — it cannot recover candidates the scan never returned.
+  distance order across iterations, and since #283 the scan is ordered by the
+  half-precision expression, so both paths select the **full-precision** cosine
+  distance as a column and sort by it before per-note dedupe/truncation. This
+  is presentation and ranking only — it cannot recover candidates the scan
+  never returned.
 - **Zero-row exact fallback, on *every* zero-row result.** An empty result from
   an approximate filtered scan is ambiguous. Both paths re-run the identical
   statement after `SET LOCAL enable_indexscan = off` (pgvector's documented
@@ -72,6 +82,75 @@ Consequences that are easy to undo by accident:
   `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault is under the cap;
   those are the next knobs, not `ef_search`.
 
+## The `halfvec` index: half precision picks candidates, full precision ranks them (#283)
+
+Migration 027 replaced 008's `ix_note_embeddings_embedding_hnsw`
+(`vector_cosine_ops`, ~146 MB live) with
+`ix_note_embeddings_embedding_halfvec_hnsw` over
+`(embedding::halfvec(D)) halfvec_cosine_ops`. On a synthetic 17.5 k × 1024
+corpus the two measured 137 MB and 46 MB; live after deploy (2026-09-23) the new
+index is 45 MB, and on 30 real production queries its top-15 notes overlapped an
+exact full-precision scan by a mean of 0.980 (minimum 0.800). The rules that make it safe:
+
+- **One definition.** `src/services/vector_index.py` owns the name,
+  `index_enabled(D)` (*D* ≤ 2000), `create_index_sql(D)`, `drop_index_sql()`
+  (both names, `IF EXISTS`) and the two query expressions. Migration 027, both
+  reset paths (panel and `scripts/reset_embeddings.py`), the pre-warm probe and
+  the two vector queries all go through it. The DDL's expression text is
+  compiled from the same builder the queries use, and
+  `tests/test_perf_vector_index.py` pins that the ORDER BY's operand is the
+  index expression verbatim — a planner matches an expression index only on the
+  identical expression, and a mismatch is a silent sequential scan.
+- **The dimension is configuration, never a literal.** An OpenAI deployment
+  runs at 1536 or 3072. Above 2000 nothing is built — the condition under which
+  the `vector` index existed — even though `halfvec` could index up to 4,000:
+  turning those deployments' exact scan into an approximate one is a recall
+  decision this change did not take. Above 2000 the queries order by the plain
+  `vector` distance, as before. The query casts to the query vector's own
+  length, which the startup dimension check makes equal to the setting.
+- **Half precision only chooses the candidates.** Both queries order by
+  `embedding::halfvec(D) <=> q::halfvec(D)` (the index expression), select the
+  full-precision `embedding <=> q` as `distance`, re-sort the fetched rows by
+  it **before** the per-note dedupe, and report `similarity = 1 − distance`.
+  So the representative chunk, the result order and every reported number are
+  full precision; what half precision can change is only membership at the
+  overfetch boundary. The zero-row exact fallback re-runs the same statement as
+  a sequential scan ordered by the `halfvec` expression, and the re-sort then
+  restores full-precision order among what it fetched. `find_related`'s source
+  vector (the mean of its chunks) is unchanged.
+- **The recall gate.** It shipped only because
+  `tests/integration/test_search_recall.py` met its SLO with the index and the
+  casts in place: its fixture builds the index through `create_index_sql`, its
+  EXPLAIN assertions name the new index, and its **exact baseline stays a
+  full-precision `vector` sequential scan** (a `halfvec` baseline would share
+  the precision loss it is meant to measure). Measured on 2026-09-22 (pgvector
+  0.8.6, `pg16`): set recall **1.00 on all 60 filtered cases** (4 filter shapes
+  × 5 queries × 3 rebuilds) and **1.00 for `find_related`** on all 9 (3 hubs ×
+  3 rebuilds) — identical to the `vector` index on the same corpus before the
+  change. The corpus is synthetic (L8); the live top-15 overlap check is
+  informational.
+
+## notes_metadata is vacuumed on a per-table threshold (#283, D17/D18)
+
+Migration 027 sets `autovacuum_vacuum_scale_factor = 0.02` and
+`autovacuum_vacuum_insert_scale_factor = 0.02` on `notes_metadata` (threshold
+≈ 50 + 0.02 × 4,100 ≈ 132 dead tuples, against ~870 at the defaults). The table
+had never been vacuumed, and that matters to keyword search specifically: the
+GIN index's **metapage statistics are written only by VACUUM**
+(`ginvacuumcleanup`), and `gincostestimate` reads them — without them it
+assumes the whole index must be scanned, which is the same failure the keyword
+benchmark's `VACUUM` note below describes. Vacuum also flushes the GIN pending
+list. `fastupdate = off` was rejected: it makes every changed note's keyword
+write slower and fixes none of the rest.
+
+027 does **not** run `VACUUM` itself: it cannot run inside a transaction block,
+and alembic runs the whole chain in one. Autovacuum visits the table within one
+`autovacuum_naptime` of 027 committing, because the dead-tuple count already
+exceeds the new threshold. `make db-vacuum-notes` is the deterministic
+fallback: `VACUUM (ANALYZE) notes_metadata` in an autocommit session through
+the application container. The reloptions are per table, so the shared
+instance's other tenants are untouched.
+
 ## Stale vectors are annotated, never filtered (#200)
 
 Both vector paths returned the **stored** `chunk_text[:500]` with no predicate
@@ -85,8 +164,8 @@ quotable as the note's content.
 `!=`.** A note that was never embedded, or whose certification a move cleared,
 holds `NULL`, and under `!=` that yields `NULL`, which a `WHERE` reads as false
 — every never-embedded note would count as *fresh*, the exact inversion of what
-the flag is for. `semantic_search` already hydrates the whole `NoteMetadata`
-entity, so both hashes are in hand and the comparison is done in Python, where
+the flag is for. `semantic_search` projects both hashes (it hydrated the whole
+`NoteMetadata` entity until #280), so they are in hand and the comparison is done in Python, where
 `!= None` **is** that operator; do not "fix" it into an `is not None` guard.
 `find_related_stmt` gained `content_hash`, `embedded_content_hash` and
 `chunks_truncated` as projected columns of a table it already joins — scalar
@@ -194,6 +273,81 @@ docstrings, and the post-deploy exercise sets the state up explicitly — edit a
 note, search *before* the pass and observe the row is **not** marked, then search
 after the pass and observe that it is. Writing the test that way is what keeps
 the residual from being re-described as a guarantee later.
+
+## Read paths project what they render (#280)
+
+Six read statements select an explicit column list instead of whole entities:
+
+| Path | Projected columns |
+| --- | --- |
+| `semantic_search` | `ne.note_id, ne.chunk_index, ne.chunk_text, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` (the `find_related_stmt` shape) |
+| `keyword_search` | `nm.file_path, nm.title, nm.tags, rank` |
+| `list_notes` | `file_path, file_size, modified_at` |
+| `get_recent` / `find_orphans` | `file_path, title, tags, modified_at` |
+| `get_neighborhood` hydration | `id, file_path, title, tags` |
+
+None of them ships `notes_metadata.content_tsvector` (the largest TOASTed
+column, which the planner does not cost), `note_embeddings.embedding` or
+`notes_metadata.frontmatter`. `ts_rank_cd` and `@@` still read the tsvector
+*server-side*; what is gone is shipping and hydrating it. **No predicate, no
+`SET LOCAL`, no overfetch and no exact-fallback condition changed.** The
+staleness fields (`content_hash`, `embedded_content_hash`) and
+`chunks_truncated` are still selected wherever they are rendered. A new read
+path should follow the same rule: select the columns it renders.
+
+**`content_tsvector` is deferred with raiseload** (D5):
+`mapped_column(TSVECTOR, deferred=True, deferred_raiseload=True)`. A
+whole-entity `select(NoteMetadata)` (the path lookups in the graph tools, the
+indexer's per-note loads) no longer carries it, and code that reads
+`.content_tsvector` from a loaded entity raises `InvalidRequestError` instead
+of lazy-loading. Under `AsyncSession` a lazy load is an implicit-IO error
+anyway (`MissingGreenlet`); raising names the offending access in a test
+instead. Every writer is SQL text or `insert().values`, which deferral does not
+touch. A reader that genuinely needs the vector selects the column explicitly.
+`frontmatter` was assessed and **left eager**: it is small on the median note,
+filtered in SQL, and deferring it would turn any future entity reader on a
+write path into a runtime error for little gain, because every hot path above
+already projects it away.
+
+**Similarity is `1 − distance`** (D7), as `find_related` already reported it.
+The result order was always the database's distance order, and the old NumPy
+recomputation ran *after* the sort, over vectors fetched only for that. It
+differed from the distance the rows were sorted by only in float error
+(pgvector accumulates in single precision, NumPy in double, ~1e-6). That error
+could make the displayed similarity non-monotone against the displayed order.
+It cannot now. This resolved L10 in [indexing and
+embeddings](indexing-and-embeddings.md).
+
+**Exact ties are deterministic.** `list_notes` and `get_recent` order by
+`modified_at DESC, file_path ASC`. `find_orphans` orders by
+`modified_at DESC NULLS LAST, file_path ASC`, so notes with no modification time
+stay last. `semantic_search`'s in-Python re-sort keys on
+`(distance, file_path, chunk_index)`. `keyword_search` already broke rank ties
+on `file_path`. Before this, an exact tie was resolved by whatever row the sort
+saw first.
+
+**What "identical" means for this change.** The results are the same as the
+pre-change implementation: the same result set, the same order, every field
+other than `similarity` byte-equal, and `similarity` within 1e-5. There are
+exactly three permitted exceptions, and all of them are confined to exact ties
+of the sort key (`modified_at`, `rank` or distance):
+
+1. **membership at a tied cutoff**: when more rows share the boundary key than
+   fit under the limit, which of them are returned may differ;
+2. **order among exact ties**: rows with an equal key may appear in a different
+   relative order, even when all of them fit (L9 in the change);
+3. **the representative chunk among exact distance ties**: when two chunks of
+   one note are exactly equidistant, the kept `chunk_index` and its preview may
+   differ (the lower index now wins).
+
+`tests/integration/test_perf_projection_identity_pg.py` enforces this. It runs
+the pre-change implementations, copied in as oracles, next to the production
+ones on the recall benchmark's corpus plus keyword, link, tie and orphan
+structure. It covers stale, truncated, filtered, unfiltered and exact-fallback
+cases, and plants each of the three tie cases on purpose. Its comparator is
+itself tested to reject every other difference. The offline half,
+`tests/test_perf_projection.py`, compiles each statement and asserts the
+projection and the raiseload mapping.
 
 ## The query length cap (`MAX_SEARCH_QUERY_CHARS`, #194)
 

@@ -22,11 +22,25 @@ if str(ROOT) not in sys.path:
 # adding it here is a test failure rather than a silent hole.
 SETTINGS_ENV_KEYS = (
     "DATABASE_URL",
+    # Superuser opt-out (#324).
+    "DATABASE_ALLOW_SUPERUSER",
+    # Database transport (#184).
+    "DATABASE_SSL_MODE",
+    "DATABASE_SSL_CA_FILE",
+    "DATABASE_SSL_CERT_FILE",
+    "DATABASE_SSL_KEY_FILE",
     "OLLAMA_URL",
     "OLLAMA_KEEP_ALIVE",
+    # Ollama request batching (#281).
+    "OLLAMA_EMBED_BATCH_SIZE",
     "VAULT_PATH",
     "SECRET_KEY",
     "INDEX_INTERVAL_SECONDS",
+    "INDEXER_DEGRADED_AFTER_FAILURES",
+    "INDEXER_QUARANTINE_RETRIES_PER_TICK",
+    # The scan's stat shortcut and its backstop (#282).
+    "INDEX_STAT_SHORTCUT",
+    "INDEX_FULL_HASH_INTERVAL_HOURS",
     "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSIONS",
     "CHUNK_SIZE",
@@ -44,6 +58,9 @@ SETTINGS_ENV_KEYS = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_EMBEDDING_MODEL",
+    # Embedding transport (#185).
+    "EMBEDDING_ALLOW_PLAINTEXT",
+    "EMBEDDING_CA_FILE",
     "MAX_FILE_READ_BYTES",
     "MAX_FILE_WRITE_BYTES",
     "MAX_READ_RESPONSE_CHARS",
@@ -80,7 +97,43 @@ SETTINGS_ENV_KEYS = (
     "SESSION_TOUCH_INTERVAL_SECONDS",
     "SESSION_PURGE_RETAIN_DAYS",
     "OAUTH_KNOWN_REDIRECT_HOSTS",
+    "OAUTH_CLIENT_UNUSED_EXPIRY_DAYS",
+    "OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS",
+    "MCP_CONCURRENCY_MODE",
+    "MCP_CONCURRENCY_WAIT_SECONDS",
+    "MCP_CONCURRENCY_TRANSPORT_WAIT_SECONDS",
+    "MCP_CONCURRENCY_REQUESTS",
+    "MCP_CONCURRENCY_FINGERPRINT",
+    "MCP_CONCURRENCY_REQUEST_WAITERS",
+    "MCP_CONCURRENCY_FINGERPRINT_WAITERS",
+    "MCP_CONCURRENCY_AUTH",
+    "MCP_CONCURRENCY_AUTH_WAITERS",
+    "MCP_CONCURRENCY_TOOLS",
+    "MCP_CONCURRENCY_TENANT",
+    "MCP_CONCURRENCY_PRINCIPAL",
+    "MCP_CONCURRENCY_EMBEDDING",
+    "MCP_CONCURRENCY_VECTOR",
+    "MCP_CONCURRENCY_WRITE",
+    "MCP_CONCURRENCY_SCAN",
+    "MCP_CONCURRENCY_LIGHT",
+    "MCP_CONCURRENCY_OTHER",
+    "MCP_CONCURRENCY_WAITERS",
+    "MCP_CONCURRENCY_TENANT_WAITERS",
+    "MCP_CONCURRENCY_PRINCIPAL_WAITERS",
+    "MCP_CONCURRENCY_REGISTRY_SIZE",
+    "MCP_CONCURRENCY_WRITERS",
+    "MCP_CONCURRENCY_WRITER_WAITERS",
+    "MCP_CONCURRENCY_WRITER_WAIT_SECONDS",
+    "MCP_CONCURRENCY_REPLAY_BUDGET_BYTES",
+    # The /mcp body-memory budget (#322).
+    "MCP_BODY_MEMORY_BUDGET_BYTES",
+    "MCP_BODY_MEMORY_FRACTION",
+    "MCP_BODY_MEMORY_MULTIPLIER",
+    "MCP_BODY_BUDGET_WAIT_SECONDS",
+    "MCP_BODY_BUDGET_WAITERS",
     "MCP_SANDBOX_MODE",
+    # Unknown-argument refusal on MCP tools (#295).
+    "MCP_REJECT_UNKNOWN_ARGUMENTS",
     # The /mcp rate controls (#188, #194). Every one is a `Settings` field, so
     # a developer with any of them exported would otherwise change what the
     # suite measures — which for a *limiter* means a green run on a machine
@@ -88,6 +141,9 @@ SETTINGS_ENV_KEYS = (
     "MCP_AUTH_FAILURE_LIMIT",
     "MCP_AUTH_FAILURE_WINDOW_SECONDS",
     "MCP_AUTH_FAILURE_TABLE_SIZE",
+    "TRUSTED_PROXY_IPS",
+    "PANEL_LOGIN_FAILURE_LIMIT",
+    "PANEL_LOGIN_FAILURE_WINDOW_SECONDS",
     "MCP_RATE_LIMIT_PER_MINUTE",
     "MCP_RATE_LIMIT_BURST",
     "MCP_WRITE_RATE_LIMIT_PER_MINUTE",
@@ -95,8 +151,14 @@ SETTINGS_ENV_KEYS = (
     "MCP_LIMITER_MAX_TRACKED_PRINCIPALS",
     "MCP_REFUSAL_LOG_INTERVAL_SECONDS",
     "DEFAULT_DAILY_REQUEST_LIMIT",
+    # The key-creation budget and active-key cap (#323).
+    "KEY_CREATION_ACCOUNT_LIMIT",
+    "KEY_CREATION_ADDRESS_LIMIT",
+    "KEY_CREATION_WINDOW_SECONDS",
+    "KEY_MAX_ACTIVE_PER_ACCOUNT",
     "LOG_LEVEL",
     "LOG_FORMAT",
+    "PANEL_CSP",
 )
 
 # The values the singleton is built from. Everything else in SETTINGS_ENV_KEYS
@@ -105,7 +167,43 @@ CONTROLLED_TEST_ENV = {
     "DATABASE_URL": "postgresql+asyncpg://test:test@localhost/test",
     "SECRET_KEY": "test",
     "VAULT_PATH": "/tmp/test-vault",
+    # The default `OLLAMA_URL` (`http://ollama:11434`) is plaintext to a
+    # non-loopback host, which the embedding scheme policy refuses unless the
+    # operator acknowledges it (#185). Every construction in the suite gets it
+    # through `_embedding_plaintext_override` below; this covers the singleton.
+    "EMBEDDING_ALLOW_PLAINTEXT": "true",
 }
+
+# Driver and HTTP-client variables that change the database or embedding hop
+# without being `Settings` fields (#184, #185). Scrubbed from the test process
+# for the whole session, so a developer's shell can neither fail the suite (a
+# `PGSSLMODE` is a boot refusal now) nor mask a regression (an ambient proxy or
+# CA bundle is exactly what the embedding client factory must ignore).
+TRANSPORT_AMBIENT_ENV_KEYS = frozenset(
+    k.casefold()
+    for k in (
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGSERVICE",
+        "PGSERVICEFILE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    )
+)
+
+
+def _scrub_transport_ambient_env() -> None:
+    for key in list(os.environ):
+        folded = key.casefold()
+        if folded in TRANSPORT_AMBIENT_ENV_KEYS or folded.startswith("pgssl"):
+            os.environ.pop(key, None)
+
+
+_scrub_transport_ambient_env()
 
 # Escape hatch for the import-isolated subprocess suites
 # (`tests/_transport_body_limit_cases.py`), which deliberately choose
@@ -236,6 +334,81 @@ def unpublished_vault_root_snapshot():
 
 
 @pytest.fixture(autouse=True)
+def _reset_indexer_health():
+    """Start every test with clean indexer failure accounting (#308, D4).
+
+    The registry is process state, like the indexer loop it describes; a test
+    that drives a failing tick must not leave `/health` degraded for the next.
+    """
+    from src.services import indexer_health
+
+    indexer_health.reset()
+    yield
+    indexer_health.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_note_quarantine():
+    """Start every test with an empty poison-note quarantine (#308, D3).
+
+    In-process state keyed by `(owner, path)`; two tests that both use
+    `Bad.md` must not see each other's entry.
+    """
+    from src.services import indexer
+
+    indexer.clear_quarantine()
+    yield
+    indexer.clear_quarantine()
+
+
+@pytest.fixture(autouse=True)
+def _reset_empty_prune():
+    """Start every test with no empty-prune permission held (#309, D5)."""
+    from src.services import empty_prune
+
+    empty_prune.reset()
+    yield
+    empty_prune.reset()
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "transport_defaults: run without the suite-wide "
+        "EMBEDDING_ALLOW_PLAINTEXT=true, so the real unset default applies",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _embedding_plaintext_override(request):
+    """Acknowledge the default plaintext `OLLAMA_URL` for every test (#185).
+
+    `CONTROLLED_TEST_ENV` applies only while the singleton is imported; every
+    later `Settings(...)` a test builds would otherwise meet the embedding
+    scheme policy's refusal of `http://ollama:11434`. A process variable wins
+    over a dotenv value in pydantic-settings, so a test that means the override
+    to be **false** must carry the `transport_defaults` marker, which removes
+    it instead.
+    """
+    # By hand rather than through `monkeypatch`: requesting that fixture from
+    # an autouse fixture would set it up before every other autouse fixture
+    # and so tear a test's own patches down *after* theirs.
+    key = "EMBEDDING_ALLOW_PLAINTEXT"
+    previous = os.environ.get(key)
+    if request.node.get_closest_marker("transport_defaults"):
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = "true"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+@pytest.fixture(autouse=True)
 def _reset_provider_cache():
     """Clear the cached provider singleton between tests so changes to
     `settings.embedding_provider` propagate."""
@@ -244,6 +417,48 @@ def _reset_provider_cache():
     embeddings.get_provider.cache_clear()
     yield
     embeddings.get_provider.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_concurrency_controller():
+    """Give each test its own explicit process-controller boundary (#261).
+
+    Lifespan tests intentionally close admissions and writers. That shutdown
+    must persist for the rest of that test, but must not turn unrelated later
+    middleware calls into 429s or suppress their usage inserts. Production
+    requests never reset the controller; tests and lifespan own that boundary.
+    Captured leases still release their original controller after replacement.
+    """
+    from src.services import concurrency
+
+    concurrency.reset_controller()
+    yield
+    concurrency.get_controller().shutdown(close_writers=True)
+
+
+@pytest.fixture(autouse=True)
+def _reset_body_budget():
+    """Give each test a fresh, host-independent /mcp body budget (#322).
+
+    Derived from the default settings with *no* readable cgroup limit (the
+    1 GiB fallback: 128 MiB capacity), so a developer's or a CI runner's own
+    memory limit never changes what the suite measures, and a reservation a
+    test left behind never leaks into the next one. The module's default
+    reader is pointed at "no limit" too, so a lifespan a test runs derives the
+    same plan instead of reading the host's cgroup; the reader's own tests
+    call it with a fake root explicitly.
+    """
+    from src.config import settings
+    from src.services import body_budget
+
+    real_reader = body_budget.read_cgroup_memory_limit
+    body_budget.read_cgroup_memory_limit = lambda *a, **k: None
+    body_budget.configure(settings, log_line=False)
+    try:
+        yield
+    finally:
+        body_budget.read_cgroup_memory_limit = real_reader
+        body_budget.reset_body_budget(None)
 
 
 @pytest.fixture(autouse=True)
@@ -267,3 +482,25 @@ def _reset_rate_limiter_state():
     rate_limits.reset_state_for_tests()
     yield
     rate_limits.reset_state_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _reset_indexer_scan_state():
+    """Start every test with no backstop clock and no clean-sweep record (#282).
+
+    Both are deliberately in-process memory: a restart forgets them, which is
+    what makes the first pass after a start a full-hash pass and the first
+    embed pass a sweeping one. A test suite is one long process, so without
+    this a test that completed a clean sweep would silently switch the next
+    test's sweep off, in an order-dependent way. Only touched when the indexer
+    is already imported, so this fixture imports nothing on its own.
+    """
+    indexer = sys.modules.get("src.services.indexer")
+    if indexer is not None:
+        indexer._last_full_hash.clear()
+        indexer.clear_sweep_state()
+    yield
+    indexer = sys.modules.get("src.services.indexer")
+    if indexer is not None:
+        indexer._last_full_hash.clear()
+        indexer.clear_sweep_state()

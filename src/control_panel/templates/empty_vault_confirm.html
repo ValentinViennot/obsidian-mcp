@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Confirm Vault Is Empty — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+    /* "Confirm vault is empty" page classes (#309, design D5). */
+    .evc-lead { color: var(--text); font-size: 14px; margin-bottom: 8px; font-weight: 500; }
+    .evc-text { color: var(--text-2); font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
+    .evc-count { color: var(--error); font-weight: 600; }
+    .evc-expiry { font-size: 11px; color: var(--text-3); font-family: 'JetBrains Mono',monospace; background: var(--code-bg); padding: 10px 14px; border-radius: 4px; border: 1px solid var(--border); margin-bottom: 22px; }
+</style>
+{% endblock %}
+{% block content %}
+
+<div class="page-top">
+    <h1 class="page-title">Confirm vault is empty</h1>
+    <div class="page-actions">
+        <a href="{{ cancel_url }}" class="btn btn-ghost">← Back</a>
+    </div>
+</div>
+
+<div class="page-body">
+    {% if flash %}
+    <div class="alert {% if flash_kind == 'err' %}alert-warning{% else %}alert-success{% endif %} anim-1">{{ flash }}</div>
+    {% endif %}
+
+    <div class="card anim-1 u-max-width-480px u-border-color-danger-border">
+        <div class="card-header u-border-bottom-color-danger-border-soft">
+            <span class="card-title u-color-error">Destructive Operation</span>
+        </div>
+        <div class="card-body">
+            {% if refusal %}
+            <p class="evc-lead">This vault cannot be confirmed.</p>
+            <p class="evc-text">{{ refusal }}</p>
+            {% elif note_count == 0 %}
+            <p class="evc-lead">Nothing to confirm.</p>
+            <p class="evc-text">
+                The index for {{ target_label }} holds no notes, so an empty
+                vault root is indexed normally and nothing needs confirming.
+            </p>
+            {% else %}
+            <p class="evc-lead">
+                If the vault is empty, the next index pass will delete
+                <span class="evc-count">{{ note_count }}</span>
+                indexed note{{ '' if note_count == 1 else 's' }} for
+                {{ target_label }}, with their embeddings and links.
+            </p>
+            <p class="evc-text">
+                The indexer refuses to prune a vault root that contains no
+                markdown files while its index still holds notes, because that
+                is far more often a mount that did not mount than a vault
+                emptied on purpose. Confirm only if the vault really was
+                emptied. If the files are still on disk, fix the mount instead:
+                once they are visible again nothing is deleted.
+            </p>
+            <p class="evc-text">
+                Confirming grants one index pass, for this vault only, a
+                single-use permission valid for {{ permission_minutes }}
+                minutes, and starts that pass now. If the pass finds files after
+                all, the permission is used up and nothing is deleted.
+            </p>
+            {% if pending %}
+            <p class="evc-text">An unused permission is already pending for this vault; confirming again replaces it.</p>
+            {% endif %}
+            <div class="evc-expiry">
+                ⚠ This confirmation expires in {{ token_minutes }} minutes and works once
+            </div>
+            <div class="u-display-flex u-gap-10px">
+                {#
+                  Fails closed (#195): a `type="button"` with `data-confirm`;
+                  panel.js prompts and only then calls `requestSubmit()`. The
+                  form carries hidden fields only, so Enter cannot submit
+                  around the prompt.
+                #}
+                <form method="POST" action="{{ post_action }}">
+                    <input type="hidden" name="token" value="{{ token }}">
+                    {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+                    <button type="button" class="btn btn-danger u-font-size-13px u-padding-9px-18px"
+                            data-confirm="Delete the index of this vault if its root is empty? This cannot be undone.">
+                        Yes, the vault is empty
+                    </button>
+                </form>
+                <a href="{{ cancel_url }}" class="btn btn-ghost u-font-size-13px u-padding-9px-18px">
+                    Cancel
+                </a>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

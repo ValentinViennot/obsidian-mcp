@@ -446,6 +446,10 @@ def test_db_backup_records_the_dump_and_its_status_is_the_targets():
     # itself used — the same channel, not a second one.
     assert "$$BACKUP_FILE.gz" in invocations[0]
     assert "DB_CONTAINER=$(DB_CONTAINER)" in invocations[0]
+    # ... and the same backend: a cnpg dump recorded through docker (or the
+    # reverse) would record into a different database than it dumped.
+    for var in ("DB_BACKEND", "CNPG_NAMESPACE", "CNPG_CLUSTER", "KUBECTL"):
+        assert f"{var}=$({var})" in invocations[0], var
     body = [line.strip() for line in recipe.strip().splitlines() if line.strip()]
     assert "record-backup.sh" in body[-1], (
         "the recording must be the last command in the recipe, or its failure "
@@ -453,13 +457,31 @@ def test_db_backup_records_the_dump_and_its_status_is_the_targets():
     )
 
 
-def test_the_recording_script_goes_through_docker_exec_psql():
-    """Same channel as `pg_dump`. A host-side script has no other handle on the
-    database, and inventing one (a direct connection, a mounted socket) is how
-    a public repo acquires a host-specific path."""
+def test_the_recording_script_goes_through_the_dump_channel():
+    """Same channel as `pg_dump`: `docker/db-exec.sh` (`docker exec`, or
+    `kubectl exec` into a CNPG primary). A host-side script has no other handle
+    on the database, and inventing one (a direct connection, a mounted socket)
+    is how a public repo acquires a host-specific path."""
     with open(os.path.join(HERE, "..", "docker", "record-backup.sh")) as fh:
         script = fh.read()
-    assert 'docker exec -i "$DB_CONTAINER" psql' in script
+    assert 'bash "$DB_EXEC_SCRIPT" -i psql' in script
+    assert "docker exec" not in "\n".join(
+        line for line in script.splitlines() if not line.lstrip().startswith("#")
+    ), "the recording must not open a second channel of its own"
+    make = _makefile()
+    backup = make[make.index("\ndb-backup:") : make.index("\ndb-restore:")]
+    restore = make[make.index("\ndb-restore:") : make.index("\n# There is no headless")]
+    for target, recipe in (("db-backup", backup), ("db-restore", restore)):
+        commands = "\n".join(
+            line for line in recipe.splitlines() if not line.strip().startswith("#")
+        )
+        assert "docker exec" not in commands, target
+    assert "$(DB_EXEC)" in backup
+    assert "bash docker/db-restore.sh" in restore
+    with open(os.path.join(HERE, "..", "docker", "db-restore.sh")) as fh:
+        restore_script = fh.read()
+    assert 'bash "$DB_EXEC_SCRIPT" -i psql' in restore_script
+    assert "docker exec" not in restore_script
     assert "to_regclass('public.backups_log')" in script
     assert "ON_ERROR_STOP=1" in script
     # The filename and size travel as psql variables, not as interpolated
@@ -984,3 +1006,64 @@ def test_a_non_admins_run_history_is_scoped_to_them(monkeypatch):
     monkeypatch.setattr(routes, "recent_indexer_runs", _fake_runs)
     _health_context(monkeypatch, is_admin=False)
     assert seen["user_id"] == 3
+
+
+# --------------------------------------------------------------------------
+# #308 D5: a pass that quarantined notes succeeded — "quarantined", not
+# "failed", on the strip, the health table and the performance table.
+# --------------------------------------------------------------------------
+
+_QUARANTINE_LINE = "quarantined 1 note(s): Bad.md"
+
+
+def _outcome_run(error):
+    from src.services.indexer_health import run_outcome
+
+    return _run(id=42, error=error, outcome=run_outcome(error))
+
+
+def _badges(html):
+    return re.findall(r'class="badge (badge-\w+)[^"]*"[^>]*>([a-z]+)<', html)
+
+
+def test_the_strip_marks_a_quarantining_pass_amber_not_failed():
+    strip = _render_strip(last_run=_outcome_run(_QUARANTINE_LINE))
+    strip = strip[: strip.index("Stat row")]
+    assert ("badge-yellow", "quarantined") in _badges(strip)
+    assert ("badge-red", "failed") not in _badges(strip)
+    assert "/admin/health#run-42" in strip
+
+
+def test_the_strip_still_marks_a_real_failure_red():
+    strip = _render_strip(last_run=_outcome_run(
+        _QUARANTINE_LINE + "\nembed: OSError: no space left"
+    ))
+    strip = strip[: strip.index("Stat row")]
+    assert ("badge-red", "failed") in _badges(strip)
+    assert "quarantined</" not in strip
+
+
+@pytest.mark.parametrize("error,badge", [
+    (_QUARANTINE_LINE, ("badge-yellow", "quarantined")),
+    ("index: OSError: no space left", ("badge-red", "failed")),
+    (None, ("badge-green", "ok")),
+])
+def test_the_health_table_renders_each_run_outcome(error, badge):
+    html = _render_health(runs=[_outcome_run(error)])
+    table = html[html.index("Index passes"):]
+    assert badge in _badges(table)
+    if error:
+        assert error in table, "the record's text is still shown"
+
+
+@pytest.mark.parametrize("error,badge", [
+    (_QUARANTINE_LINE, ("badge-yellow", "quarantined")),
+    ("index: OSError: no space left", ("badge-red", "failed")),
+])
+def test_the_performance_table_renders_each_run_outcome(error, badge):
+    src = open(os.path.join(TEMPLATES_DIR, "performance.html")).read()
+    start = src.index("{% if r.error and r.outcome == 'quarantined' %}")
+    end = src.index("{% endif %}", start) + len("{% endif %}")
+    html = _env().from_string(src[start:end]).render(r=_outcome_run(error))
+    assert badge in _badges(html)
+    assert 'style=' not in html

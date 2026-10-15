@@ -131,20 +131,28 @@ def _run_tracked(fn, *args, limit=None, key_id=7, spy=None, **kwargs):
     return result, captured.get("params"), spy
 
 
-@tools._tracked("quota_probe", ["value"])
+@tools._tracked("quota_probe", ["value"], resource_class="light")
 async def _probe(value: str = "x") -> str:
     """A minimal tracked tool. The decorator is what is under test, so a real
     tool would only add a vault and a database to the surface."""
     return f"ran:{value}"
 
 
-@tools._tracked("quota_probe_raises", [])
+@tools._tracked("quota_probe_raises", [], resource_class="light")
 async def _probe_raises() -> str:
     raise RuntimeError("the body failed after being admitted")
 
 
 def _admissions(spy):
     return [s for s, _ in spy.statements if "INSERT INTO quota_counters" in s]
+
+
+def _admission_params(spy):
+    """The admission's bound parameters. Not `statements[0]`: the
+    transaction's first statement is its `SET LOCAL synchronous_commit = off`
+    (performance-2026-09 D2)."""
+    (params,) = [p for s, p in spy.statements if "INSERT INTO quota_counters" in s]
+    return params
 
 
 # --------------------------------------------------------------------------
@@ -365,7 +373,10 @@ def test_a_refusal_issues_no_second_statement():
         assert not asyncio.run(quotas.admit(7, 100)).admitted
     finally:
         mp.undo()
-    assert len(refused.statements) == 1
+    # The transaction's `SET LOCAL synchronous_commit = off`
+    # (performance-2026-09 D2) and the admission itself; no prune.
+    sqls = [s for s, _ in refused.statements]
+    assert sqls == [str(quotas.ASYNC_COMMIT_SQL), str(quotas.ADMISSION_SQL)]
 
 
 # --------------------------------------------------------------------------
@@ -387,7 +398,10 @@ def test_in_domain_limits_are_accepted(value):
 
 
 @pytest.mark.parametrize("raw", ["", "   ", None])
-def test_an_empty_field_means_unlimited_not_zero(raw):
+def test_an_empty_field_is_no_value_not_zero(raw):
+    # Renamed for #323: blank no longer means unlimited — what a blank means is
+    # decided by `src/services/api_keys.py` (default on create, error on edit).
+    # The parser still reports it as "no value", never as zero.
     assert quotas.parse_limit_form_value(raw) == (None, None)
 
 
@@ -456,13 +470,19 @@ class _MiddlewareSession:
         sql = str(stmt)
         if sql.startswith("UPDATE"):
             return _EmptyResult()
+        # The user's `is_active`/`vault_path` ride the credential statement
+        # (performance-2026-09 D3).
         if "FROM api_keys" in sql:
-            return _RowsResult([self.api_key] if self.api_key else [])
+            return _RowsResult(
+                [(self.api_key, True, "/vaults/x")] if self.api_key else []
+            )
         if "FROM oauth_tokens" in sql:
             if self.oauth_token is None:
                 return _RowsResult([])
             owner, name = self.client_row if self.client_row else (None, None)
-            return _RowsResult([(self.oauth_token, owner, name)])
+            return _RowsResult(
+                [(self.oauth_token, owner, name, True, "/vaults/x")]
+            )
         if "vault_path" in sql:
             return _RowsResult([])
         return _EmptyResult()
@@ -563,6 +583,7 @@ def test_oauth_traffic_is_exempt_because_no_branch_binds_a_limit_for_it():
     from src.models.db import OAuthToken
 
     token = OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=42,
         token_hash="y",
         token_type="access",
@@ -770,11 +791,11 @@ def test_the_keys_page_renders_both_a_limited_and_an_unlimited_key():
 
     assert "7 / 100" in html, "the limited key's consumption is not rendered"
     assert "Unlimited" in html, "the unlimited key is not labelled"
-    # The edit control carries the key's id and its current value, and both are
-    # numeric — nothing quotable is interpolated into the `onclick`, which is
-    # the trap documented for the OAuth delete's confirm().
-    assert "omcpEditLimit(4, '100')" in html
-    assert "omcpEditLimit(5, '')" in html
+    # The edit control carries the key's id and its current value as data
+    # attributes, both numeric; panel.js reads them as strings, so nothing is
+    # parsed as script (the trap the old inline handler documented).
+    assert 'data-key-id="4" data-limit="100"' in html
+    assert 'data-key-id="5" data-limit=""' in html
     # The create form offers the field, with the domain the CHECK enforces.
     assert 'name="daily_request_limit"' in html
     assert 'max="1000000"' in html
@@ -908,7 +929,7 @@ def test_a_refusal_straddling_utc_midnight_names_the_right_midnight(monkeypatch)
 
     # The statement was bound to the day the first reading fell in.
     assert decision.day == _dt.date(2026, 8, 29)
-    assert spy.statements[0][1]["day"] == _dt.date(2026, 8, 29)
+    assert _admission_params(spy)["day"] == _dt.date(2026, 8, 29)
     assert decision.admitted is False
 
     message = quotas.quota_refusal_message(5, decision.reset_at)
@@ -997,7 +1018,7 @@ def test_the_retry_interval_survives_a_decision_taken_at_utc_midnight(monkeypatc
     )
 
     assert params["over_quota"] is True
-    assert spy.statements[0][1]["day"] == _dt.date(2026, 8, 29)
+    assert _admission_params(spy)["day"] == _dt.date(2026, 8, 29)
     assert len(reads) == 1, (
         f"the clock was read {len(reads)} times; the decision is one reading "
         "and everything downstream is arithmetic on it"

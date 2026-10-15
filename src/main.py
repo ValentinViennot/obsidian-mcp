@@ -25,7 +25,7 @@ from src.limiter import limiter
 from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
 from src.oauth.routes import router as oauth_router
-from src.services import error_log, security_events, vault, vault_overlap
+from src.services import error_log, panel_csp, security_events, vault, vault_overlap
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     KEY_FTS_FINGERPRINT,
@@ -37,9 +37,22 @@ from src.services.index_state import (
     set_state,
     state_table_exists,
 )
+from src.services.embeddings import close_provider_client
 from src.services.indexer import run_indexer_loop
+from src.services.transport_security import (
+    check_database_transport,
+    log_embedding_transport,
+)
 from src.services.rate_limits import flush_all
+from src.services import body_budget
+from src.services.database_role import (
+    check_database_role,
+    warn_admin_password_in_environment,
+)
+from src.services import concurrency
+from src.services import concurrency_counters
 from src.services import vault_fs
+from src.services import indexer_health
 from src.logging_setup import configure_logging
 from src.transfer.routes import router as transfer_router
 
@@ -139,6 +152,23 @@ async def _check_pgvector_version() -> None:
             row[0],
             ".".join(str(p) for p in MIN_PGVECTOR_VERSION),
         )
+        sys.exit(1)
+
+
+def _configure_body_budget() -> None:
+    """Derive, check and install the /mcp body-memory budget (#322 D2).
+
+    Logs the resolved derivation once (WARNING when no cgroup limit was
+    readable). Refuses to start — CRITICAL, exit 1, like the other startup
+    guards — when the large lane cannot hold one maximum request body, the
+    small lane one envelope, or a budget exceeds the safe allocation of the
+    readable limit: a server whose documented write cap silently cannot work
+    is worse than one that does not start.
+    """
+    try:
+        body_budget.configure(settings)
+    except body_budget.BodyBudgetConfigError as exc:
+        logging.getLogger(__name__).critical("%s", exc)
         sys.exit(1)
 
 
@@ -397,9 +427,18 @@ async def _warm_embedding_model() -> None:
 
 
 def _on_indexer_done(task: asyncio.Task) -> None:
+    """Record the indexer task's end for `/health` (#308, D4).
+
+    Cancellation is the lifespan shutting down and is not a failure. Anything
+    else — an exception, or a return from a loop that should run forever — is
+    recorded as "task not running", which `/health` reports as `degraded`:
+    before this, a dead indexer left the server serving stale search with a
+    `status: ok` health check and one CRITICAL log line as the only signal.
+    """
     if task.cancelled():
         logging.getLogger(__name__).info("Indexer task cancelled (lifespan shutdown)")
         return
+    indexer_health.mark_task_stopped()
     exc = task.exception()
     if exc is not None:
         logging.getLogger(__name__).critical(
@@ -436,6 +475,43 @@ async def _publish_first_root_snapshot() -> None:
         )
 
 
+def _log_panel_csp_mode() -> None:
+    """Say once, at startup, which panel CSP mode is in force (#195).
+
+    `PANEL_CSP` is the rollback lever: `report-only` and `off` exist so a
+    policy that breaks a panel control can be backed out with one `.env` line
+    and a recreate. A rollback nobody remembers to undo leaves the panel
+    without an enforced policy indefinitely, so anything other than `enforce`
+    is also logged at WARNING, where it is seen.
+    """
+    log = logging.getLogger(__name__)
+    mode = settings.panel_csp
+    log.info("Panel CSP: PANEL_CSP = %s", mode)
+    if mode != "enforce":
+        log.warning(
+            "Panel CSP is not enforced (PANEL_CSP = %s): panel, login and "
+            "consent pages are served without an enforcing "
+            "Content-Security-Policy",
+            mode,
+        )
+
+
+def _log_unknown_arguments_mode() -> None:
+    """Warn once, at startup, when undeclared tool arguments are ignored (#295).
+
+    `MCP_REJECT_UNKNOWN_ARGUMENTS=false` is the rollback for a client found to
+    send extras. While it is in force a misspelled filter silently returns
+    unfiltered results again, so — like a `PANEL_CSP` rollback — it is logged
+    at WARNING, where a forgotten rollback is seen.
+    """
+    if not settings.mcp_reject_unknown_arguments:
+        logging.getLogger(__name__).warning(
+            "MCP tools accept unknown arguments "
+            "(MCP_REJECT_UNKNOWN_ARGUMENTS = false): undeclared arguments are "
+            "silently ignored and input schemas do not forbid them"
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # First, before any guard can fail: the panel's health page reads this
@@ -444,6 +520,10 @@ async def lifespan(app: FastAPI):
     # ERROR, so it sees every module's errors without any of them opting in;
     # process-lifetime only, no schema — see `src/services/error_log.py`.
     error_log.attach()
+    _log_panel_csp_mode()
+    _log_unknown_arguments_mode()
+    warn_admin_password_in_environment()
+    concurrency_controller = concurrency.reset_controller(settings)
     # Wrapped so the suppressor's outstanding counts are flushed on **every**
     # exit path, the sandbox-mode early return included. A window still holding
     # a withheld count when the process stops takes the count with it, and the
@@ -454,6 +534,9 @@ async def lifespan(app: FastAPI):
                 "MCP_SANDBOX_MODE active — skipping DB check and indexer. "
                 "Tools are registered but cannot run. Registry-eval only."
             )
+            # No indexer runs here by design: `/health` says `disabled`, which
+            # does not by itself make the top-level status `degraded`.
+            indexer_health.mark_disabled()
             # Sandbox mode still has to be *ready*: the admission gate refuses
             # every multi-user caller until a snapshot is published, and a
             # sandbox that never publishes one would refuse every registered
@@ -463,8 +546,25 @@ async def lifespan(app: FastAPI):
             async with mcp.session_manager.run():
                 yield
             return
+        # #322: the /mcp body-memory budget, derived from this process's own
+        # cgroup limit and checked here — the web application's startup —
+        # never in `Settings`: the migration init container imports the
+        # settings under a smaller limit and must not be refused for it.
+        # First of the guards: it needs no database and no vault. Sandbox
+        # mode bypasses `APIKeyMiddleware`, so it skips this like the rest.
+        _configure_body_budget()
         _check_openat2_support()
         _check_mount_identity_support()
+        # First database contact, deliberately: a strict `DATABASE_SSL_MODE`
+        # whose session is not encrypted (or cannot be established) must fail
+        # as itself, not as whatever the first query happened to be. Then the
+        # embedding hop's line. Both below the sandbox short-circuit (#184/#185).
+        await check_database_transport()
+        # #324: the long-lived process must not be a PostgreSQL superuser.
+        # After the transport assertion (so a strict-TLS failure reports as
+        # itself) and below the sandbox short-circuit.
+        await check_database_role()
+        log_embedding_transport()
         await _check_embedding_dim()
         await _check_pgvector_version()
         await _validate_fts_configs()
@@ -483,6 +583,12 @@ async def lifespan(app: FastAPI):
         # reopened once per restart. Placed after the fingerprint guards so a
         # misconfigured deployment still fails with their own messages.
         await _publish_first_root_snapshot()
+        # #188 (D8): this run's coverage row, then the 60 s flush that turns
+        # the event-time counter accumulator into durable rows and advances the
+        # run's watermark whatever the traffic. Registration never blocks
+        # serving: a failed insert is retried by the next flush.
+        await concurrency_counters.register_run(controller=concurrency_controller)
+        counters_task = asyncio.create_task(concurrency_counters.run_flush_loop())
         # Fire-and-forget so a ~15s cold load doesn't block the app from serving.
         # The lifespan frame stays suspended at `yield`, keeping this referenced.
         warmup_task = asyncio.create_task(_warm_embedding_model())
@@ -494,10 +600,25 @@ async def lifespan(app: FastAPI):
         finally:
             warmup_task.cancel()
             indexer_task.cancel()
+            counters_task.cancel()
+            try:
+                await counters_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
             try:
                 await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+            # The embedding provider's pooled client (#281, D14): after the
+            # indexer has stopped issuing requests, before the engine goes.
+            # Best-effort — a close that fails must not turn a clean shutdown
+            # into a traceback.
+            try:
+                await close_provider_client()
+            except Exception as e:  # noqa: BLE001 - shutdown, never fatal
+                logging.getLogger(__name__).error(
+                    f"Closing the embedding provider client failed: {e}"
+                )
             # The refusal coalescer's last flush, **before `engine.dispose()`**:
             # every window still holding a pending count writes the row it owes
             # while a connection is still obtainable. After the dispose there
@@ -514,15 +635,29 @@ async def lifespan(app: FastAPI):
             # Best-effort, like every other shutdown step: a database already
             # going away must not turn a clean shutdown into a traceback.
             try:
+                concurrency_controller.shutdown()
                 await flush_all()
             except Exception as e:  # noqa: BLE001 - shutdown, never fatal
                 logging.getLogger(__name__).error(
                     f"Refusal flush at shutdown failed: {e}"
                 )
+            # #188 (D8): the shutdown flush — after the refusal coalescer's
+            # `flush_all()` (whose own checkouts it then counts) and before
+            # `engine.dispose()`. It sets `completed_through` to exactly now and
+            # `clean_shutdown`, which is what makes the gap to the next run
+            # covered. Without it (a hard kill) that gap reads uncovered.
+            try:
+                await concurrency_counters.flush(clean=True)
+            except Exception as e:  # noqa: BLE001 - shutdown, never fatal
+                logging.getLogger(__name__).error(
+                    f"Concurrency counter flush at shutdown failed: {e}"
+                )
             # Explicitly close pooled database connections during application
             # shutdown (important for reloads and test/application lifecycles).
+            concurrency_controller.shutdown(close_writers=True)
             await engine.dispose()
     finally:
+        concurrency_controller.shutdown(close_writers=True)
         security_events.flush_suppression_summaries()
 
 
@@ -562,12 +697,38 @@ def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
-# Honor X-Forwarded-Proto/For from upstream reverse proxy so that scheme-aware
-# redirects (e.g. trailing-slash on /mcp) keep the https:// scheme.
-app.add_middleware(
-    ProxyHeadersMiddleware,
-    trusted_hosts=["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
-)
+def _install_proxy_headers(target: FastAPI) -> list[str]:
+    """Honour `X-Forwarded-Proto`/`-For` from the peers `TRUSTED_PROXY_IPS` names.
+
+    Scheme-aware redirects (the trailing-slash one on `/mcp`) need the header
+    to keep the `https://` scheme, and every limiter in the process keys on the
+    address this middleware resolves — which is why the list is one setting and
+    not a literal here (#189). The value is already canonical: `Settings`
+    rewrites `192.168.0.10/24` to `192.168.0.0/24` at boot, because the
+    un-canonicalised string is what uvicorn's own parse turns into a literal
+    matching no peer.
+
+    An empty setting installs **no** middleware rather than a middleware
+    trusting nobody. The two behave identically, and not adding it says so in
+    the middleware stack, which is where an operator looks.
+
+    The effective list is logged once at import, i.e. at startup: a trust
+    boundary nobody can read from the logs is a trust boundary nobody audits.
+    """
+    trusted = list(settings.trusted_proxy_ips)
+    log = logging.getLogger(__name__)
+    if not trusted:
+        log.info(
+            "Proxy header trust: TRUSTED_PROXY_IPS is empty — X-Forwarded-* "
+            "ignored from every peer"
+        )
+        return trusted
+    target.add_middleware(ProxyHeadersMiddleware, trusted_hosts=trusted)
+    log.info("Proxy header trust: TRUSTED_PROXY_IPS = %s", ", ".join(trusted))
+    return trusted
+
+
+_trusted_proxy_ips = _install_proxy_headers(app)
 
 # Reject forged Host headers at the application boundary. This complements
 # FastMCP's DNS-rebinding checks and also protects OAuth/admin routes.
@@ -607,6 +768,12 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+    # The panel CSP (#195). Applied only to HTML rendered by the panel, auth
+    # and consent template instances — their context processor marks the
+    # request — so the transfer pages keep their own stricter policy and
+    # FastAPI's /docs pages get none. An enforcing policy already on the
+    # response is never overwritten. See `src/services/panel_csp.py`.
+    panel_csp.apply_policy(request, response, settings.panel_csp)
     return response
 
 
@@ -624,7 +791,7 @@ app.include_router(api_router)
 # it. Each handler authenticates its own request from the token row.
 app.include_router(transfer_router)
 
-# Panel assets (htmx, Chart.js) served from this app rather than a CDN — see
+# Panel assets (Chart.js, panel.js) served from this app rather than a CDN — see
 # the comment in `src/control_panel/templates/base.html`. Mounted under
 # `/admin/` because that is the prefix Traefik already routes to this app for
 # the panel; a top-level `/static` would match no router on the production
@@ -710,10 +877,28 @@ async def health():
     file in the vault — nor may it be the thing that decides a root's staging
     mode. The mount-identity probe is read-only, but it belongs to startup: a
     health check must not be where a capability verdict is made either.
+
+    `indexer` (#308, D4) is the indexer's failure accounting, read from
+    in-process state (`src/services/indexer_health.py`): `status`
+    (`ok` | `degraded` | `disabled`), `task_running`, `failing_scopes`,
+    `embedding_failing_scopes`, `max_consecutive_failures`,
+    `quarantined_notes` and `last_success_at`. When it is `degraded` — the
+    indexer task is dead, any index / embedding / incomplete-re-derive /
+    enumeration counter has reached `INDEXER_DEGRADED_AFTER_FAILURES`, or a
+    note is quarantined — the top-level `status` is `degraded` too.
+    `disabled` (`MCP_SANDBOX_MODE`) does not by itself degrade the top level.
+
+    **The HTTP status is 200 in every case.** Kubernetes uses this endpoint
+    for liveness, and a restart loop cannot repair vault content or an
+    embedding-provider outage; monitors alert on the `status` field instead.
+    **Counts only**: no path, error text, SQLSTATE or user id — the endpoint
+    is unauthenticated and publicly routed.
     """
+    indexer = indexer_health.snapshot()
     return JSONResponse(
         {
-            "status": "ok",
+            "status": "degraded" if indexer["status"] == "degraded" else "ok",
+            "indexer": indexer,
             "vault_named_staging_fallback_active": (
                 vault_fs.named_staging_fallback_active()
             ),

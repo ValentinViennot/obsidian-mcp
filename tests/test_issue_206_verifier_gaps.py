@@ -84,7 +84,9 @@ def _function_source(func) -> str:
 
 def test_the_scan_never_learns_about_the_chunk_cap():
     """`_index_vault_pinned` cannot skip on a truncation it cannot see."""
-    source = _function_source(indexer._index_vault_pinned)
+    source = _function_source(indexer._index_vault_pinned) + _function_source(
+        indexer._index_vault_attempt
+    )
     found = [name for name in CHUNK_CAP_NAMES if name in source]
     assert not found, (
         "the scan now references the chunk cap "

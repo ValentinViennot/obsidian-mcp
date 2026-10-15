@@ -3,7 +3,7 @@ import logging
 import resource
 import sys
 from typing import Annotated, Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse, urlsplit
 
 from pydantic import (
     BeforeValidator,
@@ -14,6 +14,8 @@ from pydantic import (
 )
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
+
+from src.services.transport_security import normalise_db_ssl_mode
 
 
 # ── One representation for "off" ────────────────────────────────────────────
@@ -185,6 +187,19 @@ MAX_LIST_PATTERN_CHARS = 1024
 # purpose.
 MAX_SEARCH_QUERY_CHARS = 8192
 
+# Upper bound on `import_from_url`'s `url` argument (#322), through the same
+# declarative `arg_char_caps` screen as the search query: the existing
+# `argument_too_long` refusal, before any DNS resolution, connection or quota
+# statement. Presigned S3/GCS URLs carrying session tokens reach 2–4 KB, so
+# 8 KiB clears every real one while staying ~7,000× below the request-body
+# limit. Its logging transform (`_url_host`) refuses to parse a longer value,
+# which removes the canonicalisation peak the ASVS reproduction measured.
+#
+# **This is not the memory bound.** Every other near-limit envelope still
+# buffers; the process-wide body budget (`src/services/body_budget.py`) is
+# what bounds them all.
+MAX_IMPORT_URL_CHARS = 8192
+
 # Aggregate bound on the preflight of `move_note(rewrite_links=True)`. That
 # preflight holds, for every backlink source, both the original bytes and the
 # rewritten content in memory before a single byte is mutated — the price of
@@ -354,7 +369,40 @@ class _FieldFilteredSource(PydanticBaseSettingsSource):
 
 
 class Settings(BaseSettings):
-    database_url: str = "postgresql+asyncpg://obsidian_mcp:changeme@postgres:5432/obsidian_mcp"
+    # No password in the default (#324): an unset DATABASE_URL must not
+    # authenticate with a known value. The bundled compose files set it from
+    # OBSIDIAN_DB_PASSWORD; `_reject_placeholder_database_password` refuses the
+    # placeholders this repository used to ship.
+    database_url: str = "postgresql+asyncpg://obsidian_mcp@postgres:5432/obsidian_mcp"
+    # Opt-out of the startup refusal to run as a PostgreSQL superuser (#324,
+    # src/services/database_role.py). The long-lived process must not hold
+    # cluster administration; set this only as a stop-gap while converting an
+    # install (DEPLOYMENT.md, "Upgrading: split database roles").
+    database_allow_superuser: bool = False
+    # ── Database transport (#184) ──────────────────────────────────────────
+    #
+    # The **only** statement of TLS for the database hop; see "Database
+    # transport" in docs/architecture/schema-and-migrations.md. libpq's
+    # vocabulary minus `allow`, stripped and case-folded. Default `prefer` is
+    # exactly the behaviour every deployment had before this setting existed
+    # (asyncpg's advisory TLS with a plaintext fallback); the downgrade it
+    # permits is made visible by the lifespan's transport assertion, not
+    # prevented. `require` / `verify-ca` / `verify-full` are an explicit
+    # `ssl.SSLContext` with no plaintext retry (`src/services/
+    # transport_security.py`). A TLS key in `DATABASE_URL`'s query or a
+    # `PGSSL*` variable is refused rather than merged — `_validate_database_
+    # transport` below.
+    database_ssl_mode: Annotated[
+        Literal["disable", "prefer", "require", "verify-ca", "verify-full"],
+        BeforeValidator(normalise_db_ssl_mode),
+    ] = "prefer"
+    # Trust anchor for `verify-ca` / `verify-full`, required by both and
+    # refused with any other mode (a CA with `require` is not silently
+    # upgraded to verification, as libpq would). No system-store fallback.
+    database_ssl_ca_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
+    # Optional client certificate pair, strict modes only, both or neither.
+    database_ssl_cert_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
+    database_ssl_key_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
     ollama_url: str = "http://ollama:11434"
     # How long Ollama keeps the embedding model resident after a call.
     # "-1" pins it in VRAM indefinitely (sent as the integer Ollama requires),
@@ -362,9 +410,38 @@ class Settings(BaseSettings):
     # and the model has been evicted. A Go duration like "30m" instead frees
     # VRAM when idle. Ollama provider only — ignored by the OpenAI provider.
     ollama_keep_alive: str = "-1"
+    # Inputs per Ollama `/api/embed` request (#281, D15). A *fixed* size, so
+    # the 30 s per-request bound stays constant whatever the note's size; there
+    # is deliberately no aggregate deadline over the batch (#127 D5). `1`
+    # reproduces the pre-batching request shape, one chunk per request.
+    ollama_embed_batch_size: int = Field(16, ge=1, le=256)
     vault_path: str = "/obsidian"
     secret_key: str = "changeme"
     index_interval_seconds: int = Field(300, ge=1)
+    # Consecutive failures of any indexer counter (a scope's index passes, its
+    # embed passes, its incomplete re-derives, or the tick's own user
+    # enumeration) at which `/health` reports `degraded` and the CRITICAL
+    # "manual intervention required" line is logged once (#308, D4).
+    indexer_degraded_after_failures: int = Field(3, ge=1)
+    # How many times one invocation of an index pass may roll back and re-run
+    # a scope after quarantining a poison note (#308, D3). Beyond it the pass
+    # fails as an ordinary failure; the notes already quarantined stay so.
+    indexer_quarantine_retries_per_tick: int = Field(5, ge=0)
+    # The scan's stat shortcut (#282): skip reading and hashing a note whose
+    # current `(size, mtime_ns, ctime_ns, inode)` equals the tuple recorded for
+    # the bytes that produced its row. Safe on local Linux filesystems (every
+    # bypass is enumerated in docs/architecture/indexing-and-embeddings.md,
+    # "The stat shortcut"). **Set it false for a vault on NFS, CIFS/SMB, any
+    # FUSE mount or FAT/exFAT**: attribute caching can serve a stale stat,
+    # inode numbers can be synthetic, FAT has 2 s mtime granularity and no
+    # real ctime, and a remote server's clock defeats the racy-stat rule. Off,
+    # every pass reads and hashes every file, as before.
+    index_stat_shortcut: bool = True
+    # The backstop that bounds every edit the shortcut can miss: a pass that
+    # reads and hashes everything runs for each scope at process start, from
+    # the panel's Reindex, and once this many hours have elapsed since that
+    # scope's last *successful* one (one that committed with nothing skipped).
+    index_full_hash_interval_hours: int = Field(24, ge=1)
     embedding_model: str = "bge-m3"
     embedding_dimensions: int = Field(1024, ge=1, le=16000)
     # bge-m3 design point. Must stay strictly greater than `chunk_overlap`:
@@ -455,6 +532,19 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_embedding_model: str = "text-embedding-3-small"
+    # ── Embedding transport (#185) ─────────────────────────────────────────
+    #
+    # The **active** provider's URL (`OLLAMA_URL` or `OPENAI_BASE_URL`) must be
+    # `https`, or `http` to a literal loopback host — or `http` to anything
+    # else only when this override is true. Default false (owner decision
+    # 2026-09-22): an `http://` URL never becomes encrypted by itself, so the
+    # plaintext hop has to be a written decision in the operator's `.env`.
+    # See "Embedding providers" in docs/architecture/indexing-and-embeddings.md.
+    embedding_allow_plaintext: bool = False
+    # Pins the trust anchor for an `https` embedding endpoint to this PEM file
+    # only (replacing certifi's bundle; the OS store is never consulted).
+    # Parsed once, at settings construction, in every mode including sandbox.
+    embedding_ca_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
 
     # Caps for the raw file-access tools (read_file / write_file). Read is
     # checked against on-disk size before reading; write against the decoded
@@ -659,6 +749,57 @@ class Settings(BaseSettings):
         4096, ge=1, le=AUTH_FAILURE_TABLE_SIZE_MAX
     )
 
+    # ── Proxy trust and the panel login budget (#189) ──────────────────────
+    #
+    # Interjected here, between L1 and L2, because both settings below are the
+    # *inputs* to L1: every limiter in this file keys on the address
+    # `ProxyHeadersMiddleware` resolves, and the login budget is the
+    # account-keyed half of the pair slowapi's address-keyed limit cannot
+    # express. The L2/L3 buckets resume below.
+
+    # The **only** statement in the tree of which peers may set `X-Forwarded-*`.
+    # The default is exactly the list that was hard-coded in `src/main.py`
+    # before this setting existed, so a deploy that changes no environment
+    # value changes no client-IP resolution. Narrowing it to the proxy's own
+    # address is the operator's job and must not need a code change — the
+    # deployment's Docker network is shared with containers that run
+    # user-supplied code, and any of them can forge the header that keys every
+    # limiter.
+    #
+    # `NoDecode` for `fts_configs`' reason: a bare `list[str]` is JSON-decoded
+    # by pydantic-settings, so the comma-separated form an operator naturally
+    # writes would abort startup. Env `TRUSTED_PROXY_IPS` accepts JSON
+    # (`["127.0.0.1"]`) or CSV (`127.0.0.1,10.0.0.0/8`); the `_OFF_SPELLINGS`
+    # convention disables the middleware entirely, which is the correct
+    # configuration for a directly-exposed deployment.
+    #
+    # Entries are stored **canonicalised** — see `_parse_trusted_proxy_ips`.
+    # uvicorn's own `--forwarded-allow-ips` is switched off in the `Dockerfile`
+    # rather than aligned with this list: two controls that happen to agree is
+    # not one control, and uvicorn's reads `$FORWARDED_ALLOW_IPS`.
+    trusted_proxy_ips: Annotated[list[str], NoDecode] = [
+        "127.0.0.1",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+    ]
+
+    # The per-**account** failed-login budget on `POST /admin/auth/login`,
+    # additive to the 5/min per-address slowapi limit and replacing neither: an
+    # address-keyed limit hands an attacker a fresh allowance for every address
+    # they rotate through. Keyed exactly on `users.id` and counted only for a
+    # username that resolves to a row, so it can never reach another account
+    # and an unknown name creates nothing — **no table-size setting**, because
+    # the key space is the set of accounts rather than free-to-mint addresses.
+    # Ten failures in fifteen minutes is far above a human typo rate and far
+    # below an online guessing budget worth having. Not a lockout: nothing
+    # durable is written, there is no unlock, and the counter self-heals a
+    # window after the last failure (`docs/architecture/rate-limits.md`).
+    panel_login_failure_limit: NullableLimit = 10
+    panel_login_failure_window_seconds: int = Field(
+        900, ge=1, le=LIMITER_WINDOW_SECONDS_MAX
+    )
+
     # L2 — the general velocity bucket, on every tool call. Far above observed
     # usage (~1,600 calls per 30 days across all credentials), and it stops a
     # hot loop within a second; the burst covers a post-search fan-out.
@@ -692,12 +833,167 @@ class Settings(BaseSettings):
     )
 
     # The daily quota a **newly created** key receives when the caller does not
-    # say otherwise. Applied by the key-creation paths and never as a column
-    # default: existing keys are grandfathered, and an explicit null still
-    # means unlimited. ~1,600 calls per 30 days across every credential, so
-    # 5,000/day cannot interrupt a real session while a runaway stops the same
-    # day.
+    # say otherwise — an omitted JSON field or a blank panel field (#323).
+    # Applied by the key-creation paths and never as a column default: existing
+    # keys are grandfathered. Unlimited is an administrator's explicit request
+    # only (JSON `null`, or the panel's Unlimited box); with this setting null,
+    # a create that names no limit is refused as missing one rather than
+    # silently becoming unlimited. ~1,600 calls per 30 days across every
+    # credential, so 5,000/day cannot interrupt a real session while a runaway
+    # stops the same day.
     default_daily_request_limit: NullableDailyLimit = 5000
+
+    # ── The key-creation budget and active-key cap (#323) ──────────────────
+    #
+    # Every new API key is a fresh `/mcp` principal with full general and write
+    # bursts, so unthrottled creation resets the per-principal buckets. Both
+    # creation routes (`POST /api/keys` and `POST /admin/keys/create`) charge
+    # one in-process budget with two counters, both of which must admit: one
+    # keyed exactly on the account, one on the trusted client address. Neither
+    # key subsumes the other — rotating addresses must not outrun the account
+    # counter, rotating accounts must not outrun the address counter. A person
+    # creates a handful of keys in a session; the address limit is the looser
+    # so accounts behind one NAT do not refuse each other.
+    key_creation_account_limit: NullableLimit = 10
+    key_creation_address_limit: NullableLimit = 20
+    # Fixed window, opened by a counter's first charge — the login budget's
+    # shape. Not nullable: disable the counters above instead.
+    key_creation_window_seconds: int = Field(
+        3600, ge=1, le=LIMITER_WINDOW_SECONDS_MAX
+    )
+    # The budget bounds the *flow* of new keys, not the *stock*: at 10/hour a
+    # non-admin could hold thousands of active keys within a month, each with
+    # its own bursts. This caps the active keys a non-admin account may own;
+    # admins and the single-user operator are exempt, and nothing existing is
+    # revoked to get under it.
+    key_max_active_per_account: NullableLimit = 25
+
+    # Process-local concurrency (#261, #188 `concurrency-enforce-ready`).
+    # Modes: `off`; `shadow` (observe, never wait: configured waits are only
+    # reported); `queue` (wait like enforce, admit with an overrun mark where
+    # enforce would refuse for capacity); `enforce`. A mode change is one line:
+    # every other setting validates identically in all four modes.
+    mcp_concurrency_mode: Literal["off", "shadow", "queue", "enforce"] = "shadow"
+    # Tool-stage wait (one deadline across every tool dimension).
+    mcp_concurrency_wait_seconds: float = Field(5, ge=0, le=10, allow_inf_nan=False)
+    # One per-request deadline shared by the request and auth stages (D1).
+    mcp_concurrency_transport_wait_seconds: float = Field(2, ge=0, le=5, allow_inf_nan=False)
+    mcp_concurrency_requests: int = Field(64, ge=1, le=10000)
+    mcp_concurrency_fingerprint: int = Field(20, ge=1, le=10000)
+    mcp_concurrency_request_waiters: int = Field(64, ge=1, le=10000)
+    mcp_concurrency_fingerprint_waiters: int = Field(16, ge=1, le=10000)
+    mcp_concurrency_auth: int = Field(2, ge=1, le=15)
+    mcp_concurrency_auth_waiters: int = Field(32, ge=1, le=10000)
+    mcp_concurrency_tools: int = Field(6, ge=1, le=15)
+    mcp_concurrency_tenant: int = Field(4, ge=1, le=15)
+    mcp_concurrency_principal: int = Field(3, ge=1, le=15)
+    # Independent class ceilings, each <= TOOLS (D2/D3); they need not sum to it.
+    mcp_concurrency_embedding: int = Field(1, ge=1, le=15)
+    mcp_concurrency_vector: int = Field(1, ge=1, le=15)
+    mcp_concurrency_write: int = Field(1, ge=1, le=15)
+    mcp_concurrency_scan: int = Field(2, ge=1, le=15)
+    mcp_concurrency_light: int = Field(4, ge=1, le=15)
+    # Legacy #261 class, split into LIGHT and SCAN. `1` (the old .env.example
+    # default, which expressed no intent) is ignored with one WARNING; any
+    # other value is refused at boot.
+    mcp_concurrency_other: int | None = None
+    mcp_concurrency_waiters: int = Field(64, ge=1, le=10000)
+    mcp_concurrency_tenant_waiters: int = Field(32, ge=1, le=10000)
+    mcp_concurrency_principal_waiters: int = Field(16, ge=1, le=10000)
+    mcp_concurrency_registry_size: int = Field(1024, ge=1, le=100000)
+    mcp_concurrency_writers: int = Field(1, ge=1, le=15)
+    mcp_concurrency_writer_waiters: int = Field(64, ge=1, le=10000)
+    mcp_concurrency_writer_wait_seconds: float = Field(.25, ge=0, le=.25, allow_inf_nan=False)
+    # Process-wide byte budget for `/mcp` messages the transport watcher reads
+    # while a request waits (D1). Exhaustion stops *consuming*; nothing already
+    # consumed is ever dropped.
+    mcp_concurrency_replay_budget_bytes: int = Field(
+        32 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024)
+
+    # ── The /mcp body-memory budget (#322) ─────────────────────────────────
+    #
+    # A memory-safety bound, not a tuning knob: always on, in every
+    # `MCP_CONCURRENCY_MODE`, with no shadow mode and no off switch. Every
+    # range below only allows the *safe* direction. The derivation (cgroup
+    # limit × fraction ÷ multiplier) and the boot check live in
+    # `src/services/body_budget.py` and run in the lifespan, never here: the
+    # migration init container imports these settings under its own, smaller
+    # memory limit and must not be refused for it. See
+    # `docs/architecture/rate-limits.md`.
+    #
+    # The memory budget in bytes. **Not a `NullableLimit`:** unset means
+    # "derive from the cgroup limit", never "disabled". Elsewhere in this file
+    # null means off; here there is no off. Startup refuses a value above the
+    # safe allocation of a readable cgroup limit.
+    mcp_body_memory_budget_bytes: int | None = Field(None, ge=64 * 1024 * 1024)
+    # Share of the cgroup limit given to request bodies. Capped at 0.5 so the
+    # fixed non-body headroom stays.
+    mcp_body_memory_fraction: float = Field(0.5, ge=0.1, le=0.5, allow_inf_nan=False)
+    # Peak memory per raw body byte. 6.7× was the import_from_url figure
+    # before its URL cap; after it, measured 3.17× (write_file) and 4.09×
+    # (import_from_url) — see docs/architecture/rate-limits.md. 8 is the
+    # safety floor, with headroom over both.
+    mcp_body_memory_multiplier: int = Field(8, ge=8, le=32)
+    # How long a request that does not fit waits before its transport 429.
+    mcp_body_budget_wait_seconds: float = Field(15, ge=0, le=60, allow_inf_nan=False)
+    # Waiters across both lanes; one more is refused at once.
+    mcp_body_budget_waiters: int = Field(8, ge=1, le=256)
+
+    @model_validator(mode="after")
+    def _validate_concurrency(self) -> "Settings":
+        """Hierarchy, coherence and pool budget; every error names its settings."""
+        from src.services.pool_budget import CLASS_CONNECTIONS, budget_terms
+
+        def env(name: str) -> str:
+            return "MCP_CONCURRENCY_" + name.upper()
+
+        def val(name: str) -> int:
+            return getattr(self, "mcp_concurrency_" + name)
+
+        other = self.mcp_concurrency_other
+        if other is not None:
+            if other != 1:
+                raise ValueError(
+                    f"MCP_CONCURRENCY_OTHER={other} is no longer supported: the "
+                    "`other` class was split into MCP_CONCURRENCY_LIGHT and "
+                    "MCP_CONCURRENCY_SCAN; set those and remove MCP_CONCURRENCY_OTHER")
+            logging.getLogger(__name__).warning(
+                "MCP_CONCURRENCY_OTHER=1 is ignored: the `other` class was split "
+                "into MCP_CONCURRENCY_LIGHT (default 4) and MCP_CONCURRENCY_SCAN "
+                "(default 2); remove the legacy line")
+        classes = ("embedding", "vector", "write", "scan", "light")
+        pairs = (
+            ("fingerprint", "requests"),
+            ("principal", "tenant"),
+            ("tenant", "tools"),
+            *((cls, "tools") for cls in classes),
+            ("principal_waiters", "tenant_waiters"),
+            ("tenant_waiters", "waiters"),
+            ("fingerprint_waiters", "request_waiters"),
+        )
+        for child, parent in pairs:
+            if val(child) > val(parent):
+                raise ValueError(
+                    f"{env(child)} ({val(child)}) must not exceed {env(parent)} ({val(parent)})")
+        # The transport envelope must not refuse what the tool stage would
+        # queue: one principal's admitted plus waiting tools each hold a request.
+        if val("fingerprint") < val("principal") + val("principal_waiters"):
+            raise ValueError(
+                f"MCP_CONCURRENCY_FINGERPRINT ({val('fingerprint')}) must be at least "
+                f"MCP_CONCURRENCY_PRINCIPAL ({val('principal')}) + "
+                f"MCP_CONCURRENCY_PRINCIPAL_WAITERS ({val('principal_waiters')})")
+        caps = {cls: val(cls) for cls in classes}
+        terms = budget_terms(auth=val("auth"), tools=val("tools"), caps=caps,
+                             writers=val("writers"))
+        if terms["total"] > terms["capacity"]:
+            mix = ", ".join(f"{env(c)} {caps[c]}x{CLASS_CONNECTIONS[c]}" for c in caps)
+            raise ValueError(
+                "MCP_CONCURRENCY pool budget exceeded: "
+                f"MCP_CONCURRENCY_AUTH {terms['auth']} + tool demand {terms['tool_demand']} "
+                f"(MCP_CONCURRENCY_TOOLS {val('tools')}; {mix}) + "
+                f"MCP_CONCURRENCY_WRITERS {terms['writers']} + headroom {terms['headroom']} "
+                f"= {terms['total']} > pool capacity {terms['capacity']}")
+        return self
 
     multi_user_mode: bool = False
     session_max_age: int = 60 * 60 * 24 * 7
@@ -792,12 +1088,67 @@ class Settings(BaseSettings):
         "chatgpt.com",
     ]
 
+    # How long a dynamically registered OAuth client may sit **never used**
+    # before the maintenance pass deletes it. `/register` is unauthenticated by
+    # RFC 7591 and nothing else bounds `oauth_clients`, so without this the
+    # table only grows.
+    #
+    # **Thirty days, measured against the actual use.** A DCR client registers
+    # and authorizes within seconds, so any gap over a few hours is already
+    # anomalous; thirty days is two orders of magnitude of slack while still
+    # bounding the table at roughly a month of the 3/min registration
+    # limiter's output.
+    #
+    # "Never used" is `oauth_clients.last_used_at IS NULL`, and migration 025
+    # stamped every row that existed when it ran — so that can only mean a
+    # registration made *after* 025 which has never issued a code or a token.
+    # The sweep additionally requires no surviving code or token row of any
+    # state and no owning user; see
+    # `docs/architecture/oauth-and-grants.md`.
+    #
+    # `NullableLimit`, so the house "off" spellings (empty, `null`, `none`)
+    # disable the sweep entirely and `ge=1` refuses zero: a zero-day window
+    # would delete a registration the moment it was made, which reads to an
+    # operator as an outage rather than as a setting (#162's reason). Env:
+    # OAUTH_CLIENT_UNUSED_EXPIRY_DAYS.
+    oauth_client_unused_expiry_days: NullableLimit = 30
+
+    # The absolute lifetime of an OAuth grant family, in days (#326, ASVS
+    # V10.4.8). Each rotation mints a fresh 30-day refresh token, so without a
+    # cap a party that refreshes at least monthly keeps the grant for ever. The
+    # deadline is `oauth_tokens.grant_issued_at` plus this, derived at use, so
+    # lowering it takes effect at the next request for every family and
+    # raising it extends existing ones (accepted, L1).
+    #
+    # Deliberately a plain int and **not** a `NullableLimit`: empty, `null`,
+    # `none` and `0` all fail at boot. The client sweep's kill switch exists
+    # because that sweep deletes things; nothing here deletes anything, and the
+    # worst outcome of a wrong value is a connector re-authorizing. A disabled
+    # spelling *is* #326 — an ASVS L2 control one blank env line silently
+    # removes. Zero would make every grant dead on arrival (an outage, not a
+    # setting). The 365-day ceiling keeps "absolute" meaning something: a value
+    # large enough to be indistinguishable from disabled is the same hole
+    # spelled differently. The rollback lever is raising the value. See
+    # `docs/architecture/oauth-and-grants.md`. Env:
+    # OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS.
+    oauth_grant_absolute_lifetime_days: int = Field(90, ge=1, le=365)
+
     # Registry-eval only: when true, lifespan skips the DB dim check,
     # indexer, and embedding provider, and the /mcp auth middleware
     # short-circuits. Lets Glama's sandbox build the image and validate
     # MCP introspection without real external deps. Never enable in
     # production — tools register but cannot run.
     mcp_sandbox_mode: bool = False
+
+    # Refuse MCP tool calls carrying an argument the tool does not declare, and
+    # publish `additionalProperties: false` on every input schema (#295). The
+    # SDK otherwise drops unknown names silently, so a misspelled filter
+    # (`folders=` for `folder=`) returns unfiltered results the agent believes
+    # are filtered. Read at import, when the tools are registered. `false` is
+    # the rollback — the SDK's ignore behaviour and unmodified schemas — for a
+    # client found to send extras; it is logged at WARNING on every HTTP server start.
+    # Env: MCP_REJECT_UNKNOWN_ARGUMENTS.
+    mcp_reject_unknown_arguments: bool = True
 
     # ── Logging (see docs/architecture/security-event-logging.md) ───────────
     # The root level `src/logging_setup.configure_logging()` applies. Accepts
@@ -811,10 +1162,24 @@ class Settings(BaseSettings):
     # else when `Settings()` is constructed, i.e. at startup.
     log_format: Literal["json", "text"] = "json"
 
+    # ── Panel Content-Security-Policy (#195) ─────────────────────────────────
+    # The rollback lever for the nonce policy on the panel, login and consent
+    # pages (see docs/architecture/control-panel.md). `enforce` sends
+    # `Content-Security-Policy`; `report-only` sends the identical value as
+    # `Content-Security-Policy-Report-Only`; `off` sends neither. Changing it
+    # needs only an `.env` edit and a container recreate — no rebuild. The
+    # transfer pages' own policy is unaffected by every value. `Literal`
+    # refuses anything else at startup; the effective mode is logged once, and
+    # at WARNING when it is not `enforce`.
+    panel_csp: Literal["enforce", "report-only", "off"] = "enforce"
+
     # `extra` stays at pydantic-settings' default ("forbid") so a misspelled
     # constructor kwarg or an unknown init value is still a hard error; only the
     # dotenv source is filtered (see `settings_customise_sources` below).
-    model_config = {"env_file": ".env"}
+    # A refused setting must not be echoed back: pydantic appends the raw input
+    # to a ValidationError, which would print a credential-bearing URL (or any
+    # secret) into the startup traceback.
+    model_config = {"env_file": ".env", "hide_input_in_errors": True}
 
     @classmethod
     def settings_customise_sources(
@@ -1012,6 +1377,91 @@ class Settings(BaseSettings):
             out.append(host)
         return out
 
+    @field_validator("trusted_proxy_ips", mode="before")
+    @classmethod
+    def _parse_trusted_proxy_ips(cls, v):
+        """Accept a JSON list, a comma-separated string, or a list of peers —
+        then validate every entry and store it in its **canonical** form.
+
+        Parsing mirrors `_parse_known_redirect_hosts`. Two rules are this
+        setting's own.
+
+        **A malformed entry refuses startup, naming it.** A trust list that
+        quietly drops a range is worse than one that fails: the operator
+        believes they configured a boundary that is not there, and every
+        limiter keyed on the resolved address silently changes meaning.
+
+        **Validation alone is not enough; the stored value must be canonical.**
+        `ip_network("192.168.0.10/24", strict=False)` *accepts* host bits and
+        answers `192.168.0.0/24`, but if the original string is what reaches
+        `ProxyHeadersMiddleware`, uvicorn's stricter parse rejects it and keeps
+        it as a literal matching no peer. The failure is silent and inverts the
+        intent: every proxied request then retains the **proxy's** address, so
+        all callers collapse into one limiter bucket. A bare address stays bare
+        (`127.0.0.1`, not `127.0.0.1/32`) so the logged list reads as what the
+        operator wrote.
+
+        An **empty** list is accepted and means no peer is trusted, which is
+        the correct configuration for a directly-exposed deployment; the
+        middleware is then not installed at all.
+        """
+        if isinstance(v, str):
+            s = v.strip()
+            if s.casefold() in _OFF_SPELLINGS:
+                return []
+            if s.startswith("["):
+                import json
+
+                try:
+                    parsed = json.loads(s)
+                except ValueError as e:
+                    # Looks like JSON (leading "[") but isn't — fail loudly
+                    # rather than CSV-splitting into junk addresses.
+                    raise ValueError(
+                        "TRUSTED_PROXY_IPS looks like JSON but failed to "
+                        f"parse: {e}. Use a JSON list "
+                        '(["127.0.0.1","10.0.0.0/8"]) or a comma-separated '
+                        "string (127.0.0.1,10.0.0.0/8)."
+                    ) from e
+                if not isinstance(parsed, list):
+                    raise ValueError(
+                        "TRUSTED_PROXY_IPS JSON must be a list of addresses "
+                        "or CIDR networks"
+                    )
+                v = parsed
+            else:
+                v = s.split(",")
+        if v is None:
+            return []
+        if not isinstance(v, (list, tuple)):
+            raise ValueError(
+                "TRUSTED_PROXY_IPS must be a list of IP addresses or CIDR "
+                "networks (JSON or comma-separated)"
+            )
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in v:
+            entry = str(item).strip()
+            if not entry:
+                continue
+            try:
+                if "/" in entry:
+                    canonical = str(ipaddress.ip_network(entry, strict=False))
+                else:
+                    canonical = str(ipaddress.ip_address(entry))
+            except ValueError as e:
+                raise ValueError(
+                    f"TRUSTED_PROXY_IPS entry {entry!r} is neither an IP "
+                    f"address nor a CIDR network: {e}. Each entry is one peer "
+                    "or one network; there is no wildcard spelling — clear the "
+                    "setting to trust nobody."
+                ) from e
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            out.append(canonical)
+        return out
+
     # Set by `_record_public_origin`, which must run *before*
     # `_derive_public_urls` fills in the localhost fallback. Once that
     # fallback has been applied, `base_url` is no longer evidence of what the
@@ -1042,6 +1492,100 @@ class Settings(BaseSettings):
         if not isinstance(v, str):
             return v
         return v.strip().lower() or None
+
+    @model_validator(mode="after")
+    def _validate_database_transport(self) -> "Settings":
+        """Design D3/D2a/D3a: refuse every ambiguous database TLS input.
+
+        TLS for the database has one source, `DATABASE_SSL_*`. A TLS key in
+        the URL's query or a `PGSSL*` variable would be merged with it by
+        driver rules nobody can see, so each is refused; so is a CA with a
+        non-verifying mode (libpq would silently upgrade `require`), a
+        verifying mode without a CA, half a client pair, a client pair under
+        a lax mode, and any named file that is missing, not regular, not
+        readable or not loadable. Under a strict mode every Unix-socket route
+        is refused too, before any connection exists. Messages never echo the
+        URL or its password.
+        """
+        from src.services.transport_security import (
+            STRICT_DB_MODES,
+            VERIFYING_DB_MODES,
+            build_database_ssl_context,
+            check_certificate_file,
+            validate_database_url_transport,
+        )
+
+        mode = self.database_ssl_mode
+        validate_database_url_transport(self.database_url, mode)
+        ca, cert, key = (
+            self.database_ssl_ca_file,
+            self.database_ssl_cert_file,
+            self.database_ssl_key_file,
+        )
+        if mode in VERIFYING_DB_MODES and ca is None:
+            raise ValueError(
+                f"DATABASE_SSL_MODE={mode} requires DATABASE_SSL_CA_FILE: a "
+                "verifying mode needs a stated trust anchor (point it at the "
+                "system bundle explicitly for a publicly-trusted certificate)."
+            )
+        if ca is not None and mode not in VERIFYING_DB_MODES:
+            raise ValueError(
+                f"DATABASE_SSL_CA_FILE is set but DATABASE_SSL_MODE={mode} does "
+                "not verify the server. Use DATABASE_SSL_MODE=verify-ca or "
+                "verify-full, or unset DATABASE_SSL_CA_FILE."
+            )
+        if (cert is None) != (key is None):
+            raise ValueError(
+                "DATABASE_SSL_CERT_FILE and DATABASE_SSL_KEY_FILE must be set "
+                "together: a client certificate needs its key."
+            )
+        if cert is not None and mode not in STRICT_DB_MODES:
+            raise ValueError(
+                "DATABASE_SSL_CERT_FILE / DATABASE_SSL_KEY_FILE are set but "
+                f"DATABASE_SSL_MODE={mode} does not require TLS. Use require, "
+                "verify-ca or verify-full, or unset the client certificate."
+            )
+        for setting, path in (
+            ("DATABASE_SSL_CA_FILE", ca),
+            ("DATABASE_SSL_CERT_FILE", cert),
+            ("DATABASE_SSL_KEY_FILE", key),
+        ):
+            if path is not None:
+                check_certificate_file(path, setting)
+        if mode in STRICT_DB_MODES:
+            # Parse now, so an unloadable file refuses the boot here rather
+            # than at `src.database` import; the engine builds its own copy.
+            build_database_ssl_context(mode, ca, cert, key)
+        return self
+
+    # The database passwords this repository has shipped as placeholders,
+    # compared trimmed and case-folded (#324).
+    _DATABASE_PASSWORD_PLACEHOLDERS = frozenset({"changeme", "change_me"})
+
+    @model_validator(mode="after")
+    def _reject_placeholder_database_password(self) -> "Settings":
+        """Refuse a DATABASE_URL whose password is a shipped placeholder (#324).
+
+        An absent or empty password is accepted: peer, trust and certificate
+        authentication are legitimate outside the bundles. The message names
+        the setting and how to generate a value, never the URL (it carries
+        the credential).
+        """
+        try:
+            raw = urlsplit(self.database_url).password
+        except ValueError:
+            return self
+        if raw is None:
+            return self
+        if unquote(raw).strip().casefold() in self._DATABASE_PASSWORD_PLACEHOLDERS:
+            raise ValueError(
+                "DATABASE_URL carries a placeholder password (changeme / "
+                "CHANGE_ME). Generate one with `openssl rand -hex 32` and set "
+                "it on the database role and in DATABASE_URL; the bundled "
+                "compose files build DATABASE_URL from OBSIDIAN_DB_PASSWORD in "
+                ".env (see DEPLOYMENT.md)."
+            )
+        return self
 
     @model_validator(mode="after")
     def _record_public_origin(self) -> "Settings":
@@ -1151,6 +1695,54 @@ class Settings(BaseSettings):
         if self.embedding_provider == "openai" and not (self.openai_api_key or "").strip():
             raise ValueError(
                 "OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai"
+            )
+        return self
+
+    # The `ssl.SSLContext` parsed from `EMBEDDING_CA_FILE` by the validator
+    # below, or `None`. Reused by `embedding_http_client`; the file is never
+    # re-read.
+    _embedding_ssl_context: Any = PrivateAttr(default=None)
+
+    @property
+    def embedding_ssl_context(self):
+        """The parsed `EMBEDDING_CA_FILE` context, or `None` (certifi applies)."""
+        return self._embedding_ssl_context
+
+    @model_validator(mode="after")
+    def _validate_embedding_transport(self) -> "Settings":
+        """Design D6: the active embedding URL's scheme policy and the CA file.
+
+        The CA file is checked and **parsed in every mode**, sandbox included:
+        a broken trust anchor is a broken configuration whatever the process
+        is for. Everything that depends on the endpoint URL — the scheme
+        policy and the CA-with-`http` refusal — is skipped under
+        `MCP_SANDBOX_MODE`, which never calls a provider. The inactive
+        provider's URL is never dialled and is therefore never validated.
+        """
+        from src.services.transport_security import (
+            check_embedding_url_policy,
+            load_embedding_ca_context,
+        )
+
+        self._embedding_ssl_context = (
+            load_embedding_ca_context(self.embedding_ca_file)
+            if self.embedding_ca_file is not None
+            else None
+        )
+        if self.mcp_sandbox_mode:
+            return self
+        if self.embedding_provider == "openai":
+            setting, url = "OPENAI_BASE_URL", self.openai_base_url
+        else:
+            setting, url = "OLLAMA_URL", self.ollama_url
+        endpoint = check_embedding_url_policy(
+            url, setting=setting, allow_plaintext=self.embedding_allow_plaintext
+        )
+        if self.embedding_ca_file is not None and endpoint.scheme != "https":
+            raise ValueError(
+                f"EMBEDDING_CA_FILE is set but {setting} uses plaintext http, "
+                "where a trust anchor verifies nothing. Use an https endpoint "
+                "or unset EMBEDDING_CA_FILE."
             )
         return self
 
@@ -1356,8 +1948,9 @@ class Settings(BaseSettings):
                 f"DEFAULT_DAILY_REQUEST_LIMIT ({limit}) must be within "
                 f"{_DAILY_REQUEST_LIMIT_MIN}..{_DAILY_REQUEST_LIMIT_MAX}, the "
                 "domain every daily request limit obeys "
-                "(ck_api_keys_daily_request_limit). Null means new keys are "
-                "created unlimited."
+                "(ck_api_keys_daily_request_limit). Null means a new key "
+                "must name its limit (only an administrator may ask for "
+                "unlimited)."
             )
         return self
 

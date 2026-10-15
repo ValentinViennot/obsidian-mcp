@@ -4,11 +4,7 @@
 
 ## Embedding providers
 - `EMBEDDING_PROVIDER=ollama` (default) — uses `OLLAMA_URL` and
-  `EMBEDDING_MODEL`. Native batching: up to `OLLAMA_BATCH_LIMIT` (32) inputs
-  per `/api/embed` POST, with sub-batching for larger lists, positional order
-  preservation checked against the response length, and per-chunk degradation
-  when a batched request fails. `embed_one` (the `semantic_search` query path)
-  still sends a bare string.
+  `EMBEDDING_MODEL`; pooled hardened HTTP transport and sequential `/api/embed` requests of at most `OLLAMA_EMBED_BATCH_SIZE` inputs each (default16,1–256), positional cardinality checks and attributed per-chunk fallback. Query requests retain the supported bare-string shape.
 - `EMBEDDING_PROVIDER=openai` — requires `OPENAI_API_KEY` (validated at
   startup). Uses `OPENAI_BASE_URL` (default `https://api.openai.com/v1`)
   and `OPENAI_EMBEDDING_MODEL` (default `text-embedding-3-small`). Native
@@ -31,6 +27,185 @@
   sandbox mode and when the extension is not installed yet (alembic's job).
   See "Filtered vector search" in [search.md](search.md) for why an older
   backend fails *silently* without it.
+
+### The embedding hop's transport (#185)
+
+Every chunk the indexer embeds and every `semantic_search` / `find_related`
+query crosses this hop, and an interposing peer can do worse than read it: it
+can answer with vectors of its choosing, which is a **silently wrong search
+result** an agent acts on. So the endpoint is held to a policy at boot and every
+client that talks to it is built one way. The code is
+`src/services/transport_security.py`; the validator is
+`Settings._validate_embedding_transport`.
+
+**The scheme policy** applies to the **active** provider's URL only —
+`OLLAMA_URL` under `EMBEDDING_PROVIDER=ollama`, `OPENAI_BASE_URL` under
+`openai`. The inactive one is never dialled, so validating it would refuse a
+deployment for a setting it does not use. In order:
+
+0. **The raw string is checked before any parser sees it.** Leading or trailing
+   whitespace, or any C0 control character or DEL anywhere, refuses. Nothing is
+   normalised: the string the validator approves is byte-for-byte the one the
+   providers interpolate (`f"{settings.ollama_url}/api/embed"`) and the report
+   prints.
+1. **`httpx.URL` is the only parser.** It is the parser the clients use, so the
+   host the policy judges is the host the request dials. `urllib.parse.urlsplit`
+   strips leading whitespace and deletes embedded tab/CR/LF, so it approves
+   strings httpx rejects (`' https://x/v1'` has no scheme to httpx); it is used
+   nowhere in the policy, and a differential test holds the policy to httpx's
+   verdict wherever the two disagree. A parse error, a scheme other than
+   `http`/`https`, no host, any userinfo, or a port outside 1–65535 refuses —
+   and the message never echoes userinfo.
+2. `https` is accepted.
+3. `http` to a **literal** loopback host is accepted — `localhost`, 127.0.0.0/8,
+   `::1`, bracketed or not, with a trailing dot — using the same fail-closed
+   `_is_loopback_host` as the sandbox guard. No DNS resolution: a name that
+   resolves to loopback is non-loopback. `127.0.0.1.evil.example` is a DNS name;
+   `http://127.0.0.1@evil.example` dials `evil.example` and is refused by rule 1
+   anyway.
+4. `http` to anything else is accepted **only with
+   `EMBEDDING_ALLOW_PLAINTEXT=true`**; the refusal names both remedies (`https`
+   with `EMBEDDING_CA_FILE`, or the override).
+5. **`MCP_SANDBOX_MODE`** skips rules 0–4 and the CA-with-`http` refusal —
+   everything that depends on the endpoint URL, since sandbox never calls a
+   provider. It never skips the CA file's own validity.
+
+**Why the override defaults to refusal** (owner decision, 2026-09-22), when
+the database hop's default is the permissive `prefer`: the two are not
+symmetric. `prefer` at least *attempts* TLS and becomes encrypted the day the
+server enables it; an `http://` URL never will — it stays cleartext until
+someone edits it, and a warning in a log nobody reads is how #185 went
+unnoticed. The override makes the plaintext hop a written decision in the
+operator's own `.env`, costs one line (`.env.example` ships it beside the
+`http://ollama:11434` default), and is removed the day the hop gains TLS. When
+it admits a non-loopback `http` URL, the lifespan emits
+`internal_transport_plaintext` (`reason=embedding`, `outcome=override`) once
+per start; loopback `http` does not, because that traffic never leaves the
+network namespace.
+
+**`EMBEDDING_CA_FILE`** pins the trust anchor for an internal CA. It is checked
+(exists, regular file, readable) and **parsed at settings construction** with
+`ssl.create_default_context(cafile=…)`, which loads that file only; the
+context is kept on the settings object and reused, and the file is never read
+again. Parsing lazily in the factory was wrong: the OpenAI provider makes no
+startup call and Ollama's warm-up swallows failures, so a bad CA would have
+booted "healthy" and failed every embedding. The file is refused with an
+`http` URL — a trust anchor on a hop with no TLS verifies nothing — and it is
+checked in every mode, sandbox included.
+
+**One client factory**, `embedding_http_client(timeout)`, builds every HTTP
+client aimed at the embedding endpoint: both providers and the panel's Ollama
+reachability ping. It sets:
+
+- **`trust_env=False`.** httpx otherwise reads the environment for every
+  client: `HTTP(S)_PROXY` / `ALL_PROXY` would carry an approved loopback `http`
+  hop to a remote proxy in cleartext, `SSL_CERT_FILE` / `SSL_CERT_DIR` would
+  silently replace the trust anchor, and `.netrc` would add credentials. The
+  policy judged the URL; with the environment off, the URL is the whole hop.
+  The cost is that embeddings cannot go through an ambient proxy (accepted
+  limitation 9 of the change).
+- **`verify=`** the parsed `EMBEDDING_CA_FILE` context, else **certifi's
+  bundle**, built once. That is what `verify=True` already meant, stated
+  rather than implied so it does not depend on `trust_env` and the startup
+  line can name it (`verify=certifi` / `ca-file` / `n/a`). The operating
+  system's store is never consulted.
+- **`follow_redirects=False`**, httpx's default written down: a redirect is the
+  one way a validated `https` endpoint could hand the request to an `http://`
+  one after boot.
+
+A test sweeps `src/services/embeddings.py` and `src/control_panel/routes.py`
+for any direct `httpx.AsyncClient(` / `httpx.Client(` construction, so a fourth
+call site cannot bypass the factory silently.
+
+**The startup line**, logged once by `log_embedding_transport()` right after
+the database probe: `Embedding transport: provider=… scheme=… host=… port=…
+verify=… plaintext_override=…` — scheme, host and port only, never the path,
+query or userinfo. `plaintext_override=True` means the override is what
+admitted this hop (plaintext to a non-loopback host).
+
+### One pooled client per provider, and Ollama batches (#281)
+
+**D14 — the shared client is built by the factory, never beside it.** Each
+provider used to open and close an `httpx` client per request, so every chunk
+and every search query paid a new TCP (and TLS) handshake. Each provider now
+keeps one pooled client (`_SharedClient` in `embeddings.py`), and it is
+obtained **only** by calling `embedding_http_client(timeout)` — so
+`trust_env=False`, `follow_redirects=False` and the pinned CA context hold for
+the pooled instance by construction, and the sweep above stays green with no
+exemption. The client is:
+
+- **created lazily and keyed to the running event loop.** A pooled
+  connection belongs to the loop that opened it; pytest's per-test loops and
+  the maintenance scripts' `asyncio.run` would otherwise inherit a client
+  bound to a dead loop and fail in ways that look like provider outages. A
+  client whose loop is not the running one (or that is closed) is dropped and
+  rebuilt — dropped, not closed, because closing it would need the loop it
+  belongs to.
+- **closed in the lifespan's shutdown** (`close_provider_client()`), after the
+  indexer task has been cancelled and awaited and before `engine.dispose()`.
+- **given its timeout per request**: every `post(..., timeout=)` carries 30 s
+  for Ollama and 60 s for OpenAI (the values are unchanged; the client-level
+  timeout is the same number). Pool limits are httpx's defaults.
+
+**D15 — Ollama embeds through fixed-size `/api/embed` batches.** `embed_batch`
+splits the chunk list into consecutive slices of `OLLAMA_EMBED_BATCH_SIZE` and
+sends each as one request with an `input` array, awaited under
+`asyncio.wait_for(..., 30.0)`. Every response must carry exactly
+`len(slice)` vectors, in input order, or the batch raises and no vector of it
+is used; `embed_note`'s whole-note cardinality check stays above it. The
+input-limit translation (#194) is unchanged. OpenAI keeps its native 96-input
+batching and its own retry contract; it is adapted to the shared client only.
+Why the size is fixed and there is still no aggregate deadline is the D5
+bullet under "Indexing decisions" below.
+
+### Chunk-vector reuse (#281, D16)
+
+A stored vector is reused for a chunk whose text is **byte-identical** to a
+stored chunk of the same note, so an append or a metadata-only edit no longer
+re-embeds the whole note. A reused vector attached to text it was not computed
+from — or computed by another model — would be a silently wrong search result,
+so reuse is gated three ways, and a doubt anywhere re-embeds:
+
+1. **Look up, then end the transaction.** On the certified path only (the two
+   production callers, which end their own read transaction before calling),
+   `_lookup_reusable_vectors` reads the note's `(id, chunk_text, embedding)`
+   rows and the stored embedding fingerprint, then **commits before any
+   provider I/O** — or rolls back and re-raises on an error. Holding even an
+   `AccessShareLock` on `note_embeddings` across the provider call would close
+   the #206 cycle against a reset, which takes the generation lock and then
+   needs the table exclusively (`ALTER TABLE … TYPE`).
+2. **Fingerprint present and equal.** Reuse is eligible only when the stored
+   fingerprint is `MATCH`. `ABSENT` claims nothing about the rows, so it
+   disables reuse (it still certifies, as before); `DIFFERS` and `UNREADABLE`
+   disable it and are then refused under the lock as always.
+3. **The reused rows survive, checked under the lock.** `_generation_matches`
+   takes `reused_rows` (row id → chunk text). After acquiring the generation
+   lock and re-reading the fingerprint, it requires the fingerprint to be
+   present (an absent table or row now refuses when anything was reused) and
+   every reused id to still exist **for this note with the same text**. Row ids
+   come from a sequence and `note_embeddings` rows are never updated in place,
+   so a surviving id is the same row with the same vector. A reset between the
+   lookup and the check deletes every row, so the check fails — the one
+   interleaving the fingerprint cannot see, a reset under an unchanged
+   fingerprint after a model-artifact change (fingerprint L1).
+
+Only the chunks without a stored vector are sent; the provider's answer must
+carry exactly one vector per chunk **sent**, and the note is certified only on
+full coverage of the **requested** (capped) list, reused and fresh together.
+Then `certify_embedded`, and every row — reused and new — is deleted and
+re-inserted in document order, exactly as before. No partial row surgery.
+
+**Accounting.** `on_provider_call` fires with the number of chunks sent and
+not at all when nothing is sent, so a note whose every chunk is reused is not
+an attempt and debits no budget. A `GENERATION_MISMATCH` counts as an attempt
+**if and only if** a provider call was issued: an all-reuse note that loses a
+reset race reports the mismatch with `attempted` unchanged.
+
+**L6 — reused vectors.** A reused vector is the provider's answer from when
+that chunk was first embedded. Batched and single requests can differ by
+numeric noise, so a note mixing reused and fresh vectors is not bit-identical
+to a from-scratch embed. The vector is assumed to be a function of (model,
+text) alone; the fingerprint names the model.
 
 ## Indexing decisions
 
@@ -109,6 +284,9 @@
   sweep repeats per pass), bytes that no longer hash to the row (the backlog
   owns it next pass), and a failed provider call (left unstamped). A pause
   stops it between notes; the next pass runs a fresh, idempotent sweep.
+  **It no longer runs every tick** (#282, D13): it is gated in memory on the
+  patterns' fingerprint plus a *clean* completion — see
+  [the sweep gate](#the-exclusion-sweep-gate-d13).
 - **Both move paths recompute the stem-derived `title`** (#127). It falls back
   to the filename stem, so a rename left `Alpha` on a note called `Beta.md`
   for ever — a move changes no content, so the scan never revisits the row.
@@ -120,6 +298,13 @@
   every falsy title (`false`, `0`, `[]`, `{}`, `""` all fall back to the stem)
   and trusted a copy that can be older than the file. The JSONB derivation
   survives only as the read/parse-failure fallback, declared best-effort.
+- **Note text is NUL-free from the decode point on** (#308, D1/D2). See
+  [the section below](#nul-free-derivation-not-indexable-paths-and-the-re-derive-stamp-308).
+  PostgreSQL `text` cannot hold U+0000, and one NUL in a body failed the
+  keyword-vector UPDATE and rolled the owner's whole pass back every tick for
+  8.5 days. `read_note_at` removes it before hashing; the shared title and tag
+  rules and the JSONB boundary remove it from frontmatter-derived strings; a
+  link whose decoded target contains it is not a link.
 - **A non-finite frontmatter number is converted at each JSON boundary, never
   at the parse** (#154). It is valid YAML and invalid JSON, so left alone it
   aborts the whole batch; coerced at the parse it would rewrite the note's own
@@ -133,12 +318,17 @@
   characters — today's statement — with each attempt in its own savepoint and
   the `try` **outside** `async with session.begin_nested()`, so the error
   unwinds through the context manager's rollback and leaves the outer
-  transaction usable. A floor failure propagates, exactly as before: the
-  incremental pass aborts with nothing committed and retries next tick, and
-  `_rebuild_tsvectors_single_scope_for_tests` is now **atomic** — its every-500 intermediate commits
-  are gone, so a floor failure rolls the whole rebuild back instead of leaving
-  a keyword index half-built under two FTS configs that no periodic pass would
-  repair. Verified against a real PostgreSQL
+  transaction usable. A floor failure propagates out of the helper, and the
+  two callers then differ (#308, D3): in the **incremental pass** a floor
+  failure with a poison SQLSTATE (class 22 or 54000) **quarantines that note
+  and the pass re-runs without it**, committing the rest — see
+  [the quarantine](#the-poison-note-quarantine-308-d3-d5); any other floor
+  failure still aborts the pass with nothing committed. The **full rebuild**
+  (`_rebuild_tsvectors_single_scope_for_tests`, and the all-scopes driver) is
+  excluded from the quarantine and is **atomic** — its every-500 intermediate
+  commits are gone, so a floor failure rolls the whole rebuild back and
+  surfaces to the operator instead of leaving a keyword index half-built under
+  two FTS configs that no periodic pass would repair. Verified against a real PostgreSQL
   (`tests/integration/test_tsvector_bounded_pg.py`); a mocked savepoint cannot
   show the driver's aborted-transaction state clearing.
 - **The rebuild certifies what it writes, and the reason is that nothing else
@@ -198,6 +388,13 @@
   production corpus (~14,000 chunks) that is ~21 minutes of load turned into
   ~4. `OpenAIProvider` batched natively from the start and is untouched.
 - Indexer runs on startup then every 5 minutes, hash-based change detection.
+- Indexer runs on startup then every 5 minutes. Change detection is by
+  content hash, **with a stat shortcut** (#282): a file whose
+  `(size, mtime_ns, ctime_ns, inode)` equals the tuple recorded for its row's
+  bytes is not read, and a full-hash pass — at process start, from the panel's
+  Reindex, and every `INDEX_FULL_HASH_INTERVAL_HOURS` — reads everything. The
+  walk runs off the event loop and ahead of the generation lock (#278). See
+  [the scan section](#the-scan-off-the-loop-and-ahead-of-the-lock-278-282).
   Each periodic tick ends with `prewarm_search_caches()` **inside**
   `index_pass_lock`: one `get_embedding("warmup")` (Ollama only — a remote API
   has no warm state) and one HNSW probe with a deterministic non-zero unit
@@ -205,9 +402,15 @@
   because `semantic_search` is bimodal (≈0.47 s warm, ≈17.5 s cold: 14 s of
   Ollama reloading bge-m3, 3 s of HNSW pages missing from a 128 MB shared
   `shared_buffers`) and the median gap between calls has grown to ~28 min.
-  It logs and swallows ordinary failures (the indexer's `consecutive_failures`
-  must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
-  still stops the loop.
+  It logs and swallows ordinary failures (the indexer's failure counters in
+  `indexer_health` must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
+  still stops the loop. Since #283 the probe (`probe_statement()`) orders by
+  `vector_index.order_expr` — the same half-precision expression the two
+  vector queries order by — so it warms the `halfvec` index the search
+  actually walks, and `_hnsw_index_exists` looks up `vector_index.INDEX_NAME`.
+  Above 2000 dimensions there is no index and the probe is skipped, as before.
+  `tests/integration/test_prewarm_probe.py` EXPLAINs the probe against an index
+  built by `vector_index.create_index_sql`.
 - **The dashboard's "Last run" is an in-process heartbeat, not
   `max(notes_metadata.indexed_at)`.** `indexer.last_index_run_at` /
   `last_index_run_ok` are stamped at the end of the startup pass and of every
@@ -264,7 +467,8 @@
   write-side note cap times the number of changed notes and is unchanged here —
   an accepted residual on #203, recorded rather than quietly conflated with the
   link-row bound this fixed.
-- **Extraction runs off the event loop.** The indexer's changed-path rebuild,
+- **Extraction runs off the event loop.** The scan itself does too since #278
+  — see the section below. The indexer's changed-path rebuild,
   the one-shot backfill and the scan's `extract_tags` all dispatch through
   `asyncio.to_thread`. The honest caveat, which the tests state rather than
   hide: a thread only yields between `re` calls, never inside one, so this
@@ -274,6 +478,602 @@
   it. The observable the tests assert is the dispatch itself — a timing
   assertion against a concurrent request is a flake generator on a shared
   runner.
+
+## The scan, off the loop and ahead of the lock (#278, #282)
+
+A cold pass over the production vault froze the event loop for 235 s — every
+request, `/health` included — because the walk, the stat, the read and the
+SHA-256 ran on the loop, inside the pass's locked transaction. And every idle
+tick re-read and re-hashed every note to learn that none had changed.
+
+### The scan runs in one worker-thread call (D8)
+
+`_scan_vault(root_fd, snapshot, *, force_read, re_derive, stop)` is one
+synchronous function that `asyncio.to_thread` runs whole: the
+`discover_markdown_files_at` walk, the shortcut stat, the read, the pre-read
+`fstat` and the hash. It returns, per discovered path, the hash, the recordable
+stat and — only where the pass will need it (path absent from the snapshot,
+hash differs, stale extraction marker, or a re-derive) — the body; plus the
+`skips` list. The walk's one-descriptor-per-depth property is unchanged
+because the generator is drained inside the thread. `parse_frontmatter`,
+`extract_tags` and the grammar check are dispatched per changed note.
+
+The embed paths offload per note: the backlog's read, hash and parse; the
+exclusion sweep probe's read, hash, parse, `clean_for_embedding` and
+`chunk_text_bounded`; and `embed_note`'s clean and chunk.
+
+**Cancellation.** A thread cannot be cancelled, so the scan checks a
+`threading.Event` between files. `_run_scan` awaits the thread under
+`asyncio.shield`; on `CancelledError` it sets the event, **waits for the
+thread to stop** (at most one file) and only then re-raises — so lifespan
+shutdown waits for one file, not a 177 s walk, and the pinned root descriptor
+is never closed (and its number reused) under a live walk. The honest bound
+from the extraction note applies: SHA-256 and `read()` release the GIL, so the
+loop is free during the I/O-bound walk; a single pathological `re` step is
+still one step.
+
+The acceptance criterion — `/health` answers and a concurrent coroutine makes
+progress while a pass is reading — is `tests/test_perf_scan_offload.py`, as a
+binary progress assertion, not a timing bound.
+
+### The walk moves ahead of the generation lock (D9)
+
+The pass is now: provenance (multi-user, own committed session) → the
+**snapshot** `S` (owner-scoped `file_path, content_hash, extraction_version`
+and the four stat columns, read in its own session and **committed**) → the
+walk → the locked transaction. The constraints, and how each is kept:
+
+- **C1 — advisory before any row or table lock** (D7c3). The pass
+  transaction's first lock-taking statement stays
+  `acquire_generation_lock_unbounded`. Unchanged: the walk takes no database
+  lock at all.
+- **C2 — no table lock held across an advisory wait.** A plain SELECT holds
+  `AccessShareLock` until transaction end ("Discovery SELECTs end their
+  transaction before provider work"). So the pre-walk snapshot —
+  `file_path, content_hash, extraction_version` and the four stat columns,
+  owner-scoped — is read in **its own session and committed before the walk
+  starts**. It is never held open across the walk or the lock wait.
+- **C3 — one commit for one filesystem snapshot.** Every mutation (move
+  UPDATE, upsert, grammar invalidation, prune, link rebuild, tsvector write,
+  stat refresh, provenance stamp) stays in the single locked transaction and
+  commits together, so a failure cannot pair a new hash with stale derived
+  rows. Unchanged.
+- **C4 — decisions are made against the locked state.** Under the lock the
+  pass re-reads the same owner-scoped rows (`L`). For every walked path whose
+  `L` row equals its snapshot row (`S`) in presence, hash, extraction version
+  and stat, the walk's result stands. For any path where they differ — another
+  process's pass, `move_note`, or a reset committed in between — the path is
+  **re-processed under the lock** (read + hash via `to_thread`, decided against
+  `L`). `existing`, move detection and `deleted_paths` are computed from `L`,
+  never from `S`.
+- **C5 — a row that changed since the snapshot is never pruned by an older
+  walk.** A path in `L` that the walk did not see and whose `L` row differs
+  from `S` (including "absent from `S`" — e.g. a `move_note` that landed
+  mid-walk) is **deferred**: not pruned, not paired as a move, left for the
+  next pass. Under a re-derive a deferral of a row not derived under the
+  current root is appended to `skips`, so A.7a withholds the stamp exactly as
+  for any other unprocessed path (#311). Today's pass
+  has the same race at a narrower width (the walk and `move_note` already
+  interleave); this rule makes the wider window no worse.
+- **C6 — provenance and the FTS fingerprint.** `_reconcile_provenance` still
+  runs first in its own committed session and decides `re_derive` before the
+  walk; `_assert_fts_generation_current` still runs immediately after the
+  lock. Unchanged.
+- **C7 — `index_pass_lock` covers the whole pass**, walk included, so no two
+  passes in one process interleave. Unchanged.
+- **C8 — the quarantine snapshot is consulted before the pass**
+  (`_refuse_quarantined_pass`). Unchanged.
+
+The safety argument: the walk is filesystem-only and was never protected by
+the database lock (a file could change under a locked walk before this too);
+the lock protects *rows*, and every row decision is still taken under it
+against rows read under it. What moved is only the time at which bytes are
+read, which C4/C5 reconcile. What it buys: the lock and the open transaction
+are held for the mutation phase (seconds), not the walk (minutes), so L5b
+shrinks and no transaction sits idle holding back the vacuum horizon. The
+regressions are `tests/integration/test_perf_scan_pg.py` (a `move_note`
+between snapshot and lock is not pruned; another process's upsert is
+re-decided; `pg_stat_activity` shows no open transaction during the walk; a
+reset racing the walk neither deadlocks nor lets old decisions land) and the
+extended `test_issue_206_lock_ordering_pg.py`.
+
+### The stat shortcut (#282, D10–D11)
+
+Migration 026 records, per row, `stat_size`, `stat_mtime_ns`, `stat_ctime_ns`
+and `stat_ino` (signed 64-bit) — all NULL or all set (the CHECK).
+
+- **Source.** The recorded tuple is always the `os.fstat` of the descriptor
+  whose bytes were hashed, taken **before** the read (`read_note_at`). A write
+  after the fstat changes the stat, so the next pass re-reads: the failure
+  direction is a wasted read, never a stale row. The comparison uses
+  `os.stat(name, dir_fd=parent_fd)`, **following** a leaf symlink as the read
+  does, so a retargeted `.md` symlink presents its new target's inode.
+- **Racy stats are not recorded, and recency is measured at read start**
+  (Codex spec review r1, MAJOR). `t_start = time.time_ns()` is taken before
+  the pre-read `fstat` (in code: before `read_note_at` opens the file, which
+  is strictly earlier and can only make more stats racy). If
+  `max(mtime_ns, ctime_ns) ≥ t_start − STAT_RACY_WINDOW_NS` (2 s), or either
+  is later than `t_start`, the stat is written NULL and the next pass hashes
+  the file — git's racy-clean rule. Measuring at hash completion was wrong: a
+  slow read could outlast the window while a writer rewrote already-read bytes
+  in the same timestamp tick. Measured at read start, any later write either
+  lands in a later tick (a changed stat) or shares a tick within 2 s of
+  `t_start`, which is never trusted. The kernel's coarse clock lags
+  `time.time_ns()` by at most a tick; the window absorbs it.
+- **Eligibility.** A path skips its read iff `INDEX_STAT_SHORTCUT` is on, the
+  pass is not a full-hash pass, not a re-derive (or, since #311, the row is
+  derived under the current root), the row's extraction marker is current, the
+  row's stat is non-NULL, and all four fields equal. Otherwise it
+  is read and hashed exactly as before.
+- **Refresh.** When a read's hash equals the row's but the stat differs or is
+  NULL (a `touch`, a no-op save, the first pass after 026), the pass writes the
+  new stat with a conditional UPDATE (`WHERE id AND file_path AND
+  content_hash`) inside the locked transaction; otherwise such a file would be
+  re-read every tick. New and changed rows carry the stat in their upsert; the
+  id-preserving move carries the new path's stat. **`move_note` writes NULL**
+  (carrying it would be sound — the stat names an inode state — but one extra
+  read per move buys not having to argue it).
+
+**Every way a file can change without changing those four fields, and what
+bounds it (D11).** The expensive failure is a silently stale row; this is the
+complete list known.
+
+| # | Mechanism | Plausible here? | Bound |
+| --- | --- | --- | --- |
+| 1 | Same-size in-place rewrite sharing the recorded stat's timestamp tick, landing during or after the read (including a slow read that outlasts the window) | Rare (editors and this server write by rename → new inode; appends change size) | **Closed on local filesystems** by the racy rule measured at read start. Remote/FUSE clocks: row 6 |
+| 2 | `mmap` writes: mtime/ctime move at the first write fault after writeback, so later same-page writes can leave them unchanged until the next cycle | Unusual for notes | Backstop |
+| 3 | Restore with preserved mtime (`rsync -a`, `cp -p`, `tar x`, restic/borg) | Yes | **Not a hole**: userspace cannot set ctime (`utimensat` sets it to now), and these tools usually create a new inode |
+| 4 | btrfs/zstd: transparent compression, CoW, reflinks, dedupe, defrag | This host | **Not a hole**: `st_size` is logical; CoW and dedupe change extents, not content; a content write moves mtime/ctime as anywhere. Inodes are per-subvolume, but comparison is per path |
+| 5 | Subvolume/snapshot rollback or replacement — of the root, or of a child subvolume inside it | Possible | **Partially covered.** Provenance re-derive runs only for multi-user scopes and observes only the pinned root. Otherwise btrfs snapshots preserve inode *and* ctime, so a restored file presents the `(ino, ctime_ns)` of the state it was snapshotted in, which matches a row only if the row was recorded from those same bytes. The residual (one content state reached twice with identical fields, or a colliding inode from another subvolume at the same path) falls to the backstop |
+| 6 | Network / FUSE: attribute caching (NFS `actimeo`, CIFS, FUSE `attr_timeout`), synthetic inodes, server clock skew defeating the racy rule | Not on this host | `INDEX_STAT_SHORTCUT=false` for such mounts; backstop |
+| 7 | FAT/exFAT: 2 s mtime granularity, no true ctime, synthesised inodes | Not on this host | The 2 s window; `INDEX_STAT_SHORTCUT=false` recommended; backstop |
+| 8 | Clock set backwards so a later same-size write reproduces an earlier `(mtime_ns, ctime_ns)` | Needs root and a ns coincidence | Backstop |
+| 9 | Offline modification (disk image edited, fsck/debugfs) while the server is down | Operator action | The first pass after process start is a full-hash pass |
+| 10 | Row changed by another writer between the snapshot and the lock | Yes (deploy overlap, `move_note`) | C4/C5 re-decide or defer under the lock |
+
+### The backstop: a full-hash pass (D12)
+
+`index_vault` decides it, so every entry point inherits it: a pass is a
+full-hash pass when the panel's Reindex passes `full_hash=True`, or the
+scope's `_last_full_hash[scope]` (process memory, monotonic clock) is absent —
+the first pass after a restart — or older than
+`INDEX_FULL_HASH_INTERVAL_HOURS` (default 24, `ge=1`). A full-hash pass reads
+and hashes every file, ignoring stats, and forgets the scope's clean-sweep
+record so the embed pass that follows sweeps.
+
+**The clock advances only on success.** `_last_full_hash[scope]` is set only
+when a full-hash pass commits having **read and hashed every discovered
+file's bytes**, with no other path left unprocessed (Codex r2: the scan
+catches read and parse failures and still commits, so commit alone would let
+a skipped file hide for another interval). **A present-but-not-indexable path
+does not block** (verifier, wave 1; generalised by #308 D7): a file whose
+bytes are not valid UTF-8 was read in full, and a path that is unencodable or
+over-long can never be indexed, so a full-hash pass every tick could verify
+nothing more. None of them is a skip at all any more — any row at such a path
+is deleted (see [#308](#nul-free-derivation-not-indexable-paths-and-the-re-derive-stamp-308)).
+Everything else blocks — walk failures and read errors (`ScanResult.unverified`,
+plus C4's re-read), a missing buffered body, a parse failure, the
+keyword-vector and link-rebuild skips, a C5 deferral under re-derive. A pass that aborts, is
+refused or cancelled, or commits with a blocking skip leaves the scope due,
+and every following pass for it is again a full-hash pass until one succeeds.
+A forced pass (`full_hash=True`) removes the scope's timestamp before any
+refusal or filesystem work (Codex r1, wave 1), so a forced pass that fails
+cannot fall back on an earlier success. A persistently unreadable file keeps
+its scope on full-hash passes every tick, and it is visible as a logged
+warning.
+
+### The exclusion-sweep gate (D13)
+
+For each scope the sweep runs iff the pass is a backstop pass **or**
+`_swept[scope]` is not `sha256(json(EMBEDDING_EXCLUDE_PATTERNS))`. `_swept`
+is set only by a **clean** sweep: every selected row visited with no pause, no
+budget stop, no exception, no read failure, no provider failure or generation
+mismatch, no `StaleCertification`, **and no hash-mismatch skip**. Zero-chunk
+rows do not block it. It is forgotten on a backstop pass (so "the backstop
+sweeps regardless"), on a re-derive, and by `clear_sweep_state()` in the two
+in-process reset routes (`reset_embeddings`, `trigger_reembed`).
+
+*Why a hash-mismatch skip blocks the record* (Codex spec review r1, MAJOR):
+the A→B→A edit. The scan reads A; the note is saved as B before the sweep
+reaches it, so the sweep skips it on a mismatch; undo restores A before the
+next scan. The row is hash-equal and certification-current again, so the
+backlog never selects it — a gate that recorded completion would leave a
+now-included note absent from search until the backstop.
+
+*Why it preserves #127's convergence.* Once the invariant holds under
+patterns *P*, every other route to a certification-current row applies the
+current *P* or clears the stamp: the backlog's two branches read the current
+patterns; both move paths NULL the stamp; a reset NULLs every stamp.
+`EMBEDDING_EXCLUDE_PATTERNS` has no runtime writer, so a pattern change means a
+restart, and a restart forgets `_swept`. *Rejected:* a persisted fingerprint
+(buys skipping one 0.2 s startup sweep, costs a cross-process false agreement
+and an `indexer_state` key), and a persisted zero-chunk marker (removes only
+the zero-chunk re-reads, not the per-row `EXISTS` probes behind the 7.98 M
+index scans, and a stale marker is exactly a silently absent note).
+
+### Accepted limitations (performance-2026-09)
+
+Labelled `perf-L*` as in the change's design, so distinct from the #200–#206 `L*` list below.
+
+- **perf-L3 — stat-shortcut staleness.** An edit that changes none of
+  `(size, mtime_ns, ctime_ns, inode)` is not *detected* until the next
+  **successful** full-hash pass of its scope — at most
+  `INDEX_FULL_HASH_INTERVAL_HOURS` (24 h) after the previous successful one; a
+  failed or incomplete one does not restart the clock. It is detected earlier
+  if the file's stat changes again. Detection commits the new `content_hash`,
+  which makes keyword search current at once and makes `semantic_search` mark
+  the note `stale: true` (#200). **Semantic convergence** then follows the
+  ordinary backlog under the existing budgets, provider availability and
+  pause flag, and can take further passes. Network, FUSE and FAT mounts should
+  set `INDEX_STAT_SHORTCUT=false`.
+- **perf-L4 — exclusion sweep skipped between backstops.** A second process running
+  with different `EMBEDDING_EXCLUDE_PATTERNS` (a deploy overlap, a one-off
+  container) could certify rows that disagree with this process's patterns
+  without triggering a sweep here. Bounded by the 24 h backstop sweep.
+- **perf-L7 — deferred rows.** C5 defers a row changed mid-walk to the next pass;
+  that note's row, and its search presence, can lag by one extra pass.
+
+## NUL-free derivation, not-indexable paths and the re-derive stamp (#308)
+
+Two NUL bytes in two agent-written notes wedged one user's indexer for 8.5
+days: `text` cannot hold U+0000, the keyword-vector UPDATE raised
+`CharacterNotInRepertoireError` at the floor, the pass's one transaction rolled
+back, and every tick re-upserted and re-vectorised ~5,000 notes and threw the
+work away (~650 GB/day of writes). The third route to "one note takes its
+owner's index down" after #126 (title) and #154 (non-finite JSON). The rules
+below close the NUL route and two same-class routes a bug hunt found;
+[the per-note quarantine](#the-poison-note-quarantine-308-d3-d5) bounds the
+*class*.
+
+- **NUL is removed at the one decode point, before hashing** (D1).
+  `read_note_at` returns the text with every `\x00` removed and logs one
+  WARNING per read naming the vault-relative path and the count, never
+  content. Every indexer reader goes through it — the scan (`_read_and_hash`),
+  the C4 re-read and the raw-body fallback (`_rescan_one`), and via
+  `read_note_beneath` the embed backlog, the reconciliation sweep, the link
+  backfill and the tsvector rebuild — so the scan's `content_hash`, the embed
+  pass's `StaleCertification` check and the rebuild's certification are all
+  computed over the same text. **A perpetual re-index loop would need some
+  reader to strip and another not to**; keep every new reader on this
+  function. The indexer is the only writer of `notes_metadata.content_hash`.
+  A NUL-free note's text and hash are unchanged, so the deploy re-indexes
+  nothing. The file's bytes are never modified; `a\0b` is searchable as `ab`
+  (removal, not a space or U+FFFD — declared). Not stripping at each DB
+  boundary instead is deliberate: five-plus boundaries, and the one missed is
+  the next #308.
+- **Frontmatter-derived strings are NUL-free too** (D2), because YAML's
+  `"\0"` escape makes a NUL from NUL-free bytes. `vault.note_title` and
+  `vault.extract_tags` — the one derivation shared by the indexer, `read_note`
+  metadata and `move_note` — remove it (a title that is nothing but NUL falls
+  back to the stem); `_jsonb_value` removes it from every string key and value
+  on its walk, keeping #154's first-key-wins rule for a key that collides after
+  removal. **The parsed mapping `read_note` returns and `set_frontmatter`
+  re-serialises is not touched**, so setting an unrelated key never rewrites
+  the escape. `extract_tags` also drops a tag over `MAX_TAG_BYTES` (1,024
+  UTF-8 bytes): `tags` has a GIN index and a key over ~2.7 KB raises 54000,
+  which would cost the whole note for one tag. The shared helper reports the
+  dropped sizes through its `dropped=` list and never logs itself (it is on
+  `read_note`'s request path, where #190 forbids a caller-drivable bare
+  WARNING); the indexer passes the list and logs one WARNING per note naming
+  the path and the sizes, never the tag.
+- **A NUL-bearing link is not a link** (D2). Markdown hrefs are
+  percent-decoded, so `[x](bad%00target.md)` yields U+0000 from NUL-free text;
+  removing it would invent a link to `badtarget.md`, a different file. The
+  extractor drops a markdown link whose decoded target (or raw label) contains
+  NUL, and a wikilink/embed with a NUL anywhere in target, anchor or alias.
+  The markdown `#anchor` is never decoded or stored apart from `link_text`
+  (where `%00` stays three characters), so it is deliberately not examined:
+  dropping `[x](a.md#%00)` would change storable rows and need an extraction
+  version bump. No row that could exist today changes, so there is no bump.
+- **Paths and contents the index can never hold are present but not
+  indexable, decided at the scan** (D7). A filename that is not valid UTF-8
+  (`os.scandir` hands back a surrogate-escaped `str`, which asyncpg refuses at
+  the first bind — the move UPDATE or the batch upsert — exactly the #308
+  wedge), a path longer than `file_path` (`MAX_PATH_CHARS`, 1,024 — 22001 at
+  the same sites), and a file whose bytes were read in full but are not valid
+  UTF-8. `_scan_vault` checks `is_encodable(rel)` and the length before it
+  stats or reads, and classifies a `UnicodeDecodeError` the same way; the C4
+  locked re-read re-reads a content-classified path whose row moved under the
+  walk and applies the same rule, as does the raw-body fallback. Such a path
+  is kept in `seen` (so it is not "vanished"), excluded from `to_upsert` and
+  from move pairing (added to the prune set *after* move detection), and any
+  row at it is deleted through the ordinary prune — embeddings and outgoing
+  links cascade, inbound links fall back to dangling. One WARNING per path per
+  pass, rendered with `backslashreplace` (`_loggable_path`) so the line can
+  always be written. **It is not a skip**: it withholds neither a re-derive's
+  stamp (its row is gone, so nothing foreign survives at it) nor the
+  backstop's clock. Before this a Latin-1 rewrite of an indexed note left its
+  row in place — the path was `seen`, so neither upserted nor pruned — and
+  `semantic_search` served the old content as current. **A file that cannot be
+  read (EACCES, EIO, ENOENT, a dangling symlink) is deliberately not in this
+  class**: its row may be the correct row for a file merely unreadable at that
+  moment, so it is kept. A decode failure differs because the bytes *were*
+  read and provably are not the bytes the row was derived from.
+- **A skip withholds the re-derive stamp only if it could hide a row** (D8).
+  The completeness rule (A.7a) exists so a skipped path cannot leave the
+  previous vault's row certified under the new root; a skip can do that only
+  if a row exists at that path. So `withholding` — not `skips` — decides:
+  a read, C4 re-read, raw-body or parse skip on a path with a row in the
+  **locked** rows; any directory the walk could not list (anything beneath
+  could have a row); a C5 deferral (it has a row by construction); and the
+  keyword-vector and link-rebuild skips (paths already in `to_upsert`). A read
+  skip on a row-less path, and every D7 path, do not withhold. The old
+  rationale for withholding on *any* skip — "a re-derive parses and upserts a
+  vault the pass already reads in full" — stopped being true with the stat
+  shortcut (#282): a re-derive forced every file into `to_upsert` with a
+  keyword-vector UPDATE and a link rebuild, so one never-indexed unreadable
+  file made a **full-scope rewrite every tick, for ever**, #308's write
+  amplification by a route the spec accepted. (A row-*backed* unreadable file
+  still did, until [#311](#re-derive-progress-311) made re-derive progress
+  per row; the "has a row" test is now "has a row not derived under the
+  current root".) All skips are still logged; the
+  withholding ones are named as the offenders. The pass reports what happened
+  on its return value: `index_vault` returns an `IndexPassResult` — still the
+  `(notes_scanned, notes_indexed)` two-tuple every caller unpacks — whose
+  `rederive` is `None` (not a re-derive), `"recorded"`, `"incomplete"` (a
+  withholding skip; `rederive_incomplete` is True) or `"unrecorded"` (nothing
+  withheld it but the NOWAIT stamp lost a lock or the assignment moved), and
+  whose `not_indexable` counts D7 paths. Failure accounting counts an
+  incomplete re-derive toward the scope's degradation; `"unrecorded"` counts
+  the same way (its consequence is the same full-scope re-derive next tick),
+  so only a lock or assignment race that persists for
+  `INDEXER_DEGRADED_AFTER_FAILURES` passes reaches degraded.
+
+### The poison-note quarantine (#308, D3, D5)
+
+D1/D2/D7 close the routes known today; the quarantine bounds the class, so the
+next unforeseen value costs one note rather than its owner's whole index.
+
+- **A poison failure** is a database error whose SQLSTATE is class 22 (data
+  exception) or 54000 (program limit exceeded) — `poison_sqlstate`, which
+  reads the first SQLSTATE on the SQLAlchemy wrapper / driver chain — raised
+  in an **incremental** pass by a write attributable to one note: the
+  id-preserving **move** UPDATE (with its `target_path` rewrite), its row of
+  the **batch upsert**, its **keyword vector** at the floor, or its **link**
+  inserts. asyncpg's client-side refusal of an unencodable bind (a lone
+  surrogate) surfaces as `asyncpg.exceptions.DataError` with sqlstate
+  `22000`, so it is in the set without a special case. (The routes a YAML
+  `"\ud800"` has to those writes — title, tags, JSONB values — are already
+  closed by `coerce_text` and the frontmatter scrub; the quarantine is the
+  backstop.)
+- **Each site runs in a savepoint**, `try` outside `begin_nested()`
+  (`_savepoint_poison`). A batch upsert statement that fails with a poison
+  SQLSTATE is **replayed one row at a time**, each row in its own savepoint,
+  and **every** row that fails alone is named; if none does, the original
+  error is re-raised — a statement-level failure is not attributable to a
+  note. The tsvector and link sites carry on past a poison note so the stage
+  names all of them; the move site does the same per move.
+- **Restart, not repair-in-place.** The stage raises `PoisonNote`; the
+  attempt's whole transaction rolls back; the notes are quarantined; and
+  `_index_vault_pinned` re-runs `_index_vault_attempt` — from the generation
+  lock and classification, moves included — against fresh copies of the
+  scan's verdicts. The walk is not repeated. Repairing in place would leave
+  `moved_new_paths` and the `to_upsert` exclusions describing undone writes.
+  At most `INDEXER_QUARANTINE_RETRIES_PER_TICK` (5) restarts per scope per
+  invocation; beyond it `QuarantineRetriesExhausted` fails the pass as an
+  ordinary failure (counted by `indexer_health`), and the notes found so far
+  stay quarantined for the next tick. It lives in `index_vault`, so the
+  startup pass, the periodic pass and the panel's Reindex now all get it.
+- **A quarantined note is absent, never stale.** The registry is in-process,
+  `(owner, rel_path) → (content_hash, sqlstate, at)`. After the C4 re-read, a
+  file whose current hash equals its quarantined hash is moved from `files`
+  to `not_indexable` — the D7 mechanism: not upserted, never a move source or
+  destination, and any row at it deleted through the ordinary prune with its
+  embeddings and outgoing links. Keeping the old row would let
+  `semantic_search` serve superseded content as current (it only compares
+  `embedded_content_hash` with `content_hash`). A moved note whose move fails
+  loses its source row as a vanished file.
+- **A quarantine is not a read failure.** The bytes were read and hashed and
+  the row is absent by decision, so it neither withholds a re-derive's stamp
+  (no row survives at the path to be foreign) nor keeps the scope due for a
+  full-hash pass. Without both, one quarantined note would re-arm a
+  whole-scope rewrite every tick — #308 by another route.
+- **Cleared** when the note next indexes (its content changed and no longer
+  fails), when its file is gone from the walk, when the scope is discarded on
+  reassignment, or when a user leaves the active set; not persisted, so a
+  restart re-learns each poison note for one rolled-back attempt.
+- **Visible where the operator looks** (D5): one ERROR per quarantine (path via
+  `backslashreplace`, SQLSTATE, never content or the driver's message), the
+  pass's `indexer_runs.error` reads `quarantined N note(s): <path>, …` (at
+  most five, then `…`), and `/health` counts them as `quarantined_notes`
+  (`degraded`, no paths). **A quarantining pass is a successful pass**:
+  nothing derives success from the `error` column.
+
+## A pass does not prune what it could not see (#309)
+
+The prune set used to be `existing − seen`, and "not seen" was read as "gone
+from disk". Two ordinary host problems make the walk see less than is there:
+a subdirectory it cannot list (another uid's restrictive mode, EACCES/EIO on
+`scandir`) and an empty-but-openable root (a mount that did not mount, a
+Docker-created empty bind source, a misbound volume). The first deleted every
+row under the folder — or **move-paired** one to an unrelated same-hash file
+and rewrote it in place — and the second deleted the owner's whole index; both
+runs were recorded clean.
+
+- **The walk records structured failed prefixes** (D1).
+  `discover_markdown_files_at(…, failed_prefixes=)` appends the vault-relative
+  path of every directory it could not open or list — the same errnos already
+  recorded as skips, `""` for the root's own listing — and of every entry whose
+  type lookup (`DirEntry.is_dir()`) raised, because that entry may be a
+  directory. `ScanResult.walk_failed_prefixes`; `walk_failures` keeps the
+  human-readable strings. ELOOP/ENOTDIR (a directory symlink, a non-directory)
+  and ENOENT (a directory that vanished between listing and open — its rows
+  really are gone) are unchanged non-skips.
+- **Rows at or beneath a failed prefix are protected** (D2). In
+  `_index_vault_attempt`, against the **locked** rows: a path `p` is protected
+  if `p == pref` or `p.startswith(pref + "/")` for a non-root prefix — so `sub`
+  protects `sub/a.md` and `sub/x/b.md` but not `subway.md` (`_walk_protected`).
+  Protected paths leave the prune set **before** `deleted_by_hash` is built, so
+  they are neither deleted nor a move source. The quarantine sweep does not
+  clear an entry beneath a failed prefix for being unseen — decided by prefix
+  over the entries, since a quarantined note's row was already pruned and is
+  never among the protected rows. Everything else commits. One WARNING
+  names the directories (at most five, then `(+N more)`) and the rows kept; the
+  run record gains `walk incomplete: N dir(s) not listed: <dir>, … (+N more)` (`backslash
+  replace`, line breaks escaped, like the quarantine line), which `run_outcome`
+  labels **failed** — part of the vault was not indexed. `IndexPassResult`
+  carries `walk_failed` and `walk_protected`. A folder that stays unreadable
+  keeps its last-known rows indefinitely: by design, reported as degraded.
+- **An unlistable root, or an empty root over an existing index, is
+  indeterminate** (D3). `_index_vault_pinned` raises `IndexIndeterminate` (a
+  `RuntimeError`) before the generation lock, with nothing written, when `""`
+  is a failed prefix, or when the walk discovered **no** `.md` file while the
+  pre-lock snapshot has rows and no valid empty-prune permission is held. The
+  same predicate (`_check_determinate`) is re-evaluated against the locked rows
+  before any mutation — a note can be written into an empty scope between the
+  snapshot and the lock. The message states the condition and the row count and
+  where to confirm, never a path. It is an ordinary failed pass to #308's
+  accounting: run row failed, `index_consecutive_failures`, CRITICAL at the
+  threshold, `/health` degraded. "No `.md` files" rather than "no entries":
+  a root holding only attachments would still delete every row. A scope with
+  no rows is never refused. **The provenance discard is the stated exception**:
+  `_reconcile_provenance` deleting a scope whose assignment demonstrably
+  changed is an administrator's reassignment, not a mount accident, and is
+  untouched; afterwards the scope has no rows, so the next empty walk is not
+  refused.
+- **The empty-prune permission** (D5, `src/services/empty_prune.py`). An
+  in-process registry, one entry per scope: `grant(scope, assignment, *,
+  ttl_seconds=900, granted_by=None)`, `take(scope)` (atomic remove → frozen
+  `Authorisation(scope, expires_at, assignment)` or None), `pending(scope)`,
+  `reset()` for tests. Expiry is on the monotonic clock. A pass **takes** the
+  permission at its first evaluation of the predicate (pre-lock) **whether or
+  not the root is empty** — a permission left for later would authorise an
+  emptying nobody confirmed — and carries it as an invocation-local value: the
+  locked re-check uses it (never the registry), it survives #308's quarantine
+  restarts within the invocation, and it is never returned after failure,
+  cancellation or restart. A permission authorises only if unexpired and
+  granted for the pass's canonical assignment; immediately before the prune
+  DELETE an authorised empty-root pass re-checks expiry and the **current**
+  assignment (`settings.vault_path`, or a plain non-locking read of the `users`
+  row — the transaction already holds `notes_metadata` row locks, see
+  `_assert_still_assigned`). Grant, take and the authorised prune (with its row
+  count) each log a WARNING. A permission never overrides an unlistable root and
+  never authorises a prune beneath a failed prefix. A restart drops an untaken
+  permission (L2): re-confirm.
+- **The scope-targeted pass.** `index_scope_now(user_id, *, trigger="manual")
+  -> bool` runs overlap detection (before `index_pass_lock`), warms that user's
+  vault cache, and then `_index_pass_once(user_id, trigger, full_hash=True)`
+  under the lock — index, then embed, each stage isolated and recorded — for
+  exactly one scope. It is what the panel's confirmation starts; the existing
+  `_reindex_background` callers keep their all-user behaviour. The panel's
+  manual single-user reindex now isolates its stages like the loop (#308 D9):
+  an index stage that raised (an indeterminate root) no longer stops the embed
+  stage.
+- **Accounting** (D4). `indexer_health.record_walk(scope, incomplete)`, called
+  from `record_index_outcome` for every committed pass at every entrypoint:
+  `walk_incomplete` increments on a pass with any non-root failed prefix and
+  resets on one with none; it counts toward degraded, `max_consecutive_failures`
+  and the once-per-episode CRITICAL. `failing_scopes` is the number of
+  **distinct** scopes with any of the index, incomplete-re-derive or
+  incomplete-walk counters at the threshold.
+- **L1: a wrong but non-empty mount is not detected.** A different, smaller
+  directory mounted in place of the vault still prunes the difference; catching
+  it would need a share-of-index threshold, a heuristic the owner did not want.
+
+## Re-derive progress (#311)
+
+A re-derive used to be stateless: every re-deriving pass forced every file
+into `to_upsert` (no hash check, no stat shortcut), with a keyword-vector
+UPDATE and a link delete-and-re-extract, and only the scope-wide stamp
+recorded success. So one **row-backed** unreadable file — whose row may be the
+previous root's, which is why it rightly withholds the stamp — made every
+tick a full-scope rewrite until the file was readable again: #308's write
+amplification by a rarer route. #308's accounting made it visible
+(`rederive_incomplete`, `/health` `degraded`); it did not bound it.
+
+- **The marker** (migration 030). `notes_metadata.derived_under varchar(64)
+  NULL` holds `sha256(json(["derived-under-v1", assignment, realpath_hex,
+  handle, file_path, content_hash, extraction_version]))` —
+  `derived_under_digest`. The three facts are the provenance stamp's own
+  triple for the pinned root, compared **exactly** (a NULL handle is a value;
+  unlike `classify_provenance`'s handle tolerance, because a marker is only
+  consulted inside a re-derive and a handle-mismatch re-derive must not trust
+  the replaced directory's rows). A row is **current** — derived under the
+  current root — iff its marker equals the digest the pass computes for it.
+  NULL means "not derived".
+- **The binding.** Path, hash and extraction version are in the digest, so any
+  writer that changes what a row was derived *from* invalidates its marker
+  without knowing the column exists — a previous build during deploy overlap
+  or an image rollback included.
+- **Who writes it.** Only `_index_vault_attempt`'s tail writes it non-NULL, on
+  a re-derive, for the *fully derived* set — `to_upsert ∪ moved_new_paths`
+  minus every path with a keyword-vector or link-rebuild skip — after the link
+  rebuild, by an UPDATE predicated on the path, hash and version it hashed.
+  Every upsert and id-preserving move sets it NULL first, so a keep pass, a
+  single-user pass or a partial derivation leaves NULL. A test pins that no
+  other non-NULL write exists.
+- **Who clears it** (Codex spec review r1, MAJOR). A writer that changes a
+  row's link rows' *extracted* state without changing its path, hash or
+  version escapes the binding, so it clears explicitly: `move_note` (the moved
+  row, every source whose `note_links.target_path` it rewrites, every planned
+  backlink-rewrite source), the pass's own move branch (`move_clear_sql`, the
+  sources of the `target_path` rewrite) and the link backfill (every note it
+  writes links for — clearing was simpler than hash-certifying its input).
+  Without it: S marked under A, reassigned to B, `move_note(T.md, U.md)`
+  rewrites S's link to `U.md`, reassigned back to A — S's A marker still
+  matches and provenance A would be stamped over B-era graph state.
+  `target_note_id`-only writes (the dangling re-resolution) need no clear: the
+  recording pass re-resolves every target. The keyword-vector rebuild and the
+  embed pass write functions of hash-verified bytes plus configuration.
+- **Per-row force.** Under a re-derive, a current row gets the ordinary rules:
+  the stat shortcut (when not a full-hash pass) and hash comparison. Only
+  rows that are not current, new paths and changed files are read with their
+  body, parsed and upserted. `SnapshotRow` carries the marker, so C4
+  re-processes a row whose marker moved between the snapshot and the lock;
+  every decision uses the locked row.
+- **Withholding, narrowed to its rationale.** A skip withholds the stamp only
+  if it could leave a row **not derived under the current root**: a read, C4
+  re-read, raw-body or parse skip on a locked row that is not current; a
+  non-root unlisted directory with such a row at or beneath it (owner
+  decision 2026-10-10: a directory over current rows does not withhold, and
+  #309's `walk_incomplete` still reports it); a C5 deferral of such a row; and,
+  as before, every keyword-vector and link-rebuild skip.
+- **The invariant gates the stamp.** After its last write — the completion
+  re-resolution below included — and as the last statement before the stamp,
+  the pass re-reads the scope's rows *in its own transaction* and counts those
+  not current. When it is about to record, that read takes `FOR SHARE NOWAIT`
+  in a savepoint, so no writer (a `move_note` clearing a marker or rewriting a
+  source's links) can change a row between the check and the stamp; NOWAIT
+  for the tail stamp's reason — the pass holds row locks of its own, and
+  waiting could deadlock — so a row held elsewhere withholds the stamp as
+  `REDERIVE_UNRECORDED` (Codex implementation review r1);
+  it records only if `withholding` is empty **and** that count is zero. A row
+  left unmarked with no named skip (a writer not foreseen, a concurrent insert
+  seen under READ COMMITTED) still makes the pass incomplete, and the first
+  `SKIP_REPORT_LIMIT` such paths are named. The count is
+  `IndexPassResult.rederive_pending` and is in the incomplete WARNING; `/health`
+  is unchanged (owner decision: no pending-count field).
+- **Completion re-resolution** (`_reresolve_scope_links`, run before the
+  invariant re-read). A carried-forward
+  note's links were resolved in an earlier pass against a row set that may
+  have held rows since pruned (a protected row beneath a directory that became
+  listable). Before stamping, the pass re-resolves every link row's
+  `target_note_id` from its stored `target_path` and source path against the
+  final rows, reading no file — exactly what one complete re-derive would have
+  produced. A `target_path` at the 1,024-character storage cap may be
+  truncated and is left as is (L3).
+- **The exclusion sweep** is forgotten after a committed re-derive only if it
+  upserted, moved or deleted a row.
+- **Restart.** Markers persist; the first pass after a start is a full-hash
+  pass, so it reads everything and rewrites only what is unresolved or
+  changed.
+- **What a stuck scope costs per tick now**: the unresolved rows' re-read, the
+  invariant re-read, and — unchanged and pre-existing — a full-hash read of
+  the scope, because a persistently unreadable file keeps it due for the
+  backstop (D12). Reads, not writes. It stays `degraded`, as it should: a
+  possibly foreign row is still served.
+- **Accepted limitations.** L1 filesystem substitution behind identical facts
+  (the record's own non-goal). L2 a previous build writing from a *different*
+  root during deploy overlap (the binding covers path or content changes; a
+  previous build's `target_path` rewrite on a move is not covered). L3 link
+  targets at the storage cap are not re-resolved. L4 a handle that flickers
+  between unobtainable and obtainable costs one full re-derive. L5 a
+  permanently unreadable row-backed file keeps the scope incomplete and
+  `degraded`, and due for the backstop. L6 a reassignment A→B→A completed inside
+  one pass's final window, with a `move_note` confirmed under B whose metadata
+  transaction commits only after the A stamp, is not detected (one committing
+  before the final re-read NULLs a marker and withholds the stamp) — the stamp matches A, so no re-derive follows (triaged
+  implausible; no cross-writer lock protocol).
 
 ## Non-finite frontmatter numbers, and the one title rule (#154)
 
@@ -1179,13 +1979,13 @@ pass:    pg_advisory_xact_lock at the write  -> waits on the rebuild's advisory
 
 — a cycle the database resolves by killing one side. So the pass calls
 `acquire_generation_lock_unbounded(session)` and `_assert_fts_generation_current(session)`
-at the **head of `_index_vault_pinned`'s transaction** — ahead of every lock it
+at the **head of `_index_vault_attempt`'s transaction** (one per attempt, #308 D3) — ahead of every lock it
 takes, with only that helper's own `SET LOCAL statement_timeout` before it — and
 anyone adding a mutation to that function must keep it below that line: the
 requirement is to audit what the transaction touches, not to reason backwards
 from the write that consumes the fingerprint. A mismatch raises
-`GenerationMismatch` and the pass commits nothing, exactly as a tsvector floor
-failure already does, and retries next tick under whichever configuration is
+`GenerationMismatch` and the pass commits nothing, exactly as a non-poison floor
+tsvector failure does, and retries next tick under whichever configuration is
 then current. The abort is deliberately fatal to the pass rather than a skip: a
 keyword vector is only ever rewritten when a note's `content_hash` changes, so
 a row written under the previous `FTS_CONFIGS` would keep that vector for ever
@@ -1285,8 +2085,9 @@ makes it cheap.
 
 ### Maintenance waits for an in-flight pass, and that is correct (L5b)
 
-The pass holds the generation lock for the duration of its transaction —
-minutes on a large vault — so `make reset-embeddings` and
+The pass holds the generation lock for the duration of its transaction — the
+mutation phase since #278 moved the walk ahead of it (D9), minutes on a large
+vault before that — so `make reset-embeddings` and
 `make rebuild-tsvectors` **wait** for an in-flight pass instead of interleaving
 with it. That is the behaviour we want: a reset must not land mid-pass. The
 maintenance paths therefore deliberately do **not** set a short `lock_timeout`
@@ -1379,8 +2180,10 @@ Every residual is listed here, so none of them is discovered later as a defect.
   Recourses: settle the scope, delete or reassign the rows, or revert
   `FTS_CONFIGS`.
 - **L5b — the incremental pass holds the generation lock for its whole
-  transaction**, so the maintenance commands wait minutes on a large vault.
-  Waiting is the correct behaviour and the maintenance paths do not defeat it.
+  transaction**, so the maintenance commands wait for it. Waiting is the
+  correct behaviour and the maintenance paths do not defeat it. Since #278
+  the walk runs *before* that transaction (D9), so the wait is the mutation
+  phase — seconds — rather than minutes on a large vault.
 - **L6 — NULL-owned `notes_metadata` rows abort the rebuild** while
   `MULTI_USER_MODE` is on. Delete or reassign them.
 - **L7 — raising `MAX_CHUNKS_PER_NOTE` forces a full re-embed**, although it
@@ -1394,10 +2197,13 @@ Every residual is listed here, so none of them is discovered later as a defect.
 - **L9 — a capped note's tail is not semantically searchable at all.** That is
   what the cap is; the note stays fully keyword-searchable, and the truncation
   is marked on the row, in every vector result and on the dashboard.
-- **L10 — `semantic_search` still hydrates every candidate's full vector** to
+- ~~**L10 — `semantic_search` still hydrates every candidate's full vector** to
   recompute a similarity the query already returned as `distance`. Pre-existing
   and unrelated to these four findings; filed as a follow-up rather than
-  widened into a change that already touches both read paths.
+  widened into a change that already touches both read paths.~~ **Resolved by
+  #280** (performance-2026-09, D7): `semantic_search` projects its columns and
+  reports `similarity = 1 − distance`; no stored vector is fetched. See "Read
+  paths project what they render" in [search](search.md).
 
 ## Re-deriving after a grammar change (#150)
 
@@ -1552,6 +2358,26 @@ bump that only changes derivation costs one pass; a bump that moves the cleaned
 output costs provider calls for the notes it moves, and the per-note comparison
 is what keeps "the notes it moves" from becoming "the vault".
 
+### Version 4 combines fork version3 and rejects targets invented by code masking (#218)
+
+Masking inline code can manufacture a target: `` [[`x`Old]] `` used to become a
+link to `Old` after its masked prefix was stripped. Extraction now compares
+each raw wikilink target capture or markdown href span against the same
+code-point offsets in the original body, before stripping, decoding or cap
+accounting. A changed deciding span is omitted. Code confined to a label,
+alias or anchor does not change the target and remains extractable; the
+existing `link_text` representation and scanner grammar are unchanged.
+
+Rejected candidates neither consume `MAX_LINKS_PER_NOTE` nor set truncation.
+Version 4 shares version 2's embedding cleaner, so the existing atomic stale
+version pass repairs unchanged notes' links and stamps version 3 while
+preserving their content hashes and embedding certification. No migration or
+embedding reset is needed. Deployment costs one re-derivation pass; the
+existing owner-scoped `move_note(rewrite_links=True)` refusal lasts until that
+scope's markers are current. The version-3 row repair and unchanged vectors
+are pinned against PostgreSQL in
+`tests/integration/test_issue_150_extraction_version_pg.py`.
+
 ### The frozen v0 cleaner is a line scanner with the regexes as its oracle
 
 `_v0_clean` must keep producing byte-identical output forever — the
@@ -1586,7 +2412,7 @@ The rollback procedure is:
 
 1. revert the grammar commits on a branch;
 2. **bump `CURRENT_EXTRACTION_VERSION`** in that build (to the next unused
-   number — 2 is taken by the link-grammar bump above) and
+   number — 2 and 3 are taken by the link-grammar bumps above) and
    keep the versioned mechanism and the frozen per-version registry — the
    registry is what lets the pass compare each row's stamped grammar against
    the restored one;

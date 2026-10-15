@@ -11,7 +11,7 @@
     {# This page extends neither base, so it includes the token partial
        directly. Its historical shades survive as the `--consent-*` group. #}
     {% include "_theme.html" %}
-    <style>
+    <style nonce="{{ csp_nonce }}">
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
         body {
@@ -211,6 +211,20 @@
 
         .request-note.warn { color: var(--consent-warn); }
 
+        /* ── Credential lifetimes (#326, ASVS V10.7.2) ──
+           Every value comes from `consent_lifetimes()`, so the page can
+           never state a period longer than the server enforces. */
+        .lifetime-box {
+            border-left: 2px solid var(--consent-surface-border);
+            padding: 2px 0 2px 12px;
+            margin-bottom: 22px;
+            font-size: 12px;
+            color: var(--consent-text-2);
+            line-height: 1.5;
+        }
+
+        .lifetime-box strong { color: var(--consent-text); font-weight: 500; }
+
         .scope-label {
             font-size: 10px;
             font-weight: 600;
@@ -313,22 +327,44 @@
             color: var(--consent-text);
             background: var(--consent-neutral-surface-hover);
         }
+
+        /* Gem mark, in the consent tokens. Stylesheet rules, not fill=/stroke= presentation
+           attributes: var() in a presentation attribute does not substitute
+           dependably and falls back to black (#289, design D2). */
+        .gem-edge { stroke: var(--consent-primary); }
+        .gem-facet { fill: var(--consent-gem-facet); stroke: none; }
+        .gem-facet-2 { fill: var(--consent-gem-facet-2); stroke: none; }
+
+        /* Header text column beside the gem, and its caption (#289). */
+        .consent-brand {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .consent-request-label {
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.16em;
+            text-transform: uppercase;
+            color: var(--consent-label);
+            margin-top: 3px;
+        }
     </style>
 </head>
 <body>
     <div class="card">
         <div class="card-top">
             <svg class="gem" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <polygon points="14,2 24,9 22,22 6,22 4,9" fill="none" stroke-width="1.4" style="stroke:var(--consent-primary);"/>
-                <polygon points="14,2 24,9 14,7" style="fill:var(--consent-gem-facet);stroke:none;"/>
-                <polygon points="14,7 24,9 22,22 6,22 4,9" style="fill:var(--consent-gem-facet-2);stroke:none;"/>
-                <line x1="14" y1="2" x2="14" y2="7" stroke-width="0.8" opacity="0.7" style="stroke:var(--consent-primary);"/>
-                <line x1="14" y1="7" x2="4" y2="9"  stroke-width="0.5" opacity="0.4" style="stroke:var(--consent-primary);"/>
-                <line x1="14" y1="7" x2="24" y2="9" stroke-width="0.5" opacity="0.4" style="stroke:var(--consent-primary);"/>
+                <polygon points="14,2 24,9 22,22 6,22 4,9" fill="none" stroke-width="1.4" class="gem-edge"/>
+                <polygon points="14,2 24,9 14,7" class="gem-facet"/>
+                <polygon points="14,7 24,9 22,22 6,22 4,9" class="gem-facet-2"/>
+                <line x1="14" y1="2" x2="14" y2="7" stroke-width="0.8" opacity="0.7" class="gem-edge"/>
+                <line x1="14" y1="7" x2="4" y2="9"  stroke-width="0.5" opacity="0.4" class="gem-edge"/>
+                <line x1="14" y1="7" x2="24" y2="9" stroke-width="0.5" opacity="0.4" class="gem-edge"/>
             </svg>
-            <div style="flex:1;min-width:0;">
+            <div class="consent-brand">
                 <div class="wordmark">Obsidian MCP</div>
-                <div style="font-size:10px;font-weight:600;letter-spacing:0.16em;text-transform:uppercase;color:var(--consent-label);margin-top:3px;">Authorization Request</div>
+                <div class="consent-request-label">Authorization Request</div>
             </div>
             {% include "_theme_toggle.html" %}
         </div>
@@ -413,6 +449,19 @@
                 {% if client_can_write %}
                 <div class="request-note">Read only is preselected. Read + Write is granted only if you select it below.</div>
                 {% endif %}
+            </div>
+
+            {# The effective credential lifetimes (#326). The absolute period
+               runs from the code exchange that follows approval
+               (`grant_issued_at`), so the text says "first receives its
+               tokens", never "after you approve". #}
+            <div class="lifetime-box">
+                <strong>How long this access lasts.</strong>
+                The application receives an access token valid for {{ lifetimes.access }},
+                which it renews using a refresh token valid for {{ lifetimes.refresh }} from
+                its last renewal. Renewal stops {{ lifetimes.absolute }} after the application
+                first receives its tokens (moments after you approve); after that it must ask
+                you again. You can revoke this access at any time from the control panel.
             </div>
 
             {# `autocomplete="off"` on the form *and* on each radio is

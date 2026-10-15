@@ -364,7 +364,7 @@ def test_the_scan_dispatches_tag_extraction_off_the_loop():
     the pass that follows an extraction bump — and it regexes the whole body.
     Driving `_index_vault_pinned` needs a database, so this reads the call site:
     an assertion that fails the moment the dispatch is unwrapped."""
-    assert "extract_tags" in _to_thread_targets(indexer._index_vault_pinned)
+    assert "extract_tags" in _to_thread_targets(indexer._index_vault_attempt)
 
 
 def test_the_scan_dispatches_the_grammar_predicate_off_the_loop():
@@ -377,7 +377,7 @@ def test_the_scan_dispatches_the_grammar_predicate_off_the_loop():
     It is also the one of the three that a thread genuinely helps: the v0
     cleaner is a Python line scanner, and Python bytecode yields the GIL, where
     a single `re` step does not."""
-    targets = _to_thread_targets(indexer._index_vault_pinned)
+    targets = _to_thread_targets(indexer._index_vault_attempt)
     assert "_grammar_changed_the_embedding_text" in targets, targets
 
 

@@ -56,7 +56,7 @@ queues behind the migration rather than closing a wait cycle. `lock_timeout`
 pinned to `public` and the qualified identity asserted; all three are `RESET`
 because alembic runs every pending revision in one transaction.
 
-Revision ID: 029
+Revision ID: 035 (fork compatibility; upstream 029)
 Revises: 028
 Create Date: 2026-10-09
 """
@@ -65,8 +65,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "029"
-down_revision: Union[str, None] = "028"
+revision: str = "035"
+down_revision: Union[str, None] = "034"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

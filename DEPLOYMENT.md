@@ -30,8 +30,7 @@ handle 3 and 4 separately. For 5, layer one override on top:
 
 The overrides add a front door and change nothing else; there is one
 definition of Postgres and one of the app, in the base file. (Earlier
-releases shipped three whole stacks — `docker-compose.simple.yml` and
-`docker-compose.proxy.yml` alongside the main file — which had drifted
+releases shipped three whole stacks, which each repeated the database and app — which had drifted
 apart from one another. They are gone; the base file plus an override
 covers every case they did.)
 
@@ -40,8 +39,7 @@ On a Kubernetes cluster, use
 manifests in [`deploy/kubernetes/`](./deploy/kubernetes/) instead. The
 vault-sync, embedding and transport sections below still apply there.
 
-> **Upgrading an existing deployment?** A Compose install created from
-> `docker-compose.simple.yml` or `docker-compose.proxy.yml` before #324
+> **Upgrading an existing deployment?** A Compose install created before database role separation
 > runs its app as the database superuser and **must** follow
 > [Upgrading: split database roles](#upgrading-split-database-roles)
 > (one backup, one script); the new compose files do not start the app
@@ -238,7 +236,7 @@ server refuses to start if its database session is a superuser (see
 If that first init fails part-way (the postgres log says why), the
 postgres container refuses the half-initialised volume on its next
 start; the volume holds no data yet, so remove it
-(`docker compose -f docker-compose.simple.yml down -v`, which also
+(`docker compose -f docker-compose.yml down -v`, which also
 removes Caddy's certificate volumes, or `docker volume rm
 <project>_pg_data`) and start again. Watch the logs:
 
@@ -417,7 +415,7 @@ control resting on a string length is not a contract.
 defining it disables Caddy's automatic HTTP→HTTPS redirect for that
 host, which is why the block ends with an explicit `redir`.
 
-**Bring-your-own proxy (`docker-compose.proxy.yml`).** There is no proxy
+**Bring-your-own proxy (`docker-compose.yml`).** There is no proxy
 in that file for this repository to configure, so this is prose and
 nothing else: on your own proxy, add a plaintext (port 80) rule that
 returns 403 for the paths in the table above — including `/` when the
@@ -943,8 +941,8 @@ deployment; on a compose-file deployment the equivalents are plain
 
 ## Upgrading: split database roles
 
-**Who needs this:** a deployment from `docker-compose.simple.yml` or
-`docker-compose.proxy.yml` whose database volume was created before
+**Who needs this:** a deployment from `docker-compose.yml` or
+`docker-compose.yml` whose database volume was created before
 #324. Those bundles created the database with `POSTGRES_USER=obsidian_mcp`,
 which the PostgreSQL image makes the **cluster superuser**, and the app
 connected as it. A compromised app could then read every database,
@@ -984,14 +982,14 @@ script.
 ### Steps
 
 Run every step from the repository checkout that holds your bundle, with
-`docker-compose.simple.yml` replaced by `docker-compose.proxy.yml` if that
+`docker-compose.yml` replaced by `docker-compose.yml` if that
 is your bundle.
 
 1. **Stop the app first,** with the compose file you are running today, so
    nothing is connected as the old superuser while you work:
 
    ```bash
-   docker compose -f docker-compose.simple.yml stop obsidian-mcp
+   docker compose -f docker-compose.yml stop obsidian-mcp
    ```
 
 2. **Back up.** Nothing below deletes data, and the conversion is one
@@ -999,7 +997,7 @@ is your bundle.
    a dump first:
 
    ```bash
-   docker compose -f docker-compose.simple.yml exec -T postgres \
+   docker compose -f docker-compose.yml exec -T postgres \
      pg_dump -U obsidian_mcp obsidian_mcp | gzip > obsidian_mcp-pre-324.sql.gz
    ```
 
@@ -1017,7 +1015,7 @@ is your bundle.
    entrypoint and `postgres.env` (the app stays stopped):
 
    ```bash
-   docker compose -f docker-compose.simple.yml up -d postgres
+   docker compose -f docker-compose.yml up -d postgres
    ```
 
 7. **Run the conversion script.** It takes both passwords from the
@@ -1025,7 +1023,7 @@ is your bundle.
    command line, and connects over the container's local socket:
 
    ```bash
-   docker compose -f docker-compose.simple.yml exec -T postgres sh -c \
+   docker compose -f docker-compose.yml exec -T postgres sh -c \
      'psql -X -v ON_ERROR_STOP=1 -U obsidian_mcp -d obsidian_mcp \
            -v admin_pw="$POSTGRES_PASSWORD" -v app_pw="$OBSIDIAN_DB_PASSWORD"' \
      < docker/upgrade-split-db-roles.sql
@@ -1055,13 +1053,13 @@ is your bundle.
    before the conversion survives in any form:
 
    ```bash
-   docker compose -f docker-compose.simple.yml restart postgres
+   docker compose -f docker-compose.yml restart postgres
    ```
 
 9. **Start everything:**
 
    ```bash
-   docker compose -f docker-compose.simple.yml up -d
+   docker compose -f docker-compose.yml up -d
    ```
 
 The script relies on the image's default `trust` for local-socket

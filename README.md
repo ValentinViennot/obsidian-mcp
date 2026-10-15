@@ -797,8 +797,7 @@ cp .env.example .env
 $EDITOR .env
 ```
 
-Using a bundled stack (`docker-compose.simple.yml` or
-`docker-compose.proxy.yml`)? It runs PostgreSQL with two identities: set
+Using the bundled `docker-compose.yml` stack? It runs PostgreSQL with two identities: set
 `OBSIDIAN_DB_PASSWORD` in `.env` (the app's non-superuser role, from
 which the compose file builds `DATABASE_URL`) and copy
 `postgres.env.example` to `postgres.env` with its own
@@ -908,8 +907,8 @@ run on start. Read this first when upgrading across the internal-transport
 and panel-CSP release:
 
 - **Breaking: the server refuses to run as a PostgreSQL superuser
-  (#324).** A Compose install created from `docker-compose.simple.yml` or
-  `docker-compose.proxy.yml` before this release connects as the cluster
+  (#324).** A Compose install created from `docker-compose.yml` or
+  `docker-compose.yml` before this release connects as the cluster
   superuser and must run the one-time conversion in
   [DEPLOYMENT.md, "Upgrading: split database roles"](./DEPLOYMENT.md#upgrading-split-database-roles)
   (a backup, a new `postgres.env`, `OBSIDIAN_DB_PASSWORD` in `.env`, one

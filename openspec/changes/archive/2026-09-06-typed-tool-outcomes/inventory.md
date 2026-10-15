@@ -494,3 +494,26 @@ A final AST/manual diff sweep must check every added `str(outcome)`, f-string, c
 ## Read scope and boundaries
 
 Reviewed CLAUDE.md/shared workflow plus relevant usage-attribution, security-event logging, vault-tool publication and transfer contracts. This task authorizes an implementation/PR, not a change to HTTP transfer redemption status contracts, quota ordering, write preconditions, filesystem permissions, accepted limits, R10 durability-warning policy or mutation behavior. No new migrations, dependencies or network services are necessary for #263.
+
+
+## Fork Git-history tools retained during upstream synchronization
+
+These read-only tools predate the upstream typed-body outcome migration. Their
+existing in-band messages remain compatible; the scan admission class bounds
+their filesystem/Git work. Ordinary history and empty pickaxe answers succeed.
+
+### note_history_impl (fork)
+
+Reports bounded commit history and a note's birth commit. Behavioral coverage:
+`tests/test_git_history_tools.py::test_history_reports_the_birth_commit_with_its_backdated_author_date`.
+
+### note_blame_impl (fork)
+
+Reports bounded line attribution. Behavioral coverage:
+`tests/test_git_history_tools.py::test_blame_attributes_lines_to_the_two_authors_that_wrote_them`.
+
+### find_when_written_impl (fork)
+
+Reports a bounded literal pickaxe search, including a successful no-match answer.
+Behavioral coverage:
+`tests/test_git_history_tools.py::test_the_pickaxe_reports_no_match_for_text_never_committed`.

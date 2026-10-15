@@ -91,7 +91,7 @@ the qualified identity is asserted afterwards. A column added to an
 `oauth_clients` in a decoy schema would leave the sweep reading a table the
 application never writes, which is a sweep that deletes live registrations.
 
-Revision ID: 025
+Revision ID: 031 (fork compatibility; upstream 025)
 Revises: 024
 Create Date: 2026-09-21
 """
@@ -100,8 +100,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "025"
-down_revision: Union[str, None] = "024"
+revision: str = "031"
+down_revision: Union[str, None] = "026"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

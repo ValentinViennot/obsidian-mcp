@@ -642,22 +642,9 @@ async def close_provider_client() -> None:
     await _OPENAI_CLIENT.aclose()
 
 
-#: How many chunks go into one `/api/embed` request. Mirrors
-#: `OpenAIProvider.OPENAI_BATCH_LIMIT`, and is a *bound* rather than a target:
-#: it is what makes every deadline below finite, because the deadline scales
-#: with the request and the request can never carry more than this.
-#:
-#: 32 is where the measured curve flattens against the production endpoint
-#: (seconds per chunk: 0.092 unbatched, 0.0233 at 8, 0.0169 at 32, 0.0170 at
-#: 50). Past that the marginal gain is noise while the cost of a failed request
-#: — the whole sub-batch is re-issued one chunk at a time — keeps growing, and
-#: so does the peak memory the provider holds for one request.
+#: Legacy fork fixture size. Runtime requests use the bounded
+#: `settings.ollama_embed_batch_size` (default 16, range 1–256).
 OLLAMA_BATCH_LIMIT = 32
-
-#: The deadline for a request carrying **one** chunk. Unchanged from #127: a
-#: single-chunk request is byte for byte the call this provider made before
-#: batching existed, and it must fail in the same bounded time.
-OLLAMA_REQUEST_TIMEOUT_SECONDS = 30.0
 
 #: The extra deadline each *additional* chunk in a request buys.
 #:
@@ -759,7 +746,7 @@ class OllamaProvider:
         return await self._post(inputs, timeout=_ollama_batch_timeout(len(inputs)))
 
     async def embed_one(self, text: str) -> list[float]:
-        vectors = await self._post(text, timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS)
+        vectors = await self._embed_inputs([text])
         return vectors[0]
 
     async def _embed_sub_batch(self, texts: list[str]) -> list[list[float]]:
@@ -835,36 +822,13 @@ class OllamaProvider:
         return vectors
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed every chunk, `OLLAMA_BATCH_LIMIT` per request, in input order.
+        """Embed chunks in order using the configured bounded request size.
 
-        **`/api/embed` takes an array.** Sending one chunk per request cost
-        0.092 s/chunk against the production endpoint; a batch of 32 costs
-        0.0169 s/chunk, a 5.4x speedup that flattens by 50. On the real corpus
-        (~14,000 chunks) that is ~21 minutes of load turned into ~4. Speed is
-        the smaller half: this Ollama instance is **shared** with other
-        services, so 32x fewer requests is 32x less queue contention on
-        somebody else's latency, not just on ours.
-
-        **There is still no aggregate deadline, deliberately** (#127, D5).
-        There used to be a fixed 300 s budget over the whole batch. It could
-        only ever fire when every individual chunk was healthy — a hung
-        provider trips the per-request `wait_for` long before it — so the one
-        thing it actually caught was a note with more chunks than 300 s of
-        normal latency covers. Such a note timed out, was never certified, and
-        was re-selected on the next pass: a permanent 300 s burn per tick,
-        under `index_pass_lock`, that could never complete.
-
-        Nothing here reintroduces that. Every deadline belongs to exactly one
-        bounded request (`_ollama_batch_timeout`), this loop imposes none of
-        its own, and no amount of healthy work can exhaust a per-request bound
-        — which is precisely the property the retired budget lacked. A note of
-        any size still completes; a provider that stops responding still fails
-        in bounded time, now ≤ 340 s per request rather than the 960 s the same
-        32 chunks could take as 32 serial calls.
-
-        The pause flag is honoured at the next note boundary as it always was.
-        `OpenAIProvider` is untouched — it batched natively from the start and
-        never had this defect.
+        Each request has its own affine deadline. There is no note-wide budget:
+        a long note can finish while each provider request remains bounded.
+        Ordinary batch failures fall back per input; timeouts and malformed
+        response cardinality fail the batch without multiplying provider work.
+        The pause flag remains checked at the next note boundary.
         """
         if not texts:
             return []
@@ -1300,6 +1264,7 @@ async def _generation_matches(
                         select(NoteEmbedding.id, NoteEmbedding.chunk_text).where(
                             NoteEmbedding.note_id == note.id,
                             NoteEmbedding.id.in_(list(reused_rows)),
+                            current_embedding_predicate(),
                         )
                     )
                 ).all()
@@ -1625,7 +1590,7 @@ async def _lookup_reusable_vectors(
                             NoteEmbedding.chunk_text,
                             NoteEmbedding.embedding,
                         )
-                        .where(NoteEmbedding.note_id == note_id)
+                        .where(NoteEmbedding.note_id == note_id, current_embedding_predicate())
                         .order_by(NoteEmbedding.chunk_index, NoteEmbedding.id)
                     )
                 ).all()

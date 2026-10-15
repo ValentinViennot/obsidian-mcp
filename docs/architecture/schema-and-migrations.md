@@ -2,6 +2,12 @@
 
 > Deep rationale extracted from `CLAUDE.md`. Read before writing or reviewing a migration.
 
+> Fork numbering after the October 2026 synchronization: existing OIDC `025`
+> and temporal `026` remain unchanged. Incoming upstream `025`–`030` are fork
+> `031`–`036`, respectively. The upstream rationale below retains its historical
+> revision references; use the [compatibility map](upstream-sync-20261015.md)
+> when locating current migration files. The single current Alembic head is `036`.
+
 ## Schema drift is not only what `alembic check` sees
 
 `alembic check` autogenerates against the live database and reports what it

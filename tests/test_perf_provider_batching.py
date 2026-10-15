@@ -177,7 +177,7 @@ async def test_a_hung_request_fails_at_30s_and_so_does_the_next(
     with pytest.raises((asyncio.TimeoutError, TimeoutError)):
         await provider.embed_batch([f"c{i}" for i in range(20)])
 
-    assert seen == [30.0, 30.0]
+    assert seen == [embeddings._ollama_batch_timeout(16), embeddings._ollama_batch_timeout(4)]
     assert [len(c) for c in calls] == [16, 4]
 
 

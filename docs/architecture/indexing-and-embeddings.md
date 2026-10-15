@@ -4,7 +4,7 @@
 
 ## Embedding providers
 - `EMBEDDING_PROVIDER=ollama` (default) — uses `OLLAMA_URL` and
-  `EMBEDDING_MODEL`; pooled hardened HTTP transport and sequential `/api/embed` requests of at most `OLLAMA_EMBED_BATCH_SIZE` inputs each (default16,1–256), positional cardinality checks and attributed per-chunk fallback. Query requests retain the supported bare-string shape.
+  `EMBEDDING_MODEL`; pooled hardened HTTP transport and sequential `/api/embed` requests of at most `OLLAMA_EMBED_BATCH_SIZE` inputs each (default16,1–256), positional cardinality checks and attributed per-chunk fallback. Query requests use a one-element array.
 - `EMBEDDING_PROVIDER=openai` — requires `OPENAI_API_KEY` (validated at
   startup). Uses `OPENAI_BASE_URL` (default `https://api.openai.com/v1`)
   and `OPENAI_EMBEDDING_MODEL` (default `text-embedding-3-small`). Native
@@ -352,7 +352,7 @@ text) alone; the fingerprint names the model.
   committing around it.
 - **`OllamaProvider.embed_batch` has no aggregate deadline** (#127); the only
   liveness bound is per **request**, and a request carries at most
-  `OLLAMA_BATCH_LIMIT` chunks. The old fixed 300 s whole-batch budget could
+  the configured batch size (1–256) chunks. The old fixed 300 s whole-batch budget could
   fire only when every chunk was individually healthy — i.e. exactly on a note
   with more chunks than 300 s of normal latency covers, which then never
   certified and was re-selected every tick: a permanent 300 s burn under
@@ -360,12 +360,11 @@ text) alone; the fingerprint names the model.
   spanning the whole note re-introduces the same boundary one size class up
   and was rejected then, and is still rejected.
   `_ollama_batch_timeout(n) = 30 + 10·(n−1)` is not that: it bounds **one**
-  request over at most 32 chunks, so a note of any size gets one deadline per
+  request over at most256 chunks, so a note of any size gets one deadline per
   request instead of one deadline for the note, and no quantity of healthy work
   can exhaust any of them. It is also never larger than what the same chunks
   were allowed as serial calls (30·n), so liveness is strictly better than the
-  #127 baseline — a hung provider is caught in ≤ 340 s where 32 serial calls
-  took up to 960 s. `embed_note` still refuses to certify partial chunk
+  #127 baseline — a request of16 chunks is bounded at180s and the maximum256-input request at2580s; neither depends on the total note size. `embed_note` still refuses to certify partial chunk
   coverage, and the pause is honoured at the next note boundary, as always.
 - **Batched results are checked, not trusted.** `/api/embed` answers with a
   bare positional array and no `index` field, so the response length is the
@@ -382,12 +381,11 @@ text) alone; the fingerprint names the model.
   chunk that caused it.
 - **Why batch at all.** Measured against the production endpoint: 0.092
   s/chunk unbatched, 0.0233 at 8, 0.0169 at 32, 0.0170 at 50 — a 5.4x speedup
-  that flattens by 50, which is why the limit is 32. The larger reason is
+  that flattens by 50, which motivated the fork’s original fixed32 limit; upstream now makes the request size configurable. The larger reason is
   contention: the Ollama instance is shared with other services, so 32x fewer
   requests is 32x less queueing imposed on somebody else's latency. On the
   production corpus (~14,000 chunks) that is ~21 minutes of load turned into
   ~4. `OpenAIProvider` batched natively from the start and is untouched.
-- Indexer runs on startup then every 5 minutes, hash-based change detection.
 - Indexer runs on startup then every 5 minutes. Change detection is by
   content hash, **with a stat shortcut** (#282): a file whose
   `(size, mtime_ns, ctime_ns, inode)` equals the tuple recorded for its row's

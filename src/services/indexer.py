@@ -3061,6 +3061,7 @@ async def _index_vault_pinned(
             return await _index_vault_attempt(
                 user_id, vault, root_fd, log_suffix,
                 backstop=backstop,
+                git_times=git_times,
                 re_derive=re_derive,
                 facts=facts,
                 snapshot=snapshot,
@@ -3102,6 +3103,7 @@ async def _index_vault_attempt(
     log_suffix: str,
     *,
     backstop: bool,
+    git_times: dict[str, int],
     re_derive: bool,
     facts: "RootFacts | None",
     snapshot: dict,

@@ -185,7 +185,7 @@ async def test_version_two_mask_decided_rows_are_repaired_without_reembedding(
 
     after = (await rows(sessionmaker))["Source.md"]
     assert after.id == note_id
-    assert after.extraction_version == 3
+    assert after.extraction_version == 4
     assert after.content_hash == before.content_hash == content_hash(body)
     assert after.embedded_content_hash == before.embedded_content_hash == after.content_hash
     assert after.tags == ["real"]

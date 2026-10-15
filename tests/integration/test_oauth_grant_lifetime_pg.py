@@ -824,7 +824,7 @@ async def test_a_pre_029_family_refreshes_immediately_after_the_upgrade(monkeypa
     db = _Database("test_grant_life_029")
     await _run_maintenance(PGVECTOR_TEST_ADMIN_URL, f'CREATE DATABASE "{db.name}"')
     try:
-        await asyncio.to_thread(_alembic, db.url, "upgrade", "028")
+        await asyncio.to_thread(_alembic, db.url, "upgrade", "034")
         refresh_value = secrets.token_hex(32)
         old = datetime(2025, 1, 1, tzinfo=UTC)
 

@@ -64,6 +64,6 @@ def test_unbounded_historical_kind_order_is_preserved():
     "🌍 prose", "",
 ])
 def test_version_three_preserves_version_two_embedding_input(body):
-    assert indexer.CURRENT_EXTRACTION_VERSION == 3
+    assert indexer.CURRENT_EXTRACTION_VERSION == 4
     assert clean_at_version(3, body) == clean_at_version(2, body)
     assert indexer._grammar_changed_the_embedding_text(2, body) is False

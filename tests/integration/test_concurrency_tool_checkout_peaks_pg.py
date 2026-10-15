@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+import subprocess
 from collections import Counter
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
@@ -100,6 +101,13 @@ async def env(engine, monkeypatch, tmp_path):
     (root / 'b.md').write_text('---\nstatus: open\n---\n# B\n\nquartzite body\n')
     (root / 'lonely.md').write_text('# Lonely\n')
     (root / 'f.bin').write_bytes(b'\x00\x01binary')
+    # Exercise the retained fork history tools against real synthetic Git
+    # history, rather than measuring only their early not-a-repository branch.
+    for args in (("init",), ("add", "."),
+                 ("-c", "user.name=QA Fixture", "-c", "user.email=qa@example.invalid",
+                  "commit", "-m", "Seed synthetic checkout fixture")):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
     async with maker() as session:
         await session.execute(text(
             'TRUNCATE users, api_keys, quota_counters, usage_logs, notes_metadata, '
@@ -189,6 +197,9 @@ def _upload_id(text_):
 # (registered tool name, impl, args) in an order where each call's fixture
 # exists: create → edit → frontmatter → move → delete, and so on.
 CALLS = [
+    ('note_history', 'note_history_impl', lambda s: (('a.md',), {})),
+    ('note_blame', 'note_blame_impl', lambda s: (('a.md',), {})),
+    ('find_when_written', 'find_when_written_impl', lambda s: (('quartzite',), {'path': 'a.md'})),
     ('keyword_search', 'search_notes_impl', lambda s: (('quartzite',), {'limit': 5})),
     ('semantic_search', 'semantic_search_impl', lambda s: (('anything',), {'limit': 5})),
     ('read_note', 'read_note_impl', lambda s: (('a.md',), {})),

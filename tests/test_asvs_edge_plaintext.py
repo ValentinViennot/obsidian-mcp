@@ -26,7 +26,7 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-COMPOSE_PATH = REPO_ROOT / "docker-compose.yml"
+COMPOSE_PATH = REPO_ROOT / "docker-compose.traefik.yml"
 CADDYFILE_PATH = REPO_ROOT / "Caddyfile.example"
 
 PLAINTEXT_ROUTER = "obsidian-mcp-plaintext-rtr"
@@ -78,7 +78,10 @@ def _read(path: Path) -> str:
 @pytest.fixture(scope="module")
 def compose_labels() -> dict[str, str]:
     """The `obsidian-mcp` service's Traefik labels, as a key → value map."""
-    doc = yaml.safe_load(_read(COMPOSE_PATH))
+    class OverrideLoader(yaml.SafeLoader):
+        pass
+    OverrideLoader.add_constructor("!reset", lambda loader, node: None)
+    doc = yaml.load(_read(COMPOSE_PATH), Loader=OverrideLoader)
     labels = doc["services"]["obsidian-mcp"]["labels"]
     out: dict[str, str] = {}
     for entry in labels:
@@ -239,7 +242,7 @@ def test_the_https_routers_are_left_alone(compose_labels):
     # particular the https root router keeps its own matcher and priority.
     assert (
         compose_labels["traefik.http.routers.obsidian-mcp-root-rtr.rule"]
-        == "Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && Path(`/`) "
+        == "Host(`${MCP_HOSTNAME}`) && Path(`/`) "
         "&& HeaderRegexp(`Authorization`, `^Bearer `)"
     )
     for router in (
@@ -363,7 +366,10 @@ def test_no_host_filesystem_path_is_bind_mounted_literally():
     text, so the file's own example comments are untouched — the requirement
     bans values that identify a deployment, not published examples.
     """
-    doc = yaml.safe_load(_read(COMPOSE_PATH))
+    class OverrideLoader(yaml.SafeLoader):
+        pass
+    OverrideLoader.add_constructor("!reset", lambda loader, node: None)
+    doc = yaml.load(_read(REPO_ROOT / "docker-compose.yml"), Loader=OverrideLoader)
     allowed_literals = {"/etc/timezone", "/etc/localtime"}
     for volume in doc["services"]["obsidian-mcp"]["volumes"]:
         source = str(volume).split(":")[0]

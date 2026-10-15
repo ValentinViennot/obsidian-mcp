@@ -675,6 +675,12 @@ def test_a_kernel_without_the_mount_id_bit_warns_and_keeps_serving(
     whole-server outage — the false-positive direction."""
     import src.main as main_module
 
+    # Importing the application configures logging and can remove pytest's
+    # root capture handler when this module runs alone. Restore capture only
+    # for this test, so standalone and full-suite runs observe the same warning.
+    logger = logging.getLogger("src.main")
+    if caplog.handler not in logger.handlers and caplog.handler not in logging.getLogger().handlers:
+        monkeypatch.setattr(logger, "handlers", [*logger.handlers, caplog.handler])
     _statx_without_the_mnt_id_bit(monkeypatch)
     vault_fs.reset_mount_identity_state()
     try:

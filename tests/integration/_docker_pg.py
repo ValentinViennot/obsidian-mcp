@@ -67,7 +67,8 @@ class Container:
         return int(out.rsplit(":", 1)[1])
 
     def url(self, user: str, password: str, db: str = "obsidian_mcp") -> str:
-        return f"postgresql+asyncpg://{user}:{password}@127.0.0.1:{self.port}/{db}"
+        host = os.environ.get("OMCP_DOCKER_TEST_HOST", "127.0.0.1")
+        return f"postgresql+asyncpg://{user}:{password}@{host}:{self.port}/{db}"
 
     def running(self) -> bool:
         out = docker("inspect", "-f", "{{.State.Running}}", self.name, check=False).stdout.strip()

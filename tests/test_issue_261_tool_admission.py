@@ -252,7 +252,7 @@ def test_registry_covers_exactly_the_five_classes():
     assert concurrency.CLASSES == {'embedding', 'vector', 'write', 'scan', 'light'}
     assert set(concurrency.TOOL_CLASSES.values()) == concurrency.CLASSES
     assert 'other' not in concurrency.TOOL_CLASSES.values()
-    assert len(concurrency.TOOL_CLASSES) == 25
+    assert len(concurrency.TOOL_CLASSES) == 28
 
 
 @tools._tracked('read_note', [])
@@ -272,3 +272,31 @@ async def test_enforce_parallel_read_batch_at_defaults_sees_no_refusal(configure
     assert len(rows) == 8 and len(quotas) == 8
     assert max(r['params']['queue_ms'] for r in rows) > 0, 'the batch never queued'
     assert c.tools.active == 0 and not c.pending
+
+
+@pytest.mark.asyncio
+async def test_sync_cleanup_failure_releases_admission_and_tool_context(configured, monkeypatch, tmp_path):
+    install, _, _, _ = configured
+    controller = install()
+    monkeypatch.setattr(tools.settings, 'git_vault_enabled', True)
+    monkeypatch.setattr(tools, '_vault_root', lambda uid: tmp_path)
+
+    class BrokenCleanup:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            raise RuntimeError('synthetic sync cleanup failure')
+
+    monkeypatch.setattr(tools.vault_sync, 'writing', lambda root: BrokenCleanup())
+
+    @tools._tracked('write_file', [], write_class=True)
+    async def write_probe():
+        return 'completed'
+
+    previous = tools._current_tool_name.get()
+    with pytest.raises(RuntimeError, match='synthetic sync cleanup failure'):
+        await write_probe()
+    assert controller.tools.active == controller.writers.active == 0
+    assert not controller.tenants.entries and not controller.principals.entries
+    assert tools._current_tool_name.get() == previous

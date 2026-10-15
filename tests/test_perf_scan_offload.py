@@ -112,6 +112,9 @@ async def test_health_answers_and_the_loop_progresses_during_a_pass(
     tick_task = asyncio.create_task(ticker())
     try:
         while not reading.is_set():
+            if pass_task.done():
+                await pass_task
+                pytest.fail("Index pass finished before the worker probe began")
             await asyncio.sleep(0.01)
         ticks_at_read = ticks
         async with httpx.AsyncClient(
@@ -164,6 +167,9 @@ async def test_cancellation_stops_the_scan_before_its_next_file(monkeypatch, vau
 
     task = asyncio.create_task(indexer.index_vault())
     while not first_read.is_set():
+        if task.done():
+            await task
+            pytest.fail("Index pass finished before the worker probe began")
         await asyncio.sleep(0.01)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -364,6 +370,9 @@ async def _loop_progresses_while(reading: threading.Event, coro):
     tick_task = asyncio.create_task(ticker())
     try:
         while not reading.is_set():
+            if task.done():
+                await task
+                pytest.fail("Index pass finished before the worker probe began")
             await asyncio.sleep(0.01)
         ticks_at_read = ticks
         await asyncio.sleep(0.1)
@@ -412,7 +421,7 @@ async def test_the_link_backfill_reads_and_parses_off_the_loop(monkeypatch, vaul
     import os
 
     (vault / "A.md").write_text("---\ntitle: A\n---\nsee [[B]]\n", encoding="utf-8")
-    session = _BackfillSession([SimpleNamespace(id=1, file_path="A.md")])
+    session = _BackfillSession([SimpleNamespace(id=1, file_path="A.md", aliases=None)])
     monkeypatch.setattr(indexer, "async_session", lambda: session)
 
     async def permitted(*_a, **_k):

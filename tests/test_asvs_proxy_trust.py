@@ -320,13 +320,13 @@ def test_the_start_command_files_are_the_ones_we_think_they_are():
     assert names == {
         "Dockerfile",
         "docker-compose.yml",
-        "docker-compose.proxy.yml",
-        "docker-compose.simple.yml",
+        "docker-compose.traefik.yml",
+        "docker-compose.caddy.yml",
     }
     assert len(_uvicorn_launches(DOCKERFILE)) == 1
     assert _uvicorn_launches(REPO / "docker-compose.yml") == []
-    for name in ("docker-compose.proxy.yml", "docker-compose.simple.yml"):
-        assert len(_uvicorn_launches(REPO / name)) == 1, name
+    for name in ("docker-compose.traefik.yml", "docker-compose.caddy.yml"):
+        assert _uvicorn_launches(REPO / name) == [], name
 
 
 def test_the_documented_dev_command_leaves_forwarded_headers_to_the_application():

@@ -57,7 +57,7 @@ marker (023's rule) and prints what it leaves.
 and `RESET`, for 021's, 024's and 025's reasons. Needs the TEMP privilege for
 the probe, as 013 already does.
 
-Revision ID: 028
+Revision ID: 034 (fork compatibility; upstream 028)
 Revises: 027
 Create Date: 2026-09-23
 """
@@ -67,8 +67,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "028"
-down_revision: Union[str, None] = "027"
+revision: str = "034"
+down_revision: Union[str, None] = "033"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

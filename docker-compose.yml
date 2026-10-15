@@ -231,9 +231,9 @@ services:
     # raise INDEX_INTERVAL or the embed batch size, not after.
     # 256 MiB reservation: roughly the resident set of an idle server, so a
     # co-tenant's memory spike does not push this one into reclaim.
-    mem_limit: 1g
+    mem_limit: 2g
     mem_reservation: 256m
-    memswap_limit: 1g
+    memswap_limit: 2g
     # One event loop plus the default asyncio threadpool. More cores cannot be
     # used by one worker, and the worker count is fixed at 1 by contract.
     cpus: 1.0

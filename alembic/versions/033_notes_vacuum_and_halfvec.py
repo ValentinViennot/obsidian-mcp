@@ -78,7 +78,7 @@ and asserted: what the unqualified names resolve to must be the `public`
 tables. Everything this sets is `RESET` at the end, because alembic runs every
 pending revision in one transaction.
 
-Revision ID: 027
+Revision ID: 033 (fork compatibility; upstream 027)
 Revises: 026
 Create Date: 2026-09-22
 """
@@ -90,8 +90,8 @@ from alembic import op
 from src.config import settings
 from src.services import vector_index
 
-revision: str = "027"
-down_revision: Union[str, None] = "026"
+revision: str = "033"
+down_revision: Union[str, None] = "032"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

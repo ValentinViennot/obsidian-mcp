@@ -71,8 +71,7 @@ async def test_a_batch_past_the_old_aggregate_budget_completes(monkeypatch):
     out = await provider.embed_batch([f"chunk {i}" for i in range(400)])
 
     assert len(out) == 400
-    assert sum(requests) == 400
-    assert max(requests) <= embeddings.OLLAMA_BATCH_LIMIT
+    assert calls["n"] == 400
     assert fake_now["t"] > 300.0, "the run must exceed the retired budget"
 
 

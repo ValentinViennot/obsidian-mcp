@@ -403,7 +403,7 @@ def test_the_model_and_migration_029_agree_on_both_markers():
 
     from src.models import db as models
 
-    path = ROOT / "alembic" / "versions" / "029_oauth_grant_lifetime.py"
+    path = ROOT / "alembic" / "versions" / "035_oauth_grant_lifetime.py"
     spec = importlib.util.spec_from_file_location("_migration_029", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

@@ -16,6 +16,7 @@ TCP healthcheck on a fresh, project-scoped volume.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
@@ -38,8 +39,12 @@ class Project:
         self.dir = tmp_path / "project"
         (self.dir / "docker").mkdir(parents=True)
         self.name = unique("compose")
-        spec = yaml.safe_load((ROOT / "docker-compose.proxy.yml").read_text())
+        spec = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+        spec["services"] = {"postgres": spec["services"]["postgres"]}
         spec["services"]["postgres"]["container_name"] = f"{self.name}-postgres"
+        # Optional task-isolated subnet for hosts whose automatic pools are full.
+        if os.environ.get("OMCP_DOCKER_TEST_SUBNET"):
+            spec["networks"]["mcp_internal"]["ipam"] = {"config": [{"subnet": os.environ["OMCP_DOCKER_TEST_SUBNET"]}]}
         (self.dir / "compose.yml").write_text(yaml.safe_dump(spec))
         shutil.copy(ROOT / "docker" / "postgres-entrypoint.sh", self.dir / "docker")
         init = (ROOT / "docker" / "db-init-compose.sh").read_text()

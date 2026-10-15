@@ -170,12 +170,15 @@ jobs:
     name: compose-config
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      OBSIDIAN_DB_PASSWORD: ci-not-a-real-runtime-password
     steps:
       - uses: actions/checkout@v4
 
       - name: Validate the compose files
         run: |
           cp .env.example .env
+          cp postgres.env.example postgres.env
           echo "==> base stack"
           docker compose -f docker-compose.yml config --quiet
           for override in docker-compose.caddy.yml docker-compose.traefik.yml; do

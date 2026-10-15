@@ -362,8 +362,8 @@ async def test_ollama_batch_propagates_the_typed_exception(
 ):
     """`embed_batch` wraps each call in `asyncio.wait_for`; the exception must
     come out of it as itself, not as a `TimeoutError` or a swallowed None.
-    One input per request, so the rejection lands on the second request."""
-    monkeypatch.setattr(settings, "ollama_embed_batch_size", 1)
+    The two-input batch refusal falls back and identifies the offending chunk."""
+    monkeypatch.setattr(settings, "ollama_embed_batch_size", 2)
     provider = OllamaProvider()
     with respx.mock(base_url="http://ollama:11434") as mock:
         route = mock.post("/api/embed")

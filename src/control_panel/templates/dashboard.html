@@ -198,13 +198,13 @@
 
         <div class="stat-card anim-1">
             <div class="stat-label">Notes Indexed</div>
-            <div class="stat-num accent" data-countup="{{ stats.notes_indexed | default(0) }}">0</div>
+            <div class="stat-num accent" data-countup="{{ stats.notes_indexed | default(0) }}">{{ stats.notes_indexed | default(0) }}</div>
         </div>
 
         <div class="stat-card anim-2">
             <div class="stat-label">Embedded</div>
             <div class="u-display-flex u-align-items-baseline u-gap-10px">
-                <div class="stat-num" data-countup="{{ stats.notes_with_embeddings | default(0) }}">0</div>
+                <div class="stat-num" data-countup="{{ stats.notes_with_embeddings | default(0) }}">{{ stats.notes_with_embeddings | default(0) }}</div>
                 <span class="u-font-size-17px u-font-weight-500 u-color-text-3">/ {{ stats.notes_indexed | default(0) }}</span>
             </div>
             <!-- Coverage progress bar -->
@@ -241,12 +241,12 @@
 
         <div class="stat-card anim-3">
             <div class="stat-label">Active Keys</div>
-            <div class="stat-num u-color-success" data-countup="{{ stats.active_keys | default(0) }}">0</div>
+            <div class="stat-num u-color-success" data-countup="{{ stats.active_keys | default(0) }}">{{ stats.active_keys | default(0) }}</div>
         </div>
 
         <div class="stat-card anim-4">
             <div class="stat-label">Requests Today</div>
-            <div class="stat-num u-color-warning" data-countup="{{ stats.requests_today | default(0) }}">0</div>
+            <div class="stat-num u-color-warning" data-countup="{{ stats.requests_today | default(0) }}">{{ stats.requests_today | default(0) }}</div>
         </div>
 
     </div>
@@ -295,7 +295,7 @@
             </div>
             <div class="card-body">
                 <div class="dash-reindexed-row">
-                    <div class="dash-reindexed-num" data-countup="{{ reindexed_24h | default(0) }}">0</div>
+                    <div class="dash-reindexed-num" data-countup="{{ reindexed_24h | default(0) }}">{{ reindexed_24h | default(0) }}</div>
                     <div class="dash-reindexed-caption">
                         notes reindexed<br>
                         <span class="u-color-text-3 u-font-size-13px">in the last 24h</span>
@@ -338,15 +338,15 @@
             <div class="stats-grid u-margin-bottom-18px">
                 <div class="stat-card">
                     <div class="stat-label">Total Links</div>
-                    <div class="stat-num" data-countup="{{ graph.total_links | default(0) }}">0</div>
+                    <div class="stat-num" data-countup="{{ graph.total_links | default(0) }}">{{ graph.total_links | default(0) }}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Dangling</div>
-                    <div class="stat-num u-color-warning" data-countup="{{ graph.dangling_links | default(0) }}">0</div>
+                    <div class="stat-num u-color-warning" data-countup="{{ graph.dangling_links | default(0) }}">{{ graph.dangling_links | default(0) }}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Orphans</div>
-                    <div class="stat-num u-color-text-2" data-countup="{{ graph.orphan_count | default(0) }}">0</div>
+                    <div class="stat-num u-color-text-2" data-countup="{{ graph.orphan_count | default(0) }}">{{ graph.orphan_count | default(0) }}</div>
                 </div>
             </div>
             {% if graph.top_hubs %}

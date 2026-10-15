@@ -211,7 +211,7 @@ async def test_shutdown_wakes_queued_without_grants_and_off_exemption():
     assert (await make().tool("internal", None, None, resource_class="light")).admitted
     with pytest.raises(ValueError): await make().tool("unregistered", 1, 1)
     with pytest.raises(ValueError): await make().tool("internal", 1, 1, resource_class="other")
-    assert len(TOOL_CLASSES) == 25
+    assert len(TOOL_CLASSES) == 28
     assert set(TOOL_CLASSES.values()) == CLASSES == {"embedding", "vector", "write", "scan", "light"}
     assert shadow_metadata(()) is None
 
@@ -226,7 +226,7 @@ def test_class_mapping_is_the_design_table():
         "write": {"create_note", "edit_note", "move_note", "delete_note", "set_frontmatter",
                   "write_file", "delete_file", "import_from_url"},
         "scan": {"keyword_search", "list_notes", "get_tags", "get_neighborhood",
-                 "find_orphans", "list_files"},
+                 "find_orphans", "list_files", "note_history", "note_blame", "find_when_written"},
         "light": {"read_note", "read_file", "get_recent", "get_vault_guide", "get_backlinks",
                   "get_links", "request_upload", "check_upload", "request_download"},
     }

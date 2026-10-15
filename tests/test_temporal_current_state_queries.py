@@ -178,7 +178,7 @@ async def test_embed_note_replaces_only_the_current_vectors(monkeypatch):
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", _batch)
 
-    async def _generation_ok(_session, _note):
+    async def _generation_ok(_session, _note, _reused_rows):
         return True
 
     monkeypatch.setattr(embeddings, "_generation_matches", _generation_ok)

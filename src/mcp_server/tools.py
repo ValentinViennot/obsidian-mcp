@@ -1980,14 +1980,16 @@ def _tracked(
                     await _commit_vault_writes(tool_name)
                 return result
             finally:
-                if sync_guard is not None:
-                    await sync_guard.__aexit__(None, None, None)
-                if slot_lease is not None:
-                    slot_lease.release()
-                timing.clear(token)
-                _current_tool_name.reset(name_token)
-                if git_token is not None:
-                    git_vault.clear(git_token)
+                try:
+                    if sync_guard is not None:
+                        await sync_guard.__aexit__(None, None, None)
+                finally:
+                    if slot_lease is not None:
+                        slot_lease.release()
+                    timing.clear(token)
+                    _current_tool_name.reset(name_token)
+                    if git_token is not None:
+                        git_vault.clear(git_token)
 
         # Structural marker. `tests/test_issue_66_*` asserts that every tool
         # registered on the MCP server delegates to something carrying it, so

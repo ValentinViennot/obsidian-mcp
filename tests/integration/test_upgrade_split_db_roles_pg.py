@@ -12,6 +12,7 @@ The tests in this module run in order against one cluster.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -160,7 +161,8 @@ def test_pre_split_cluster_is_converted(cluster):
     # A session that authenticated as the old superuser before the conversion,
     # over TCP like the app: it must not survive the commit (Codex, MAJOR).
     loop = asyncio.new_event_loop()
-    dsn = f"postgresql://%s:%s@127.0.0.1:{cluster.port}/obsidian_mcp"
+    host = os.environ.get("OMCP_DOCKER_TEST_HOST", "127.0.0.1")
+    dsn = f"postgresql://%s:%s@{host}:{cluster.port}/obsidian_mcp"
     held = loop.run_until_complete(asyncpg.connect(dsn % ("obsidian_mcp", OLD_PW)))
     try:
         assert loop.run_until_complete(held.fetchval("SELECT usesuper FROM pg_user WHERE usesysid = 10"))
@@ -295,7 +297,8 @@ def test_new_credentials_work_and_schema_is_clean(cluster):
     import asyncpg
 
     async def check():
-        dsn = f"postgresql://%s:%s@127.0.0.1:{cluster.port}/obsidian_mcp"
+        host = os.environ.get("OMCP_DOCKER_TEST_HOST", "127.0.0.1")
+        dsn = f"postgresql://%s:%s@{host}:{cluster.port}/obsidian_mcp"
         conn = await asyncpg.connect(dsn % ("postgres", ADMIN_PW))
         try:
             assert await conn.fetchval("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")

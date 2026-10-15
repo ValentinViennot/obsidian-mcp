@@ -180,6 +180,7 @@ jobs:
     env:
       SECRET_KEY: ci-not-a-real-key
       POSTGRES_PASSWORD: ci-not-a-real-password
+      OBSIDIAN_DB_PASSWORD: ci-not-a-real-runtime-password
       VAULT_HOST_PATH: ./vault
       MCP_HOSTNAME: obsidian-mcp.example.com
     steps:
@@ -192,6 +193,7 @@ jobs:
           # irrelevant: the variables above are already in the environment,
           # which is what interpolation reads.
           : > .env
+          : > postgres.env
           docker compose -f docker-compose.yml config -q
           docker compose -f docker-compose.yml -f docker-compose.caddy.yml config -q
           docker compose -f docker-compose.yml -f docker-compose.traefik.yml config -q

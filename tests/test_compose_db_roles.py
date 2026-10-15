@@ -27,7 +27,7 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-BUNDLES = ("docker-compose.simple.yml", "docker-compose.proxy.yml")
+BUNDLES = ("docker-compose.yml",)
 WRAPPER = ROOT / "docker" / "postgres-entrypoint.sh"
 INIT_SCRIPT = ROOT / "docker" / "db-init-compose.sh"
 UPGRADE_SCRIPT = ROOT / "docker" / "upgrade-split-db-roles.sql"
@@ -126,9 +126,11 @@ def test_healthcheck_probes_tcp_not_the_socket(bundle):
     assert "-h 127.0.0.1" in command
 
 
-def test_the_two_postgres_services_are_identical():
-    a, b = (_load(bundle)["services"]["postgres"] for bundle in BUNDLES)
-    assert a == b
+def test_front_door_overrides_never_redefine_database_services():
+    for name in ("docker-compose.caddy.yml", "docker-compose.traefik.yml"):
+        text = (ROOT / name).read_text()
+        assert not re.search(r"^  postgres:", text, re.M)
+
 
 
 def test_nothing_runs_the_upgrade_script_automatically():
@@ -316,7 +318,7 @@ def _compose_config(tmp_path: Path, bundle: str, *, dotenv: str, postgres_env: s
     project = tmp_path / "project"
     project.mkdir(exist_ok=True)
     shutil.copy(ROOT / bundle, project / "compose.yml")
-    (project / ".env").write_text(dotenv)
+    (project / ".env").write_text(dotenv + "VAULT_HOST_PATH=/synthetic-vault\n")
     if postgres_env is not None:
         (project / "postgres.env").write_text(postgres_env)
     # A scrubbed environment: compose interpolates from the shell first, so a

@@ -704,7 +704,7 @@ def test_the_model_and_the_migration_agree_on_the_marker():
         Path(__file__).resolve().parent.parent
         / "alembic"
         / "versions"
-        / "025_oauth_client_last_used.py"
+        / "031_oauth_client_last_used.py"
     )
     spec = importlib.util.spec_from_file_location("_migration_025", path)
     module = importlib.util.module_from_spec(spec)

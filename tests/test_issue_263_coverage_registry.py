@@ -9,6 +9,9 @@ from pathlib import Path
 
 # Tool -> [(terminal contract class, module::behavioral test), ...]
 COVERAGE = {
+    'note_history': [('success', 'test_git_history_tools.py::test_history_reports_the_birth_commit_with_its_backdated_author_date')],
+    'note_blame': [('success', 'test_git_history_tools.py::test_blame_attributes_lines_to_the_two_authors_that_wrote_them')],
+    'find_when_written': [('success', 'test_git_history_tools.py::test_the_pickaxe_reports_no_match_for_text_never_committed')],
     'keyword_search': [('success', 'test_issue_161_result_telemetry.py::test_keyword_search_logs_count_and_paths')],
     'read_note': [('refused', 'test_issue_263_tool_outcomes.py::test_read_error_private_metadata_budget_and_schema'), ('success', 'test_issue_263_tool_outcomes.py::test_successful_structured_note_with_forged_sentinel_stays_success')],
     'list_notes': [('success', 'test_issue_263_tool_outcomes.py::test_metadata_empty_successes_and_graph_body_refusals')],
@@ -41,7 +44,7 @@ def test_every_registered_tool_has_inventory_and_live_behavioral_references():
     from src.mcp_server.server import mcp
     registered = {tool.name for tool in mcp._tool_manager.list_tools()}
     assert set(COVERAGE) == registered
-    assert len(registered) == 25
+    assert len(registered) == 28
     root = Path(__file__).resolve().parents[1]
     inventory = (root / 'openspec/changes/archive/2026-09-06-typed-tool-outcomes/inventory.md').read_text()
     for tool, references in COVERAGE.items():

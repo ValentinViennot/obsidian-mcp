@@ -21,3 +21,17 @@
 7877c91df8c07f4db868a23273fc0a4baa679819:tests/test_issue_128_edit_note_frontmatter.py:generic-api-key:374
 a9f2215895bd970a08f8af635c86ee9c09aee0b5:tests/test_password_policy.py:generic-api-key:154
 c87b95a26f1eb6571696f2acf1d99f4531f18d84:tests/test_issue_92_oauth_error_headers.py:generic-api-key:82
+
+# Reviewed during the 15 October 2026 upstream integration: fixed synthetic
+# SECRET_KEY fixtures in upstream body-budget tests, a committed TLS test-client
+# key/certificate fixture (not a production identity), and SHA-256 UI source
+# digests misidentified as API keys. Exact historical fingerprints only.
+ba2dd346bd0df05991de0efcf32ae438b502f332:docs/qa/upstream-sync-20261015/ui-source-hashes.json:generic-api-key:10
+ba2dd346bd0df05991de0efcf32ae438b502f332:docs/qa/upstream-sync-20261015/ui-source-hashes.json:generic-api-key:16
+ba2dd346bd0df05991de0efcf32ae438b502f332:docs/qa/upstream-sync-20261015/ui-source-hashes.json:generic-api-key:18
+df613b9e82672779414d8f78c962f499b21315a2:tests/test_body_budget_config.py:generic-api-key:34
+df613b9e82672779414d8f78c962f499b21315a2:tests/test_body_budget_config.py:generic-api-key:370
+66523567a1d76ed1b30a5324368ed502de61b24a:tests/test_body_budget_config.py:generic-api-key:34
+66523567a1d76ed1b30a5324368ed502de61b24a:tests/test_body_budget_config.py:generic-api-key:370
+a18f2f7c9f7708c97176ef655981953851fcdd34:tests/fixtures/transport_tls/client.key:private-key:1
+c3c1ef6d740371169f4aca0fe30e4f4bf066c5c8:tests/fixtures/transport_tls/client.key:private-key:1

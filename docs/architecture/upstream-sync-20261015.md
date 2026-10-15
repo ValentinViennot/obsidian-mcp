@@ -72,3 +72,9 @@ nonce mismatch or database inconsistency was observed, so the browser-specific
 cause is not claimed. The page now server-renders the actual counter values and
 retains the existing animation. A focused rendered-HTML regression proves a
 truthful two-notes, two-embedded, 100% baseline before any script runs.
+
+
+Lead review also extended the exact-cardinality rule to query embeddings: an
+empty or multi-vector reply to one query now raises `ProviderBatchSizeMismatch`
+without retrying or selecting an arbitrary vector. The HTTP-seam regressions
+failed on both malformed replies before this correction and pass afterwards.

@@ -710,11 +710,9 @@ class OllamaProvider:
     ) -> list[list[float]]:
         """One `/api/embed` round trip, returning the raw `embeddings` array.
 
-        `payload_input` is passed through to the request body untouched, so
-        `embed_one` keeps sending a bare string (which is what every deployment
-        this has ever run against accepts) and only the batch path sends an
-        array. The response shape is the same either way: `embeddings` is an
-        array of vectors, positionally aligned with the inputs.
+        `payload_input` is passed through untouched. Both query and batch
+        callers send explicit input arrays; `embeddings` must contain exactly
+        one vector per input, in the same order.
         """
         client = _ollama_client()
         response = await client.post(
@@ -747,11 +745,16 @@ class OllamaProvider:
 
     async def embed_one(self, text: str) -> list[float]:
         vectors = await self._embed_inputs([text])
+        if len(vectors) != 1:
+            raise ProviderBatchSizeMismatch(
+                f"Ollama returned {len(vectors)} vectors for 1 input; "
+                "the query-to-vector pairing cannot be trusted"
+            )
         return vectors[0]
 
     async def _embed_sub_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed up to `OLLAMA_BATCH_LIMIT` chunks in one request, degrading to
-        one request per chunk if that request fails.
+        """Embed one configured sub-batch (at most 256 inputs), degrading to
+        one request per input after an ordinary provider failure.
 
         **Order is positional and is checked, not trusted.** `/api/embed`
         answers an array `input` with an array `embeddings` in input order;
@@ -767,7 +770,7 @@ class OllamaProvider:
 
         **A timeout does not fall back either.** A deadline says something
         about the provider, not about a chunk, so re-issuing the same work as
-        32 more requests would multiply exactly the burn the deadline exists to
+        one request per input would multiply exactly the burn the deadline exists to
         stop — and would make the bound `_ollama_batch_timeout` documents a
         lie. It propagates, `embed_note` records `PROVIDER_FAILED`, the note's
         existing vectors survive untouched (#11) and a later pass retries it.

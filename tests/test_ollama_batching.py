@@ -302,3 +302,16 @@ async def test_embed_one_sends_one_explicit_input(ollama_settings):
 
     assert out == [0.5, 0.25]
     assert json.loads(route.calls[0].request.read())["input"] == ["a query"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('count', [0, 2])
+async def test_query_embedding_refuses_wrong_vector_cardinality_without_retry(ollama_settings, count):
+    provider = OllamaProvider()
+    with respx.mock(base_url='http://ollama:11434') as mock:
+        route = mock.post('/api/embed').mock(
+            return_value=Response(200, json={'embeddings': [[0.5, 0.25]] * count})
+        )
+        with pytest.raises(ProviderBatchSizeMismatch, match=f'{count} vectors for 1 input'):
+            await provider.embed_one('a query')
+        assert route.call_count == 1

@@ -45,6 +45,7 @@ embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
 - [Who this is for](#who-this-is-for)
 - [Control panel](#control-panel)
 - [Quick start](#quick-start)
+- [Upgrading](#upgrading)
 - [Cost expectations](#cost-expectations)
 - [The self-describing vault](#the-self-describing-vault)
 - [Multi-user mode](#multi-user-mode)
@@ -482,7 +483,8 @@ import ran.
   including ChatGPT, Claude Desktop, and claude.ai. Dynamic registration
   defaults to both vault permission levels; the user chooses the actual
   grant on the consent screen.
-- Control panel (Jinja2, htmx, Tailwind) for keys, usage logs,
+- Control panel (Jinja2, hand-written CSS, vendored Chart.js, nonce-based
+  CSP) for keys, usage logs,
   indexer status, embedding-provider info, and a danger-zone reset.
 - Every tool call is logged to `usage_logs` with name, params
   (truncated to 200 chars), duration, response size, and the calling
@@ -493,6 +495,17 @@ import ran.
   mount check transfer writes need) and
   `vault_named_staging_fallback_active` (a write has actually staged
   under a name on this process).
+- `/health` also carries an `indexer` object (`status`, `task_running`,
+  `failing_scopes`, `embedding_failing_scopes`,
+  `max_consecutive_failures`, `quarantined_notes`, `last_success_at`),
+  and the top-level `status` becomes `"degraded"` when the indexer task
+  has died, any index, embedding or enumeration failure counter — or a
+  scope's run of incomplete re-derives — reaches
+  `INDEXER_DEGRADED_AFTER_FAILURES`, or a note is quarantined. **The HTTP
+  code stays 200** — a restart cannot repair vault content or a provider
+  outage, and Kubernetes uses `/health` for liveness — so **monitor the
+  `status` field** (a keyword or JSON check for `"status":"ok"`), not
+  the status code. Counts only: no path, error text or user id.
 
 Every write — note tools, `write_file`, uploads and imports — stages
 the new bytes in a temporary inode, `fsync`s them, and only then
@@ -721,6 +734,9 @@ old while the indexer is perfectly healthy.
 > Deploying on a VPS from scratch? See [`DEPLOYMENT.md`](./DEPLOYMENT.md)
 > for the full walkthrough: Postgres setup, Caddy and TLS, vault sync
 > via Nextcloud, and the gotchas that bite first-time deploys.
+> Running Kubernetes? See
+> [`docs/deployment-kubernetes.md`](./docs/deployment-kubernetes.md) and the
+> kustomize manifests in [`deploy/kubernetes/`](./deploy/kubernetes/).
 
 The bundled Caddy configuration fails closed on `/admin`, `/api`, and
 `/authorize`; replace its placeholder basic-auth hash before starting it.
@@ -781,6 +797,14 @@ cp .env.example .env
 $EDITOR .env
 ```
 
+Using the bundled `docker-compose.yml` stack? It runs PostgreSQL with two identities: set
+`OBSIDIAN_DB_PASSWORD` in `.env` (the app's non-superuser role, from
+which the compose file builds `DATABASE_URL`) and copy
+`postgres.env.example` to `postgres.env` with its own
+`POSTGRES_PASSWORD` (the database superuser, which only the postgres
+container sees). `make init` generates both. See
+[`DEPLOYMENT.md`](./DEPLOYMENT.md#step-2-clone-and-configure).
+
 Point the bind mount at your vault by setting `VAULT_HOST_PATH` in
 `.env` — `docker-compose.yml` reads it and refuses to start without it:
 
@@ -812,12 +836,23 @@ Option B, Ollama (self-hosted, GPU recommended):
 ```env
 EMBEDDING_PROVIDER=ollama
 OLLAMA_URL=http://your-ollama-host:11434
+EMBEDDING_ALLOW_PLAINTEXT=true
 EMBEDDING_MODEL=bge-m3
 EMBEDDING_DIMENSIONS=1024
 ```
 
 This is the default. Omitting `EMBEDDING_PROVIDER` falls back to
 Ollama.
+
+The embedding URL must be `https`, or `http` to a loopback host
+(`localhost`, `127.x`, `::1`). Plaintext `http` to any other host —
+another container such as `http://ollama:11434` included — refuses to
+start unless `EMBEDDING_ALLOW_PLAINTEXT=true` acknowledges that chunks
+and queries cross that hop unencrypted. `.env.example` ships with it
+set for that reason; drop it once the endpoint is `https` (use
+`EMBEDDING_CA_FILE` for an internal CA). Inside a container, `localhost`
+is the container itself, so an Ollama on the Docker host still needs
+the override.
 
 ### 3. Deploy
 
@@ -864,6 +899,50 @@ claude mcp add obsidian --transport http \
 The first thing any agent should do in a new session is call
 `get_vault_guide()`. That's how it learns your folder structure,
 naming conventions, and YAML schema before it writes anything.
+
+## Upgrading
+
+Pull, then `make deploy` (or rebuild your compose stack); migrations
+run on start. Read this first when upgrading across the internal-transport
+and panel-CSP release:
+
+- **Breaking: the server refuses to run as a PostgreSQL superuser
+  (#324).** A Compose install created from `docker-compose.yml` or
+  `docker-compose.yml` before this release connects as the cluster
+  superuser and must run the one-time conversion in
+  [DEPLOYMENT.md, "Upgrading: split database roles"](./DEPLOYMENT.md#upgrading-split-database-roles)
+  (a backup, a new `postgres.env`, `OBSIDIAN_DB_PASSWORD` in `.env`, one
+  script); the new compose files will not serve on an unconverted volume.
+  Any other deployment whose `DATABASE_URL` names a superuser is refused
+  at startup with a message; switch it to a non-superuser owner of the
+  database, or set `DATABASE_ALLOW_SUPERUSER=true` as a stop-gap. The
+  Kubernetes bundle is unaffected. A `DATABASE_URL` password of
+  `changeme` / `CHANGE_ME` is now refused, and the built-in default URL
+  carries no password.
+- **Breaking: plaintext embedding endpoints must be acknowledged.** If
+  the active embedding URL (`OLLAMA_URL`, or `OPENAI_BASE_URL` with the
+  OpenAI provider) is `http://` to a non-loopback host — the
+  `http://ollama:11434` default included — add
+  `EMBEDDING_ALLOW_PLAINTEXT=true` to `.env` **before** deploying, or
+  the server refuses to start with a message naming the setting.
+- **Database TLS has one source.** A TLS parameter in `DATABASE_URL`
+  (`?ssl=…`, `?sslmode=…`) or any `PGSSL*` environment variable is
+  refused at startup; move it to `DATABASE_SSL_MODE`. The default,
+  `prefer`, is the behaviour you had before.
+- **Embedding clients ignore the environment's network settings.**
+  `HTTP(S)_PROXY`, `SSL_CERT_FILE` / `SSL_CERT_DIR` and `.netrc` no
+  longer apply to the embedding hop. Use `EMBEDDING_CA_FILE` for an
+  internal CA.
+- **The panel now sends a nonce-based Content-Security-Policy**
+  (`PANEL_CSP=enforce`), and htmx is gone from it. If a panel control
+  misbehaves, set `PANEL_CSP=report-only` (or `off`) and recreate the
+  container; no rebuild.
+- **New optional settings:** `DATABASE_SSL_MODE`,
+  `DATABASE_SSL_CA_FILE`, `DATABASE_SSL_CERT_FILE`,
+  `DATABASE_SSL_KEY_FILE`, `EMBEDDING_ALLOW_PLAINTEXT`,
+  `EMBEDDING_CA_FILE`, `PANEL_CSP`. See [Configuration](#configuration),
+  and [`DEPLOYMENT.md`](./DEPLOYMENT.md#internal-transport-the-database-and-embedding-hops)
+  for moving both hops to verified TLS.
 
 ## Cost expectations
 
@@ -1045,6 +1124,11 @@ to multi-user later resumes where you left off without re-bootstrapping
   Both require an administrator to write a bind mount into the deploy
   configuration — which is why `/vaults/` **and the compose file's
   mounts** are the admin-trust boundary, not just the path strings.
+  This is a permanent, stated limit rather than a pending fix: mount
+  detection was specified, failed on a new topology in each of three
+  review rounds, and was dropped. **The operator rule: never mount one
+  user's directory, or anything nested in it, inside another user's
+  root.**
 
 ## Federated login with PocketID (OIDC)
 
@@ -1179,10 +1263,17 @@ the same fail-closed state a local user with no assignment is already in.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | — | `postgresql+asyncpg://user:pass@host/db` |
+| `DATABASE_URL` | — | `postgresql+asyncpg://user:pass@host/db`. No TLS parameters here — they are refused; use `DATABASE_SSL_MODE`. A `changeme` / `CHANGE_ME` password is refused. The bundled compose files set it themselves from `OBSIDIAN_DB_PASSWORD`. |
+| `DATABASE_ALLOW_SUPERUSER` | `false` | The server refuses to start when its database role is a PostgreSQL superuser. `true` downgrades that to a warning; a stop-gap while converting an install, not a setting to keep. |
+| `DATABASE_SSL_MODE` | `prefer` | Database TLS: `disable`, `prefer` (try TLS, fall back to plaintext), `require` (encrypt, no verification), `verify-ca`, `verify-full`. Strict modes exit if the session is not encrypted. Any `PGSSL*` variable is refused. |
+| `DATABASE_SSL_CA_FILE` | — | CA bundle (PEM) for `verify-ca` / `verify-full`; required by both, refused with any other mode. No system-store fallback. |
+| `DATABASE_SSL_CERT_FILE` | — | Client certificate (PEM). Strict modes (`require`, `verify-ca`, `verify-full`) only; set together with `DATABASE_SSL_KEY_FILE` or not at all. |
+| `DATABASE_SSL_KEY_FILE` | — | Client private key for `DATABASE_SSL_CERT_FILE`. Both or neither. |
 | `VAULT_PATH` | `/obsidian` | In-container vault mount |
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
+| `INDEXER_DEGRADED_AFTER_FAILURES` | `3` | Consecutive failures of any indexer counter (a scope's index passes, its embed passes, its incomplete re-derives, or the tick's own user enumeration) at which `/health` reports `degraded` and one CRITICAL "manual intervention required" line is logged. |
+| `INDEXER_QUARANTINE_RETRIES_PER_TICK` | `5` | How many times one index pass may roll back and re-run a scope after quarantining a note the database refuses (a data-exception or program-limit error on its row, keyword vector, move or links). Beyond it the pass fails as an ordinary failure; the notes already found stay quarantined for the next tick. |
 | `MULTI_USER_MODE` | `false` | In-app login, per-user vaults. See [Multi-user mode](#multi-user-mode). |
 | `AUTH_MODE` | `local` | How the *human* signs in to the panel: `local` (username/password) or `pocketid` (OIDC). Governs the panel login only — the server's own OAuth authorization server for MCP clients is unchanged either way. `pocketid` requires `MULTI_USER_MODE=true` and removes the password form and self-registration (both 404). See [Federated login with PocketID](#federated-login-with-pocketid-oidc). |
 | `OIDC_ISSUER` | — | Required when `AUTH_MODE=pocketid`. The provider's issuer, e.g. `https://auth.example.com`. HTTPS with no loopback exemption; discovery appends `/.well-known/openid-configuration`. |
@@ -1198,9 +1289,11 @@ the same fail-closed state a local user with no assignment is already in.
 | `ALLOWED_HOSTS` | derived | Accepted `Host` headers, JSON list. `localhost` is always added. |
 | `SESSION_MAX_AGE` | `604800` | Panel session lifetime, seconds (multi-user mode). Absolute — the server-side row is never extended, so a session used daily still expires |
 | `SESSION_COOKIE_NAME` | `omcp_session` | Panel session cookie name |
+| `PANEL_CSP` | `enforce` | Content-Security-Policy on the panel, login and consent pages: `enforce`, `report-only` (same policy, reports only), or `off`. A rollback lever — change it and recreate the container, no rebuild. Anything but `enforce` logs a WARNING at each start. |
 | `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may get before a validated `GET`/`HEAD` rewrites it. Telemetry only — nothing authorizes on it. Must be ≥ 1. |
 | `SESSION_PURGE_RETAIN_DAYS` | `7` | How long a dead panel session row is kept, measured from the *later* of its expiry and its revocation, so a revocation stays visible for the full window. Must be ≥ 1. |
 | `OAUTH_KNOWN_REDIRECT_HOSTS` | `claude.ai,chatgpt.com` | Redirect **hosts** the consent screen badges as known connector destinations. JSON or CSV. Matched by exact host equality — no wildcards, no suffixes; entries containing `*`, `/`, `@` or internal whitespace are refused at startup. An empty list means every client is shown as unverified. |
+| `OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS` | `90` | Absolute lifetime of an OAuth grant, in whole days (1–365), counted from when the application first receives its tokens. Refresh never extends it; after it the user must approve again. Stated on the consent page. **No off value** — empty, `null`, `none` and `0` refuse to start. Lowering it applies to every grant at its next request; raising it extends existing grants. |
 | `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds what the server reads from disk |
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
@@ -1218,11 +1311,13 @@ the same fail-closed state a local user with no assignment is already in.
 | `GIT_COMMIT_TIMEOUT_SECONDS` | `15` | Wall-clock bound on one git invocation (0 < n ≤ 120). git blocks indefinitely on a held index lock or an unresponsive filesystem, and this runs in a worker thread. |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
-| `OLLAMA_URL` | — | Used when provider is Ollama |
+| `OLLAMA_URL` | `http://ollama:11434` | Used when provider is Ollama. Must be `https`, loopback `http`, or covered by `EMBEDDING_ALLOW_PLAINTEXT`. |
 | `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident. `-1` pins it; a Go duration (`30m`) frees VRAM when idle. Ollama only. |
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies. Same transport rule as `OLLAMA_URL` when this provider is active. |
+| `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
+| `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
@@ -1235,8 +1330,22 @@ the same fail-closed state a local user with no assignment is already in.
 | `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `60` | Sustained vault-mutating calls per minute per principal — the eight write tools, plus `PUT /transfer/upload` charged to the principal that minted the capability. |
 | `MCP_WRITE_RATE_LIMIT_BURST` | `15` | Capacity of the write bucket. |
 | `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals holding their own limiter entry before further ones share one overflow entry. |
-| `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one rate-refusal coalescing window stays open. Inside it a refusal writes nothing; the row that lands stands for `1 + suppressed` refusals. |
-| `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** API key receives when the caller does not say otherwise. Existing keys are untouched; an explicit null (or a blank panel field) still means unlimited. |
+| `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one rate/slot-refusal coalescing window stays open. Inside it a refusal writes nothing; the row that lands stands for `1 + suppressed` refusals. |
+| `MCP_CONCURRENCY_MODE` | `shadow` | `off`, `shadow`, or `enforce`. Shadow observes pressure without rejecting or waiting. See [Concurrency admission](#concurrency-admission). |
+| `MCP_CONCURRENCY_WAIT_SECONDS` | `0` | Tool admission wait in enforce mode, 0–5 seconds. Shadow requires zero. |
+| `MCP_CONCURRENCY_TOOLS` | `4` | Global tool ceiling in enforce mode, also subject to class, tenant (3), and principal (2) ceilings. |
+| `MCP_CONCURRENCY_REQUESTS` | `32` | Full MCP request ceiling, including open streams; per bearer fingerprint ceiling defaults to 4. |
+| `MCP_CONCURRENCY_AUTH` | `2` | Authentication database-session ceiling. Released before response delivery or downstream work. |
+| `MCP_CONCURRENCY_WRITERS` | `1` | Usage-log writer ceiling; includes fallback inserts. Defaults: 64 pending writers and a 0.25-second enforce-mode wait. |
+| `MCP_BODY_MEMORY_BUDGET_BYTES` | unset | The `/mcp` body-memory budget (≥ 64 MiB). Unset derives it from the container's memory limit — it never means off. Refused at startup above half the limit (less fixed headroom). |
+| `MCP_BODY_MEMORY_FRACTION` / `MCP_BODY_MEMORY_MULTIPLIER` | `0.5` / `8` | The derivation: limit × fraction ÷ multiplier = raw body bytes in flight. Fraction 0.1–0.5, multiplier 8–32. |
+| `MCP_BODY_BUDGET_WAIT_SECONDS` / `MCP_BODY_BUDGET_WAITERS` | `15` / `8` | How long a body that does not fit waits before its 429, and how many may wait at once. |
+| `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** API key receives when the caller names none (an omitted JSON field or a blank panel field). Existing keys are untouched. Only an administrator can create or restore an unlimited key, with the panel's Unlimited box or an explicit JSON `null`. Null makes a limit required on create. |
+| `KEY_CREATION_ACCOUNT_LIMIT` | `10` | API keys one account may create per window, across `POST /api/keys` and the panel form together. Null disables. |
+| `KEY_CREATION_ADDRESS_LIMIT` | `20` | API keys created from one client address per window, across both routes and all accounts. Null disables. |
+| `KEY_CREATION_WINDOW_SECONDS` | `3600` | The fixed window both key-creation limits are counted over. |
+| `KEY_MAX_ACTIVE_PER_ACCOUNT` | `25` | Active API keys a non-admin account may hold; beyond it, creation is refused until a key is revoked. Admins exempt. Null disables. |
+| `MCP_REJECT_UNKNOWN_ARGUMENTS` | `true` | Refuse a tool call carrying an argument the tool does not declare (a tool error naming it), and publish `additionalProperties: false` on every input schema. `false` restores the SDK's silent ignore — a rollback for a client that sends extras; change it and recreate the container. `false` logs a WARNING at each start. |
 | `MCP_SANDBOX_MODE` | `false` | Registry-eval only. Skips DB, indexer, embedding provider, and `/mcp` auth so introspection works without external deps. Do not enable in production. |
 
 See `.env.example` for the full set with comments. For first-index
@@ -1248,6 +1357,16 @@ the defaults. It has to track the write caps so that every supported
 write is refused by the tool — with an actionable message — rather than
 by the transport with a bare HTTP 413. Raise `MAX_FILE_WRITE_BYTES` and
 the transport limit follows.
+
+That limit is per request. The **sum** of request bodies in flight is
+bounded too, always (#322): each `/mcp` POST reserves its declared size
+against a budget derived from the container's memory limit (half of it,
+÷ 8 for the parsing overhead — 128 MiB of raw body on a 2 GiB container),
+waits up to 15 s if it does not fit, and otherwise gets HTTP 429 with
+`code: body_memory` and `Retry-After: 2`. The server refuses to start in a
+container too small to admit one maximum-size body (about 1.1 GiB with the
+defaults). The `MCP_BODY_*` settings in `.env.example` only allow the safe
+direction.
 
 ### Switching providers or models
 
@@ -1544,11 +1663,15 @@ identical text in its declared error field. `retry_after_seconds` is
 present only where waiting can actually help — a refusal for an
 unassigned vault or an unencodable argument omits it rather than invite a
 loop that cannot end. The same shape covers the daily quota
-(`over_quota`) and the query length cap (`argument_too_long`).
+(`over_quota`), the query length cap (`argument_too_long`), and tool-body
+refusals such as `not_found`, `already_exists`, and `invalid_path`. A partial
+write also carries a typed outcome: read its explanation before retrying,
+because some bytes may already have changed. Empty search results and
+successful no-op calls remain successes.
 
-The two **transport** refusals are outside that contract, because there
-is no tool call to answer: an over-budget unauthenticated request gets an
-HTTP 429 with `Retry-After`, and so does an over-rate `PUT
+The **transport** refusals are outside that contract, because there
+is no tool call to answer: an over-budget unauthenticated request or an enforced MCP request/authentication
+concurrency refusal gets an HTTP 429 with `Retry-After`, and so does an over-rate `PUT
 /transfer/upload` — which **releases** its claim rather than consuming
 it, so the same link is still redeemable once the bucket refills.
 
@@ -1559,21 +1682,61 @@ it, so the same link is still redeemable once the bucket refills.
   `--workers 1`; raising the worker count multiplies every rate above by
   the worker count.
 - Refusals appear on `/admin/performance` as refusal counts, not in the
-  latency percentiles. Repeated rate refusals are **coalesced** — one row
+  latency percentiles. Repeated rate and enforced slot refusals are **coalesced** — one row
   per credential/tool/scope per `MCP_REFUSAL_LOG_INTERVAL_SECONDS`, each
   standing for `1 + suppressed` refusals — so that a refusal loop cannot
   make writing the log the load.
-- Every one of the defaults is a guess against a small sample. Read
+- The velocity defaults are estimates against a small sample. Read
   `/admin/performance` for a week before treating any as settled, and
   disable one by setting it empty, `null` or `none` (zero is refused at
   startup).
 - The daily quota is the durable ceiling and it is separate: keys created
-  from now on get `DEFAULT_DAILY_REQUEST_LIMIT` (5,000), keys that
-  already existed keep whatever they had, and OAuth grants have no daily
-  ceiling at all — velocity bounds only.
+  from now on get `DEFAULT_DAILY_REQUEST_LIMIT` (5,000) unless they name a
+  limit — a blank panel field gets the default too — and only an
+  administrator can make a key unlimited, explicitly. Keys that already
+  existed keep whatever they had, and OAuth grants have no daily ceiling at
+  all — velocity bounds only.
+- Every new key is a new principal with full bursts, so key creation has its
+  own budget: 10 keys per account and 20 per client address per hour, shared
+  by the JSON API and the panel form, and a non-admin account may hold at
+  most 25 active keys.
 
 The rationale lives in
 [`docs/architecture/rate-limits.md`](docs/architecture/rate-limits.md).
+
+### Concurrency admission
+
+Concurrency admission ships with `MCP_CONCURRENCY_MODE=shadow`. It records
+pressure under `concurrency_shadow` on existing usage rows and emits bounded
+security events for request/authentication pressure. Calls keep their actual
+outcome, quota accounting and duration. Shadow mode observes current occupancy
+with zero wait; it does not predict how traffic would behave under enforcement.
+
+In `enforce` mode, the server limits full MCP requests (including open SSE
+streams), authentication database sessions, tools, and usage-log writers.
+Tools pass velocity, vault and argument checks before acquiring slots; daily
+quota is checked afterward. A rejected tool receives `slot_timeout` without
+spending daily quota. Zero wait means immediate admission or refusal; a positive
+wait uses a bounded queue and one deadline. A retry hint is not a promise that
+a running call will finish by that time.
+
+The four tool classes each default to one concurrent call: `semantic_search`
+uses embedding, `find_related` uses vector, the eight vault-mutating tools use
+write, and the remaining tools use other. Global, tenant and principal ceilings
+default to 4, 3 and 2. OAuth refresh keeps the same principal. Full request and
+per-bearer ceilings default to 32 and 4, authentication to 2, and usage writers
+to 1. All settings and queue limits are listed in `.env.example`.
+
+Startup validates the pool budget as `auth + 2 × tools + writers + 4 ≤ 15`.
+The four connections of headroom are shared with panel, OAuth, indexing and
+transfer work; this arithmetic cannot guarantee availability when those other
+consumers exhaust it. Shadow mode does not enforce that budget. The controller
+is in-process and requires the existing single-worker deployment.
+
+Review pressure observations and long-lived stream occupancy before enabling
+`enforce`. Choose `off` to disable concurrency admission; the existing velocity
+limits and daily quotas still apply. Shadow requires a zero tool wait and never
+adds a writer wait or drops a usage row because of its observed pressure.
 
 ## Architecture
 
@@ -1648,8 +1811,10 @@ ignores mtime jitter. Stale embeddings are caught by the
 | `user_sessions` | One revocable row per live panel browser session, keyed on the SHA-256 of the cookie's session id. Cascades with the user. |
 
 GIN indexes on `content_tsvector` and `tags[]`. B-tree indexes on the
-hot foreign keys. pgvector HNSW index on the embedding column
-(`vector_cosine_ops`, `m=16, ef_construction=64`); queries set
+hot foreign keys. pgvector HNSW expression index
+`(embedding::halfvec(N)) halfvec_cosine_ops` (`m=16, ef_construction=64`),
+built when the dimension is ≤ 2000; results are re-ranked by the
+full-precision distance. Queries set
 `hnsw.ef_search=80` and dedupe per note in Python after a 5x overfetch.
 
 ## Project layout
@@ -1689,7 +1854,7 @@ mock httpx, so no real network access is required.
 To run the server outside Docker:
 
 ```bash
-DATABASE_URL=... SECRET_KEY=... VAULT_PATH=... uvicorn src.main:app --reload
+DATABASE_URL=... SECRET_KEY=... VAULT_PATH=... uvicorn src.main:app --reload --no-proxy-headers
 ```
 
 ## Make targets
@@ -1776,7 +1941,14 @@ backup, `alembic upgrade head`, then recreate the container. Run
   [Rate limits](#rate-limits).
 - Parameterized queries everywhere. No string interpolation into SQL.
 - Response headers include HSTS, `X-Content-Type-Options: nosniff`,
-  and `X-Frame-Options: DENY`.
+  `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. The panel,
+  login and consent pages add a per-response nonce
+  Content-Security-Policy with no inline script (`PANEL_CSP`).
+- The app's own hops are checked at startup: the database follows
+  `DATABASE_SSL_MODE`, and the embedding endpoint must be `https` or
+  loopback unless `EMBEDDING_ALLOW_PLAINTEXT` says otherwise. Each start
+  logs one transport line per hop and an `internal_transport_plaintext`
+  security event for each hop still in cleartext.
 
 ## Status
 

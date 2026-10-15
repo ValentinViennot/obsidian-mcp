@@ -27,12 +27,31 @@ told the operator "vault tools error".
   transition was the weaker fix: it forces a full re-embed on reassignment and
   leaves the credential itself unaddressed.
 - **`_vault_root` must stay a pure cache lookup.** What makes that correct is
-  `APIKeyMiddleware` calling `warm_user_vault_cache(session, user_id)` on
-  *every* authenticated MCP request. Do not add a DB query to the gate.
+  `APIKeyMiddleware` refreshing the user's row on *every* authenticated MCP
+  request (since #279 through the credential statement and
+  `apply_user_vault_row`, below). Do not add a DB query to the gate.
 - **The single-user form of that warm is authoritative — it evicts**, and it
   returns the root it read. It used to be a silent no-op for a NULL
   `vault_path`, so a previously cached root survived; the panel's
   `clear_user_vault_cache` only clears the worker that served the POST.
+- **The middleware's warm is folded into the credential read
+  (performance-2026-09 D3, #279).** The API-key lookup outer-joins `users` for
+  `is_active` and `vault_path`, and the OAuth token statement gains the same
+  join beside its `oauth_clients` join. The columns go through
+  `apply_user_vault_row(user_id, is_active, vault_path)` in `vault.py`, which
+  has exactly the single-user warm's write-or-evict rule, and the middleware
+  binds its return value to `current_vault_root` as before. `#66` still holds.
+  Its requirement is a *fresh read per request*, bound to the request so that
+  it outranks the process-global dict. The joined columns are read in the same
+  request, from the same snapshot as the credential, one statement earlier than
+  the separate warm used to run. No revocation contract distinguishes that. The
+  per-request binding and the bulk-warm-cannot-re-admit property are untouched.
+  A missing `users` row outer-joins to NULL and is refused as `inactive_user`
+  with the same body, exactly as `scalar_one_or_none() is not True` did, and an
+  inactive or absent user is now also evicted on that refusal. The API-key path
+  went from two transactions and three SELECTs to one SELECT; OAuth from three
+  statements to one. `warm_user_vault_cache` keeps its signature and its other
+  callers (the indexer's bulk warm, the panel).
 - **`_vault_root` prefers the request's own snapshot over the shared dict, and
   that is the part that fails closed.** `_user_vault_cache` is process-global
   and the indexer's bulk warm is add-only, so a bulk `SELECT` issued *before*
@@ -370,7 +389,7 @@ the survey and is seen by it.
 | # | Lock | Who takes it |
 | --- | --- | --- |
 | 1 | `ACCOUNT_GUARD_LOCK_KEY` | `users._lock_admin_guard` (admin handlers), `routes.change_password`, `session.start_session` (mint) — each **alone**; and `indexer.rebuild_tsvectors_all_scopes`, which then takes 2. |
-| 2 | `INDEX_GENERATION_LOCK_KEY` (via `acquire_generation_lock_unbounded` on the waiting paths) | `indexer._index_vault_pinned`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` — each **alone**; and `indexer._rebuild_all_scopes_locked`, reached only from 1's holder. |
+| 2 | `INDEX_GENERATION_LOCK_KEY` (via `acquire_generation_lock_unbounded` on the waiting paths) | `indexer._index_vault_attempt`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` — each **alone**; and `indexer._rebuild_all_scopes_locked`, reached only from 1's holder. |
 | 3 | row locks | inside each per-scope rebuild. |
 
 **One direction everywhere.** The maintenance rebuild is the only holder of the
@@ -604,9 +623,23 @@ snapshot does not name is indexed and served normally in the same pass.
 ### Accepted limitations
 
 Every residual is listed, so none is discovered later as a defect. **L1 and L2
-are the two with a destructive consequence**, and both go to the follow-up
-issue `vault-root-mount-graft-detection`; the owner decision on them is
-**pending**.
+are the two with a destructive consequence**, and both went to the follow-up
+issue `vault-root-mount-graft-detection` (#262). **The owner decision is taken
+(2026-09-21): both are accepted permanently, and detection is not funded.** A
+detector that misses a new mount topology in each of three review rounds is a
+heuristic, and a heuristic guarding a tenant boundary is worse than a stated
+rule, because it reads as a guarantee. The rule that replaces it is the
+operator's:
+
+> **Never mount one tenant's directory — or anything nested in it — at a path
+> inside another tenant's root, and never assign a root that cannot be opened
+> while a peer's root may alias it.** The host's mount table and the compose
+> file's `volumes:` are an admin-trust boundary; the server does not and will
+> not check them.
+
+Do not reopen this as a defect when it is re-reported; a change that revisits
+it starts from the attack-vector list in the archived
+`vault-root-overlap-guard` design (review history), not from a fresh parser.
 
 - **L1 — a bind mount that grafts a peer's vault, or any mount nested inside
   it, to a path *inside* another tenant's root is not detected.**
@@ -839,10 +872,17 @@ highest — and never toward discarding, which costs a full re-embed.
   `_is_lock_not_available` walks `.orig` *and* `__cause__` — the SQLSTATE lives
   on asyncpg's own error, two layers down, exactly as `_log_usage`'s FK
   recovery has to walk.
-- **A re-derive that skipped anything records nothing.** Any per-file skip —
-  including both link-extraction skips, the missing buffered body and the
-  missing index row — withholds the stamp, because the record's whole claim is
-  that every surviving row was written by that pass.
+- **A re-derive that skipped anything that could hide a row records
+  nothing.** A per-file skip on a path with a row in the locked rows, an
+  unlistable directory, a C5 deferral, and both link-extraction skips, the
+  missing buffered body and the missing index row (paths already selected for
+  upsert) withhold the stamp, because the record's whole claim is that every
+  surviving row was written by that pass. A read skip on a path with **no**
+  row cannot hide one and does not withhold (#308 D8) — before that, one
+  never-indexed unreadable file held the scope in re-derive, a full-scope
+  rewrite every tick. A present-but-not-indexable path (an undecodable file,
+  an unencodable or over-long name) is not a skip: its row is deleted in the
+  pass (#308 D7). See [indexing and embeddings](indexing-and-embeddings.md).
 - **`embed_vault` is deliberately ungated on provenance, because it verifies.**
   Gating it composed with the completeness rule into indefinite staleness: one
   permanently unreadable file withholds the record forever and would then
@@ -891,4 +931,37 @@ highest — and never toward discarding, which costs a full re-embed.
   before the next pass, so that is the same frozen answer in a new place, and
   it would give the move path a dependency on embedding configuration it has no
   other reason to know.
+- **The same two statements handle the recorded stat** (#282, migration 026).
+  `move_note` sets the four `stat_*` columns to NULL, so the next pass reads
+  and hashes the moved file rather than trusting a stat recorded for the old
+  path; the indexer's id-preserving move writes the stat of the bytes it just
+  hashed at the new path. See "The stat shortcut" in
+  [indexing and embeddings](indexing-and-embeddings.md).
 
+
+
+## Concurrency identities and authentication lifetimes (#261)
+
+The MCP concurrency controller keys tenant capacity by the authenticated user ID,
+not by bearer text, OAuth access-token ID, vault pathname or a caller argument.
+Single-user NULL-owner calls share one stable identity; OAuth principal capacity
+uses the existing grant ID. Refresh preserves that allowance. Before authentication
+there is no tenant reservation: a global request ceiling and transient hashed-bearer
+ceiling bound full request lifetimes, while a separate permit bounds DB auth work.
+GET/SSE holds request capacity through stream completion, not auth capacity.
+
+Authentication still checks key/token state, owner activity, cross-user grants,
+expiry and scope in the existing order. `_authenticate` returns a refusal response
+from inside its session; context-manager exit completes before `__call__` sends
+that response or invokes downstream tools. A slow client cannot occupy an auth
+connection or auth permit while receiving an error. All principal/vault ContextVars
+retain their existing final reset. Request leases release on response cancellation,
+downstream exceptions and disconnects. Registry sandbox bypass remains explicit.
+
+Keyed occupancy registries are bounded. When dedicated entries fill, new identities
+share a sticky overflow entry through active and pending ownership. Freeing a
+separate dedicated entry cannot split an overflow tenant's/principal's allowance;
+only a fully drained overflow epoch permits new dedicated assignments. This can
+be stricter under registry pressure; it cannot become a tenancy exemption. Shadow
+mode records this hypothetical admission pressure but preserves existing tool
+outcomes and performs no concurrency refusal or additional wait.

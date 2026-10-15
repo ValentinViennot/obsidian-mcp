@@ -119,6 +119,8 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
+from src.services.indexer_health import run_outcome
+
 # Mirrored from `src.mcp_server.tools`. Pinned by
 # `tests/test_issue_160_refusal_predicate.py`; see the module docstring for why
 # this is a mirror and not an import.
@@ -180,6 +182,7 @@ PRE_BODY_REFUSAL_ERROR_MARKERS: tuple[str, ...] = (
     VAULT_ROOT_NOT_READY_MARKER,
     RATE_LIMITED_MARKER,
     ARGUMENT_TOO_LONG_MARKER,
+    "slot_timeout",
 )
 
 #: The boolean `params` key the quota gate (#162) sets on a refusal.
@@ -535,6 +538,9 @@ async def recent_indexer_runs(
             "notes_indexed": r.notes_indexed,
             "notes_embedded": r.notes_embedded,
             "error": r.error,
+            # `ok` / `quarantined` / `failed`: a pass that quarantined notes
+            # succeeded but names them in `error` (#308, D5).
+            "outcome": run_outcome(r.error),
         }
         for r in rows
     ]

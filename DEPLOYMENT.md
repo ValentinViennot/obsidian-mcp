@@ -30,10 +30,42 @@ handle 3 and 4 separately. For 5, layer one override on top:
 
 The overrides add a front door and change nothing else; there is one
 definition of Postgres and one of the app, in the base file. (Earlier
-releases shipped three whole stacks — `docker-compose.simple.yml` and
-`docker-compose.proxy.yml` alongside the main file — which had drifted
+releases shipped three whole stacks, which each repeated the database and app — which had drifted
 apart from one another. They are gone; the base file plus an override
 covers every case they did.)
+
+On a Kubernetes cluster, use
+[`docs/deployment-kubernetes.md`](./docs/deployment-kubernetes.md) and the
+manifests in [`deploy/kubernetes/`](./deploy/kubernetes/) instead. The
+vault-sync, embedding and transport sections below still apply there.
+
+> **Upgrading an existing deployment?** A Compose install created before database role separation
+> runs its app as the database superuser and **must** follow
+> [Upgrading: split database roles](#upgrading-split-database-roles)
+> (one backup, one script); the new compose files do not start the app
+> on an unconverted volume. Any other deployment whose `DATABASE_URL`
+> names a superuser is refused at startup too (opt-out:
+> `DATABASE_ALLOW_SUPERUSER=true`). The Kubernetes bundle is unaffected.
+> Also read
+> [Internal transport](#internal-transport-the-database-and-embedding-hops)
+> and [Panel Content-Security-Policy](#panel-content-security-policy)
+> before you deploy. An `http://` embedding URL to a non-loopback host
+> (the `http://ollama:11434` default included) now refuses to start
+> unless `.env` has `EMBEDDING_ALLOW_PLAINTEXT=true`, and a TLS
+> parameter in `DATABASE_URL` or any `PGSSL*` variable is refused.
+>
+> **Minimum container memory (#322).** The `/mcp` body-memory budget is
+> derived from the app container's cgroup memory limit (half of it, ÷ 8,
+> as raw request bytes in flight), and the server **refuses to start**
+> when that cannot hold one maximum request body (61 MiB with the default
+> `MAX_FILE_WRITE_BYTES`). With the defaults the app container needs a
+> memory limit of at least **~1.1 GiB**; the shipped compose file and the
+> Kubernetes manifests set 2 GiB. A smaller container must lower
+> `MAX_FILE_WRITE_BYTES`. A container with no limit uses a 1 GiB budget
+> and logs a WARNING — give it a limit. Importing the settings (the
+> Kubernetes `alembic` init container, 1 GiB) is unaffected: only the web
+> application's startup checks. See `.env.example` and
+> [rate limits](docs/architecture/rate-limits.md).
 
 ## What you need before starting
 
@@ -90,8 +122,34 @@ Docker!"
 git clone https://github.com/maxkuminov/obsidian-mcp.git
 cd obsidian-mcp
 cp .env.example .env
-$EDITOR .env
+cp postgres.env.example postgres.env
+chmod 600 .env postgres.env
+$EDITOR .env postgres.env
 ```
+
+The bundled stacks use **two database identities and two files** (#324):
+
+| File | Variable | Who reads it | What it is |
+| --- | --- | --- | --- |
+| `.env` | `OBSIDIAN_DB_PASSWORD` | the app container and, for first-start init only, the postgres container | password of `obsidian_mcp`, a **non-superuser** role that owns the `obsidian_mcp` database. The compose file builds the app's `DATABASE_URL` from it. |
+| `postgres.env` | `POSTGRES_PASSWORD` | the postgres container only | password of `postgres`, the cluster **superuser**. The app never sees it: the compose file blanks `POSTGRES_PASSWORD` in the app container even if `.env` still has one. |
+
+Generate each with `openssl rand -hex 32`. Both must be at least 24
+characters, not a placeholder, and different from each other;
+`OBSIDIAN_DB_PASSWORD` may use only `A-Z a-z 0-9 . _ ~ -` because it is
+placed into a URL unencoded. The postgres container checks all of this
+**before** it initialises a volume and refuses to start otherwise, naming
+the variable and file (never the value). `docker compose config` already
+fails if `OBSIDIAN_DB_PASSWORD` is unset or `postgres.env` is missing.
+`make init` generates both files with random values.
+
+Do not set `DATABASE_URL` in `.env` for the bundles: `.env.example`
+leaves it commented out, and the compose file's own value would win
+anyway. It is for other deployments (an external or shared PostgreSQL,
+the `make init` / `make db-init` compose-host path, where `make init`
+uncomments it with the generated password). `make init` also creates
+`postgres.env` on every path; a deployment against an external
+PostgreSQL never reads it, and you can delete it there.
 
 Minimum values you need to set in `.env`:
 
@@ -99,8 +157,10 @@ Minimum values you need to set in `.env`:
 # Public hostname Caddy/Traefik will route to
 MCP_HOSTNAME=obsidian.example.com
 
-# Database. Match what docker-compose.yml will create.
-DATABASE_URL=postgresql+asyncpg://obsidian_mcp:CHANGE_ME@postgres:5432/obsidian_mcp
+# The application role's database password: openssl rand -hex 32
+# (The bundled compose files build DATABASE_URL from it; do not set
+# DATABASE_URL or POSTGRES_PASSWORD in .env for them.)
+OBSIDIAN_DB_PASSWORD=...
 
 # itsdangerous signer. Generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
 SECRET_KEY=...
@@ -115,10 +175,13 @@ EMBEDDING_DIMENSIONS=1024
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 ```
 
-Generate a strong DB password and set it as `POSTGRES_PASSWORD` in
-`.env` as well as inside `DATABASE_URL`. The compose file reads the
-first, the app reads the second, and nothing reconciles them for you —
-a mismatch is an authentication failure on every start.
+And in `postgres.env`:
+
+```env
+# The database superuser's password: openssl rand -hex 32 (different from
+# OBSIDIAN_DB_PASSWORD)
+POSTGRES_PASSWORD=...
+```
 
 Before starting Caddy, generate a password hash and replace the
 `$2a$14$REPLACE_WITH_BCRYPT_HASH` placeholder in `Caddyfile.example`:
@@ -162,6 +225,20 @@ must be writable by that id:
 ```bash
 sudo chown -R 1000:1000 /path/to/your/vault
 ```
+
+The first start does a database init: as the superuser `postgres` it
+creates the role `obsidian_mcp` (`NOSUPERUSER NOCREATEDB NOCREATEROLE
+NOREPLICATION NOBYPASSRLS`), the `obsidian_mcp` database owned by it,
+and the `vector` extension; then the app connects as `obsidian_mcp` and
+runs the alembic migrations, which need no superuser privilege. The
+server refuses to start if its database session is a superuser (see
+[Upgrading: split database roles](#upgrading-split-database-roles)).
+If that first init fails part-way (the postgres log says why), the
+postgres container refuses the half-initialised volume on its next
+start; the volume holds no data yet, so remove it
+(`docker compose -f docker-compose.yml down -v`, which also
+removes Caddy's certificate volumes, or `docker volume rm
+<project>_pg_data`) and start again. Watch the logs:
 
 …or, if it already belongs to some other account, tell the container to
 be that account instead — no rebuild needed:
@@ -246,6 +323,24 @@ WebSocket / streaming passthrough on `/mcp`. The file's header comment
 walks through both patterns and the exact headers your proxy must
 forward.
 
+**Which peers may set those headers is one setting: `TRUSTED_PROXY_IPS`.**
+The default trusts loopback and the three private (RFC 1918) ranges, which
+covers a loopback-published port and a shared Docker network without any
+configuration — and also trusts every *other* container on that network.
+Narrow it to your proxy's own address —
+`TRUSTED_PROXY_IPS=<your proxy's address>` — once the proxy has a fixed
+one. The value is a CSV or JSON list whose entries are each a single
+address or one CIDR network (`10.0.0.5`, `10.0.0.0/24`); read your
+proxy's address off your own deployment rather than copying an example,
+since a literal here that is not your proxy trusts the wrong peer. A
+proxy outside the default ranges must be listed or every request will
+appear to come from the proxy, and every per-address rate limit will be
+shared. The value is validated at boot, the canonical list is logged
+once at startup, and uvicorn's own `--forwarded-allow-ips` /
+`FORWARDED_ALLOW_IPS` is switched off in the image and in both reference
+compose files (`--no-proxy-headers`), so there is no second control to
+keep in step.
+
 If you plan to use the file-transfer tools (`request_upload`,
 `request_download`), the proxy must also forward **`/transfer/*`** —
 unauthenticated at the proxy, since the capability token is checked by
@@ -260,6 +355,152 @@ an APM capture request headers, or you will log live capabilities.
 > upstream private to the proxy (shared Docker network, or a
 > loopback/firewalled published port). Do not expose the MCP container
 > port publicly.
+
+### Plaintext HTTP is refused, not redirected, on machine-facing paths
+
+Both bundled reverse-proxy configurations answer a plaintext `http://`
+request for a machine-facing path with **403 and no `Location` header**,
+instead of redirecting it to HTTPS.
+
+This looks unhelpful and is deliberate. An MCP client configured with an
+`http://` server URL has already put its `Authorization: Bearer omcp_…`
+on the wire in cleartext by the time the proxy sees it. A redirect on a
+`POST` is a 307/308 that preserves the method and body, and MCP client
+stacks follow redirects with the `Authorization` header intact — httpx,
+which the MCP Python SDK uses, deliberately keeps it across a direct
+http→https hop. So the call succeeds over TLS and **every request keeps
+working**, which means nobody ever finds out that the credential was
+sent in the clear. The same applies to `POST /token`, which carries the
+authorization code, the `code_verifier` and the client secret in the
+body. A hard failure on the first request is the only outcome that
+reaches the operator.
+
+| Plaintext request | Answer |
+| --- | --- |
+| `/mcp*`, `/transfer*`, `/health`, `/.well-known*`, `/register`, `/token`, `/revoke` | 403, no `Location` |
+| `/` **with** an `Authorization: Bearer` header, any method | 403, no `Location` |
+| `/admin*`, `/api*`, `/authorize` | redirect to `https://` |
+| `/` with no `Authorization` header | redirect to `https://` |
+| `/.well-known/acme-challenge/*` | not refused — certificate issuance must work |
+
+The asymmetry is the control, not an oversight. A person who typed a
+hostname into a browser leaks nothing by being redirected; a machine
+holding a long-lived bearer token benefits from a failure. The root path
+is split by the *header* rather than by the path, because there the
+credential — not the URL — is what makes the request machine-facing.
+`/health` is on the refusing side: it is machine-facing and has no
+browser use, and the container's own healthcheck calls
+`http://localhost:8000/health` **inside** the container, bypassing the
+proxy entirely. If you point an external uptime monitor at this host,
+configure it with `https://`; the monitor is corrected, not the rule.
+
+**Traefik (`docker-compose.yml`).** The rule is a router on the `http`
+entrypoint with an explicit `priority=200`, carrying an `ipAllowList`
+middleware whose source range is `192.0.2.0/32`.
+
+That range is RFC 5737 TEST-NET-1 — reserved for documentation, never
+routable — so the allow-list matches nobody and `ipAllowList` refuses
+every request with its default 403, in the proxy, without contacting the
+application. **It is not a placeholder. Do not "fix" it to a real
+address**; giving it anything matchable reopens the leak. `ipAllowList`
+was chosen over the `errors` middleware because `errors` only fires on a
+status the backend already returned, so it forwards the request first
+and cannot refuse at all. The priority is written out rather than left
+to Traefik's default, which is derived from the length of the rule
+string — that would outrank the `http-catchall` redirect today, but a
+control resting on a string length is not a contract.
+
+**Caddy (`Caddyfile.example`).** An `http://{$MCP_HOSTNAME}` site block
+`respond`s 403 for the same set and `redir`s everything else. Note that
+defining it disables Caddy's automatic HTTP→HTTPS redirect for that
+host, which is why the block ends with an explicit `redir`.
+
+**Bring-your-own proxy (`docker-compose.yml`).** There is no proxy
+in that file for this repository to configure, so this is prose and
+nothing else: on your own proxy, add a plaintext (port 80) rule that
+returns 403 for the paths in the table above — including `/` when the
+request carries an `Authorization: Bearer` header, for every method —
+exempts `/.well-known/acme-challenge/`, and redirects the rest. If you
+skip it, a misconfigured client leaks its bearer token silently and the
+deployment still appears to work.
+
+**Rollback** is reverting the label block (or the Caddy site block) and
+redeploying. There is no migration, no database row and no cached state
+to unwind — plaintext requests simply go back to being redirected.
+
+### Internal transport: the database and embedding hops
+
+The app also opens two connections of its own: to PostgreSQL and to the
+embedding endpoint. Both are held to a transport policy at startup.
+
+**Upgrade note.** If the active embedding URL (`OLLAMA_URL`, or
+`OPENAI_BASE_URL` with the OpenAI provider) is `http://` to anything other
+than loopback — the `http://ollama:11434` default included — add this to
+`.env` **before** deploying, or the server refuses to start with a message
+naming it:
+
+```bash
+EMBEDDING_ALLOW_PLAINTEXT=true
+```
+
+It acknowledges that every chunk and search query crosses that hop
+unencrypted. Remove it once the endpoint is `https`. Also move any TLS
+parameter out of `DATABASE_URL` (`?ssl=…`, `?sslmode=…`) into
+`DATABASE_SSL_MODE`, and unset any `PGSSL*` variable: both are refused.
+Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_FILE` and `.netrc`.
+
+**Reading the startup lines.** Each start logs one line per hop:
+
+```text
+Database transport: mode=prefer encrypted=False tls_version=- server_verified=False
+Embedding transport: provider=ollama scheme=http host=ollama port=11434 verify=n/a plaintext_override=True
+```
+
+and one `internal_transport_plaintext` security event for each hop that is
+still cleartext (`reason` = `database` or `embedding`, `outcome` = the mode or
+`override`). A deployment with neither event is encrypted on both hops.
+
+**Going strict.**
+
+1. Create an internal CA (or reuse one) and mount its root certificate
+   read-only into the app container. Issue certificates whose SANs include
+   the names the app dials (the host in `DATABASE_URL`, the embedding host).
+2. **PostgreSQL:** install the server certificate and key, set `ssl = on` and
+   `ssl_min_protocol_version = 'TLSv1.2'`, and in `pg_hba.conf` put a
+   `hostssl` row for this database and role **above** a `hostnossl … reject`
+   row for the same pair; reload. Then set `DATABASE_SSL_MODE=verify-full`
+   and `DATABASE_SSL_CA_FILE=<mounted root>`, deploy, and confirm the line
+   reads `encrypted=True … server_verified=True`. Under a strict mode the app
+   refuses a Unix-socket `DATABASE_URL` and exits if the session is not
+   encrypted.
+3. **Embeddings:** put the endpoint behind TLS with a certificate from the
+   CA, then set its URL to `https://…`, set `EMBEDDING_CA_FILE=<mounted
+   root>`, and remove `EMBEDDING_ALLOW_PLAINTEXT`.
+
+If the database requires a client certificate, set
+`DATABASE_SSL_CERT_FILE` and `DATABASE_SSL_KEY_FILE` (PEM, mounted
+read-only). They apply to the strict modes only (`require`, `verify-ca`,
+`verify-full`), and must be set together or not at all; either one
+alone, or both with `disable`/`prefer`, refuses to start.
+
+### Panel Content-Security-Policy
+
+The admin panel, the login/register pages and the OAuth consent page
+send a per-response nonce Content-Security-Policy with no inline script.
+`PANEL_CSP` in `.env` selects it:
+
+| Value | Effect |
+| --- | --- |
+| `enforce` (default) | `Content-Security-Policy` header; violations are blocked |
+| `report-only` | the same policy as `Content-Security-Policy-Report-Only`: violations appear in the browser console, nothing is blocked |
+| `off` | neither header |
+
+`report-only` and `off` are rollback settings for a policy that breaks a
+panel control: edit `.env` and recreate the container (`docker compose
+-f <file> up -d`, or `make deploy`); no rebuild. Any value other than
+`enforce` is logged at WARNING on every start, so a forgotten rollback
+shows up. The `/transfer` pages keep their own policy under every value,
+and any other value refuses to start.
 
 ## Step 4. Get your vault onto the VPS
 
@@ -458,13 +699,16 @@ Verify:
 
 ```bash
 docker compose exec postgres \
-  psql -U obsidian_mcp -d obsidian_mcp -c '\dt'
+  psql -U postgres -d obsidian_mcp -c '\dt' -c '\du obsidian_mcp'
 ```
 
 You should see the tables: `api_keys`, `notes_metadata`,
 `note_embeddings`, `note_links`, `oauth_clients`,
 `oauth_codes`, `oauth_tokens`, `transfer_tokens`, `usage_logs`,
-`users`, plus `alembic_version`.
+`users`, plus `alembic_version`, all owned by `obsidian_mcp`, and
+`obsidian_mcp` listed with no attributes beyond login (in particular,
+not `Superuser`). `exec postgres psql` connects over the container's
+local socket, which the image trusts, so it needs no password.
 
 After Step 4 the indexer will pick up your vault on the next pass
 (every 5 min). To trigger immediately, click "Reindex Now" in the
@@ -555,7 +799,18 @@ is pennies a month.
   files` shows in the logs. Check that your `VAULT_HOST_PATH` on the
   host actually contains `.md` files and that the bind mount is
   reading from the right place (`docker compose exec obsidian-mcp ls
-  /obsidian` should show your notes).
+  /obsidian` should show your notes). If the index already holds notes,
+  the pass refuses to delete them: it fails with "vault root is empty
+  but the index holds N note(s); nothing was deleted", the run is
+  recorded as failed and `/health` turns `degraded` after three such
+  passes. Fix the mount and the next pass carries on. If you emptied the
+  vault on purpose, confirm it in the panel (Settings → Danger zone, or
+  the user's page in multi-user mode); that lets the next pass prune
+  once. A vault root that cannot be listed at all, or a subfolder the
+  server cannot read, likewise deletes nothing: the subfolder's notes
+  keep their index rows and the run record names the folder. A mount
+  that is wrong but *not* empty (a different, smaller directory) is not
+  detected, and its pass prunes whatever is missing from it.
 - Nextcloud not seeing agent writes. The OS-level write happens
   immediately, but Nextcloud only knows about it on its next scan.
   Either configure the Nextcloud cron, or run `php occ files:scan
@@ -628,8 +883,21 @@ deployment; on a compose-file deployment the equivalents are plain
 - **Health.** `curl -s https://your-hostname/health` returns `status`
   plus `transfer_mount_check_available` and
   `vault_named_staging_fallback_active` — the two capability facts that
-  are otherwise only visible in the startup log.
-- **Upgrades.** Pull, rebuild, and bring the stack up again; migrations
+  are otherwise only visible in the startup log — and an `indexer`
+  object. `status` is `"degraded"` when the indexer task has died, a
+  counter (a scope's consecutive failed index or embed passes, its
+  incomplete re-derives, or the tick's user enumeration) has reached
+  `INDEXER_DEGRADED_AFTER_FAILURES` (default 3), or a note is
+  quarantined. **The HTTP code is 200 either way**, deliberately: the
+  Kubernetes manifests use `/health` as the liveness probe, and a
+  restart loop cannot fix vault content or a provider outage. So point
+  your uptime monitor at the **`status` field** — a keyword check for
+  `"status":"ok"` or a JSON-path check — not at the status code, or a
+  failing indexer stays invisible (#308: 8.5 days of failed passes
+  under a `200 ok`). The body carries counts only; the offending path
+  is in the log and on `/admin/health`.
+- **Upgrades.** Check the upgrade note at the top of this guide first,
+  then pull, rebuild, and bring the stack up again; migrations
   run on start. After a release that carries one, confirm the schema
   agrees with the models:
   `docker compose exec obsidian-mcp alembic check`
@@ -671,11 +939,172 @@ deployment; on a compose-file deployment the equivalents are plain
   CVE scan) work from a checkout regardless of which compose file runs
   the container.
 
+## Upgrading: split database roles
+
+**Who needs this:** a deployment from `docker-compose.yml` or
+`docker-compose.yml` whose database volume was created before
+#324. Those bundles created the database with `POSTGRES_USER=obsidian_mcp`,
+which the PostgreSQL image makes the **cluster superuser**, and the app
+connected as it. A compromised app could then read every database,
+run shell commands in the postgres container (`COPY … PROGRAM`) and
+change roles. Fresh installs now get a separate superuser `postgres` and
+a non-superuser `obsidian_mcp` that owns only its database; this
+procedure converts an existing volume to exactly that shape, keeping
+all data. It is manual and one-time: nothing converts a cluster
+automatically.
+
+**Who does not:** the Kubernetes bundle (`deploy/kubernetes/`) already
+has this shape, and a deployment pointed at an external PostgreSQL where
+`make db-init` created the role is not a superuser either. If the
+server refuses to start with "is a PostgreSQL superuser" on such a
+deployment, the role in `DATABASE_URL` really is one: switch it to a
+non-superuser owner of the database (or, as a stop-gap, set
+`DATABASE_ALLOW_SUPERUSER=true`).
+
+### What happens if you skip it
+
+The new compose files will not serve on an unconverted volume:
+
+- With a **new** `OBSIDIAN_DB_PASSWORD` (the expected case), the
+  migrations fail to authenticate and the app container logs
+  `database authentication failed for role obsidian_mcp; a Compose install
+  created before #324 must run docker/upgrade-split-db-roles.sql. See
+  DEPLOYMENT.md 'Upgrading: split database roles'`, then restarts.
+- With `OBSIDIAN_DB_PASSWORD` set to the **old** password, the app
+  connects as the still-superuser role and refuses to start with
+  `Database role obsidian_mcp is a PostgreSQL superuser. Refusing to
+  start …`.
+
+The postgres container itself starts normally on the old volume (once
+both new passwords are configured), which is what lets you run the
+script.
+
+### Steps
+
+Run every step from the repository checkout that holds your bundle, with
+`docker-compose.yml` replaced by `docker-compose.yml` if that
+is your bundle.
+
+1. **Stop the app first,** with the compose file you are running today, so
+   nothing is connected as the old superuser while you work:
+
+   ```bash
+   docker compose -f docker-compose.yml stop obsidian-mcp
+   ```
+
+2. **Back up.** Nothing below deletes data, and the conversion is one
+   transaction that rolls back entirely if its self-check fails, but take
+   a dump first:
+
+   ```bash
+   docker compose -f docker-compose.yml exec -T postgres \
+     pg_dump -U obsidian_mcp obsidian_mcp | gzip > obsidian_mcp-pre-324.sql.gz
+   ```
+
+3. **Pull** the new version of the repository.
+4. **Create `postgres.env`** from `postgres.env.example` (`chmod 600`)
+   with a new `POSTGRES_PASSWORD` (`openssl rand -hex 32`). This becomes
+   the superuser's password.
+5. **Edit `.env`:** add `OBSIDIAN_DB_PASSWORD` with a **new** value
+   (`openssl rand -hex 32`, different from the superuser's). Do not reuse
+   the old password: it was the superuser's, and nothing checks that you
+   changed it. Remove `POSTGRES_PASSWORD` and `DATABASE_URL` from `.env`;
+   the compose file now builds `DATABASE_URL` itself and blanks
+   `POSTGRES_PASSWORD` in the app container, but neither belongs there.
+6. **Start the database only,** so it is recreated with the new
+   entrypoint and `postgres.env` (the app stays stopped):
+
+   ```bash
+   docker compose -f docker-compose.yml up -d postgres
+   ```
+
+7. **Run the conversion script.** It takes both passwords from the
+   postgres container's own environment, so they never appear on the host
+   command line, and connects over the container's local socket:
+
+   ```bash
+   docker compose -f docker-compose.yml exec -T postgres sh -c \
+     'psql -X -v ON_ERROR_STOP=1 -U obsidian_mcp -d obsidian_mcp \
+           -v admin_pw="$POSTGRES_PASSWORD" -v app_pw="$OBSIDIAN_DB_PASSWORD"' \
+     < docker/upgrade-split-db-roles.sql
+   ```
+
+   It renames the bootstrap superuser to `postgres` (with the
+   `postgres.env` password), creates `obsidian_mcp` as a non-superuser
+   (with the `.env` password), and gives it ownership of the database,
+   every table, sequence, view, function, type and schema in it, and any
+   default privileges the old role had set. The `vector` extension stays
+   with `postgres`, as on a fresh install. After the commit it terminates
+   every session still connected under the old superuser identity (a
+   session that logged in as the old `obsidian_mcp` would otherwise keep
+   superuser rights under the new name) and fails if any is left. It
+   prints `upgrade-split-db-roles: done …` on success.
+
+   Running it again checks the cluster against the fresh-install shape:
+   if everything matches it prints `already split` and changes nothing
+   (it also removes a temporary role an interrupted earlier run may have
+   left behind); if the cluster is only partly split (the database still
+   owned by `postgres`, `obsidian_mcp` with extra attributes such as
+   `CREATEDB`, objects or default privileges still owned by the
+   superuser) it exits non-zero with `… is not in the fresh-install
+   shape: …` and lists each problem, for you to fix by hand as `postgres`.
+
+8. **Restart the database** before the app connects, so no session from
+   before the conversion survives in any form:
+
+   ```bash
+   docker compose -f docker-compose.yml restart postgres
+   ```
+
+9. **Start everything:**
+
+   ```bash
+   docker compose -f docker-compose.yml up -d
+   ```
+
+The script relies on the image's default `trust` for local-socket
+connections; if you hardened `pg_hba.conf`, run the same `psql` with
+explicit credentials for the existing superuser. It turns statement and
+error-statement logging off for its own sessions, so a failing step does
+not write a password into the postgres container's log. A logging
+extension you added yourself (such as `pgaudit`) is outside that switch
+and may still record the `ALTER ROLE … PASSWORD` statements.
+
+**If the script fails,** it prints why and its transaction rolls back:
+the cluster is as it was, apart from a temporary role that the next run
+removes. A missing password reads `admin_pw is not set` / `app_pw is
+empty`; a cluster that is neither the old nor the new shape is refused
+with a description of what it found. The one failure that comes after
+the commit is `… session(s) of the old superuser identity are still
+connected`: the conversion is done, and step 8's restart clears them.
+
+**Rollback.** The script changes roles, not data, and the previous
+release works with either shape of cluster:
+
+- **After converting:** check out the release you ran before (its
+  compose files build the image from the checkout), restore its `.env`
+  without `POSTGRES_PASSWORD`, and set `DATABASE_URL` in it to
+  `postgresql+asyncpg://obsidian_mcp:<OBSIDIAN_DB_PASSWORD>@postgres:5432/obsidian_mcp`
+  (the new runtime password). Then `docker compose -f <bundle> up -d
+  --build`. The app runs as the non-superuser; nothing else changes.
+- **Without converting** (to keep running on the old superuser for a
+  while): check out the release you ran before and its `.env`
+  unchanged, and `up -d --build`. Nothing on the volume has changed.
+  Keeping the **new** files on an unconverted volume instead
+  (`DATABASE_ALLOW_SUPERUSER=true` and `OBSIDIAN_DB_PASSWORD` set to the
+  old password) works only when the old password passes the postgres
+  container's checks: at least 24 characters, only `A-Z a-z 0-9 . _ ~
+  -`, not a placeholder, and different from `POSTGRES_PASSWORD`. An
+  install on the old `changeme` default or any short password cannot do
+  this; use the previous release.
+
 ## What's not covered
 
 - High availability. Single VPS, single Postgres, no replica. If you
-  want redundancy, add managed Postgres and front the MCP container
-  with a load balancer. Out of scope here.
+  want redundancy, add managed Postgres. The MCP server itself runs as
+  exactly one process (its rate limits are in-process), so a load balancer
+  over several replicas is not an option. This holds on Kubernetes too (see
+  [deployment-kubernetes.md](./docs/deployment-kubernetes.md#constraints-the-manifests-encode)).
 - Vault encryption at rest. Files on the VPS disk are plain text
   unless you set up an encrypted filesystem. If you need that, look at
   LUKS for the data volume.

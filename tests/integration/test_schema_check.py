@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "026"
+HEAD_REVISION = "036"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -5116,6 +5116,1539 @@ def test_downgrade_024_refuses_a_table_it_did_not_create():
         assert alembic_version(url) == HEAD_REVISION
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 025 — oauth_clients.last_used_at, the expiry sweep's marker (#194)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `alembic check` sees the column, its type and its nullability, so the
+# declarative half is covered on every path that asserts a clean check. What
+# it cannot see is the **backfill**, and the backfill is the whole safety
+# argument: after 025 a NULL marker must mean "registered after 025 and never
+# used" and nothing else, because the maintenance sweep deletes a registration
+# — cascading its codes and tokens — on the strength of that NULL. A row this
+# migration left unmarked is a hand-configured confidential client the sweep
+# would collect, and dynamic registration does not re-provision one.
+
+LAST_USED_COLUMN = "last_used_at"
+LAST_USED_MARKER = (
+    "client use marker, stamped at code and token issuance "
+    "(025_oauth_client_last_used)"
+)
+LAST_USED_TYPE = "timestamp with time zone"
+
+
+def last_used_state(url):
+    """`(coltype, attnotnull, default, comment)` for the column, or None."""
+    rows = fetch(
+        url,
+        "SELECT format_type(a.atttypid, a.atttypmod) AS coltype, a.attnotnull, "
+        "       pg_get_expr(d.adbin, d.adrelid) AS coldefault, "
+        "       col_description(a.attrelid, a.attnum) AS comment "
+        "FROM pg_attribute a "
+        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        "WHERE a.attrelid = 'public.oauth_clients'::regclass "
+        "  AND a.attname = 'last_used_at' AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    return tuple(rows[0]) if rows else None
+
+
+def last_used_of(url, client_id):
+    return fetchval(
+        url,
+        "SELECT last_used_at FROM oauth_clients WHERE client_id = $1",
+        client_id,
+    )
+
+
+def insert_code(url, code_hash, client_id, *, created_at=None, used=False):
+    """One `oauth_codes` row. `created_at` is written explicitly where a case
+    needs the backfill to pick a *known* value out of several."""
+    sql(
+        url,
+        "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, scope, "
+        " code_challenge, code_challenge_method, expires_at, used, created_at) "
+        "VALUES ($1, $2, 'https://example.invalid/cb', 'read', $3, 'S256', $4, "
+        "        $5, COALESCE($6, now()))",
+        code_hash,
+        client_id,
+        "c" * 43,
+        FUTURE,
+        used,
+        created_at,
+    )
+
+
+def insert_client_token(url, token_hash, client_id, *, created_at=None):
+    """One `oauth_tokens` row, seeded on a post-014 schema.
+
+    Not the 014-era `insert_token` above: that helper predates `grant_id` being
+    NOT NULL and these cases run against a database migrated to 024, where the
+    column is. `created_at` is written explicitly where a case needs the
+    backfill to pick a *known* value out of several.
+    """
+    sql(
+        url,
+        "INSERT INTO oauth_tokens (token_hash, token_type, client_id, scope, "
+        " grant_id, user_id, expires_at, revoked, created_at) "
+        "VALUES ($1, 'access', $2, 'read', $3, NULL, $4, false, "
+        "        COALESCE($5, now()))",
+        token_hash,
+        client_id,
+        token_hash[:32],
+        FUTURE,
+        created_at,
+    )
+
+
+def refuse_025(url, *, must_mention):
+    """Stamp back to 024, re-run 025, require a refusal, return the message.
+
+    Stamping back is what makes this adversarial rather than theatrical: it is
+    the same path `make test-schema` exercises for idempotence, so a shape
+    waved through here would be waved through on a real database somebody had
+    altered.
+    """
+    _harness.run_alembic(url, "stamp", "024", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "025 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "024", "nothing should have been recorded"
+    return combined
+
+
+def test_025_creates_a_nullable_marked_column_with_no_default():
+    """The three properties the sweep's correctness rests on, asserted
+    separately because each fails differently: NOT NULL means no row can ever
+    say "never used" (the sweep collects nothing, silently and for ever), and
+    a server default means every fresh registration is born with a use it has
+    not had (same outcome, opposite cause)."""
+    with throwaway_db("schema_last_used_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+
+        coltype, notnull, default, comment = last_used_state(url)
+        assert coltype == LAST_USED_TYPE
+        assert notnull is False
+        assert default is None
+        assert comment == LAST_USED_MARKER
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_025_chains_from_024_and_026_from_025():
+    """The ordering the `schema-integrity` delta names, asserted rather than
+    assumed: 025 must not migrate ahead of 024, whose own predecessor is 023,
+    and 026 then 027 (performance-2026-09) chain from 025. The head is the
+    module's single literal, raised by every new revision.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+
+    assert script.get_current_head() == HEAD_REVISION
+    assert script.get_revision("033").down_revision == "032"
+    assert script.get_revision("032").down_revision == "031"
+    assert script.get_revision("031").down_revision == "026"
+    assert script.get_revision("024").down_revision == "023"
+
+    ordered = [rev.revision for rev in script.walk_revisions("base", HEAD_REVISION)]
+    # `walk_revisions` yields newest-first, so an earlier revision appears
+    # *later* in the list.
+    assert ordered.index("032") > ordered.index("033")
+    assert ordered.index("031") > ordered.index("032")
+    assert ordered.index("024") > ordered.index("031")
+    assert ordered.index("023") > ordered.index("024")
+
+
+def test_025_marks_a_client_from_its_newest_token():
+    with throwaway_db("schema_last_used_from_token", revision="024") as url:
+        insert_client(url, "client-tok", "none", None)
+        older = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+        newer = datetime.datetime(2021, 6, 1, tzinfo=datetime.timezone.utc)
+        insert_client_token(url, "a" * 64, "client-tok", created_at=older)
+        insert_client_token(url, "b" * 64, "client-tok", created_at=newer)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert last_used_of(url, "client-tok") == newer
+
+
+def test_025_marks_a_client_from_its_newest_code_when_it_has_no_token():
+    with throwaway_db("schema_last_used_from_code", revision="024") as url:
+        insert_client(url, "client-code", "none", None)
+        older = datetime.datetime(2020, 3, 3, tzinfo=datetime.timezone.utc)
+        newer = datetime.datetime(2020, 9, 9, tzinfo=datetime.timezone.utc)
+        insert_code(url, "c" * 64, "client-code", created_at=older)
+        insert_code(url, "d" * 64, "client-code", created_at=newer)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert last_used_of(url, "client-code") == newer
+
+
+def test_025_takes_the_newest_of_both_kinds():
+    """`GREATEST` over both subqueries, not "tokens, else codes": a client
+    whose newest evidence is a code must not be aged backwards to its oldest
+    token."""
+    with throwaway_db("schema_last_used_both", revision="024") as url:
+        insert_client(url, "client-both", "none", None)
+        old_token = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+        new_code = datetime.datetime(2022, 1, 1, tzinfo=datetime.timezone.utc)
+        insert_client_token(url, "e" * 64, "client-both", created_at=old_token)
+        insert_code(url, "f" * 64, "client-both", created_at=new_code)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert last_used_of(url, "client-both") == new_code
+
+
+def test_025_stamps_a_client_with_no_child_row_rather_than_leaving_it_null():
+    """The correction the spec review forced, and the invariant the whole
+    sweep rests on. Leaving this row NULL would expose a confidential client
+    whose credentials a developer configured by hand and whose token rows have
+    long since been purged — the sweep would delete its registration *and its
+    secret hash*, and registering again mints a different identifier and
+    secret the configured client does not have."""
+    before = datetime.datetime.now(datetime.timezone.utc)
+    with throwaway_db("schema_last_used_orphan", revision="024") as url:
+        insert_client(url, "client-bare", "none", None)
+        assert fetchval(url, "SELECT count(*) FROM oauth_tokens") == 0
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        stamped = last_used_of(url, "client-bare")
+        assert stamped is not None, (
+            "a pre-existing row with no surviving child row must be stamped "
+            "with the migration's own timestamp, never left NULL"
+        )
+        assert stamped >= before
+        assert stamped <= datetime.datetime.now(datetime.timezone.utc)
+
+
+def test_025_leaves_no_pre_existing_row_unmarked():
+    """The invariant stated directly: *no* row that existed before 025 may
+    come out NULL, whatever mixture of evidence it carries."""
+    with throwaway_db("schema_last_used_no_nulls", revision="024") as url:
+        insert_client(url, "client-1", "none", None)
+        insert_client(url, "client-2", "client_secret_post", "h" * 64)
+        insert_client(url, "client-3", "none", None)
+        insert_client_token(url, "1" * 64, "client-1")
+        insert_code(url, "2" * 64, "client-2")
+        # client-3 carries neither.
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert (
+            fetchval(
+                url, "SELECT count(*) FROM oauth_clients WHERE last_used_at IS NULL"
+            )
+            == 0
+        )
+
+
+def test_rerunning_025_does_not_re_stamp_an_existing_marker():
+    """Stamp-back idempotence, the shape the gate itself performs. The
+    application stamps this column on every issuance, so a re-run that
+    recomputed every marker would age a *live* client backwards towards the
+    sweep's cutoff — 016's reassignment-lag mistake in a new column."""
+    recorded = datetime.datetime(2030, 5, 5, tzinfo=datetime.timezone.utc)
+    with throwaway_db("schema_last_used_rerun", revision="024") as url:
+        insert_client(url, "client-live", "none", None)
+        insert_client(url, "client-bare", "none", None)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        # What the application would have written since the migration ran.
+        sql(
+            url,
+            "UPDATE oauth_clients SET last_used_at = $1 WHERE client_id = $2",
+            recorded,
+            "client-live",
+        )
+        bare_stamp = last_used_of(url, "client-bare")
+
+        _harness.run_alembic(url, "stamp", "024", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert last_used_of(url, "client-live") == recorded
+        assert last_used_of(url, "client-bare") == bare_stamp
+        assert last_used_state(url)[3] == LAST_USED_MARKER
+        assert fetchval(url, "SELECT count(*) FROM oauth_clients") == 2
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "wrong_type",
+            "ALTER TABLE oauth_clients ADD COLUMN last_used_at timestamp",
+            "not timestamp with time zone",
+        ),
+        (
+            "not_null",
+            "ALTER TABLE oauth_clients ADD COLUMN last_used_at timestamptz "
+            "NOT NULL DEFAULT now()",
+            "it is NOT NULL",
+        ),
+        (
+            "server_default",
+            "ALTER TABLE oauth_clients ADD COLUMN last_used_at timestamptz "
+            "DEFAULT now()",
+            "server default",
+        ),
+    ],
+)
+def test_025_refuses_a_pre_existing_column_of_another_shape(label, ddl, fragment):
+    """013's rule: reconcile a database that demonstrably has our shape, refuse
+    to guess for one that does not, and name what disagreed. Each of these
+    passes `alembic check`'s type comparison or slips past it entirely while
+    disabling the sweep — a NOT NULL column has no way to say "never used"."""
+    with throwaway_db(f"schema_last_used_foreign_{label}", revision="024") as url:
+        sql(url, ddl)
+        refuse_025(url, must_mention=[fragment])
+
+
+def test_025_refuses_an_unmarked_column_of_its_own_shape():
+    """The marker is the only evidence of authorship, so a column of exactly
+    the right shape that 025 did not create is still refused — `downgrade()`
+    would otherwise drop somebody else's column."""
+    with throwaway_db("schema_last_used_unmarked", revision="024") as url:
+        sql(url, "ALTER TABLE oauth_clients ADD COLUMN last_used_at timestamptz")
+        refuse_025(url, must_mention=["025's comment marker"])
+
+
+def test_a_025_refusal_changes_no_row():
+    """The refusal is atomic: an operator who hits it still has every
+    registration, and no marker was invented for any of them."""
+    with throwaway_db("schema_last_used_refusal_rows", revision="024") as url:
+        insert_client(url, "client-keep", "none", None)
+        sql(
+            url,
+            "ALTER TABLE oauth_clients ADD COLUMN last_used_at timestamptz NOT NULL "
+            "DEFAULT now()",
+        )
+        refuse_025(url, must_mention=["it is NOT NULL"])
+        assert fetchval(url, "SELECT count(*) FROM oauth_clients") == 1
+
+
+def test_025_accepts_its_own_column_on_a_stamp_back():
+    """Complete does not mean brittle: a column 025 itself created must still
+    reconcile, or every re-run of the migration would refuse."""
+    with throwaway_db("schema_last_used_reconcile_clean") as url:
+        insert_client(url, "client-a", "none", None)
+        _harness.run_alembic(url, "stamp", "024", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert last_used_state(url)[3] == LAST_USED_MARKER
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_025_drops_the_marked_column_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_last_used_downgrade") as url:
+        insert_client(url, "client-a", "none", None)
+        insert_client_token(url, "a" * 64, "client-a")
+
+        _harness.run_alembic(url, "downgrade", "024", dimensions=DIM)
+        assert alembic_version(url) == "024"
+        assert last_used_state(url) is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert last_used_state(url)[3] == LAST_USED_MARKER
+        # A re-upgrade re-derives the marker from the surviving child row, so
+        # a client that is in use comes back marked rather than collectable.
+        assert last_used_of(url, "client-a") is not None
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_025_refuses_a_column_it_did_not_create():
+    """013's rule on the way back down: undo *this* migration, not delete
+    somebody else's column of the same name."""
+    with throwaway_db("schema_last_used_downgrade_foreign") as url:
+        sql(
+            url,
+            "COMMENT ON COLUMN oauth_clients.last_used_at IS 'somebody else made this'",
+        )
+        result = _harness.run_alembic(
+            url, "downgrade", "024", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "025's comment marker" in result.stdout + result.stderr
+        assert last_used_state(url) is not None
+        assert alembic_version(url) == HEAD_REVISION
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 026 — notes_metadata.stat_*, the scan's stat shortcut (#282)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `alembic check` sees the four columns, their type, nullability and comment.
+# It cannot see the all-or-none CHECK (autogenerate does not compare CHECK
+# predicates), and that CHECK is what keeps a half-recorded tuple — neither a
+# stat nor its absence — out of the table the shortcut trusts. So the CHECK is
+# asserted through `pg_constraint` by definition, and enforced by an insert.
+
+STAT_COLUMNS = ("stat_size", "stat_mtime_ns", "stat_ctime_ns", "stat_ino")
+STAT_MARKER = (
+    "stat of the bytes content_hash was computed from (026_note_stat_columns)"
+)
+STAT_CHECK_MARKER = "all-or-none stat tuple (026_note_stat_columns)"
+STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
+# What PostgreSQL 16 prints for 026's predicate. The migration measures the
+# same string off a scratch table at runtime; this pin tells us if either
+# side moves.
+CANONICAL_STAT_CHECK = (
+    "CHECK ((((stat_size IS NULL) AND (stat_mtime_ns IS NULL) AND "
+    "(stat_ctime_ns IS NULL) AND (stat_ino IS NULL)) OR "
+    "((stat_size IS NOT NULL) AND (stat_mtime_ns IS NOT NULL) AND "
+    "(stat_ctime_ns IS NOT NULL) AND (stat_ino IS NOT NULL))))"
+)
+
+
+def stat_column_state(url, column):
+    """`(coltype, attnotnull, default, comment)` for the column, or None."""
+    rows = fetch(
+        url,
+        "SELECT format_type(a.atttypid, a.atttypmod) AS coltype, a.attnotnull, "
+        "       pg_get_expr(d.adbin, d.adrelid) AS coldefault, "
+        "       col_description(a.attrelid, a.attnum) AS comment "
+        "FROM pg_attribute a "
+        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        "WHERE a.attrelid = 'public.notes_metadata'::regclass "
+        "  AND a.attname = $1 AND a.attnum > 0 AND NOT a.attisdropped",
+        column,
+    )
+    return tuple(rows[0]) if rows else None
+
+
+def stat_checks(url):
+    """Every CHECK on notes_metadata whose definition is 026's predicate —
+    resolved by definition, never by name."""
+    rows = fetch(
+        url,
+        "SELECT conname, convalidated, pg_get_constraintdef(oid) AS def, "
+        "       obj_description(oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint "
+        "WHERE conrelid = 'public.notes_metadata'::regclass AND contype = 'c'",
+    )
+    return [
+        (r["conname"], r["convalidated"], r["comment"])
+        for r in rows
+        if " ".join(r["def"].split()) == CANONICAL_STAT_CHECK
+    ]
+
+
+def insert_stat_note(url, note_id, path, stat):
+    sql(
+        url,
+        "INSERT INTO notes_metadata (id, user_id, file_path, title, content_hash, "
+        " stat_size, stat_mtime_ns, stat_ctime_ns, stat_ino) "
+        "VALUES ($1, NULL, $2, 't', 'h', $3, $4, $5, $6)",
+        note_id,
+        path,
+        *stat,
+    )
+
+
+def refuse_026(url, *, must_mention):
+    """Stamp back to 025, re-run 026, require a refusal naming the problem."""
+    _harness.run_alembic(url, "stamp", "031", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "026 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "031", "nothing should have been recorded"
+    return combined
+
+
+def test_026_adds_four_nullable_marked_bigints_and_the_check():
+    with throwaway_db("schema_stat_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        for column in STAT_COLUMNS:
+            coltype, notnull, default, comment = stat_column_state(url, column)
+            assert coltype == "bigint", column
+            assert notnull is False, column
+            assert default is None, column
+            assert comment == STAT_MARKER, column
+
+        checks = stat_checks(url)
+        assert checks == [(STAT_CHECK_NAME, True, STAT_CHECK_MARKER)], checks
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_026_chains_from_025_and_applies_it_first():
+    with throwaway_db("schema_stat_chain", revision="031") as url:
+        assert alembic_version(url) == "031"
+        assert stat_column_state(url, "stat_size") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert stat_column_state(url, "stat_size") is not None
+
+
+def test_026_leaves_every_existing_row_null_and_backfills_nothing():
+    with throwaway_db("schema_stat_no_backfill", revision="031") as url:
+        sql(
+            url,
+            "INSERT INTO notes_metadata (id, user_id, file_path, title, "
+            " content_hash) VALUES (1, NULL, 'A.md', 'A', 'ha'), "
+            " (2, NULL, 'B.md', 'B', 'hb')",
+        )
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM notes_metadata WHERE stat_size IS NULL "
+            "AND stat_mtime_ns IS NULL AND stat_ctime_ns IS NULL "
+            "AND stat_ino IS NULL",
+        ) == 2
+
+
+def test_026_check_refuses_a_half_recorded_stat():
+    with throwaway_db("schema_stat_enforced") as url:
+        insert_stat_note(url, 1, "Full.md", (10, 1, 2, -5))
+        insert_stat_note(url, 2, "None.md", (None, None, None, None))
+        with pytest.raises(asyncpg.CheckViolationError):
+            insert_stat_note(url, 3, "Half.md", (10, 1, None, None))
+        with pytest.raises(asyncpg.CheckViolationError):
+            insert_stat_note(url, 4, "OnlyIno.md", (None, None, None, 7))
+        assert fetchval(url, "SELECT count(*) FROM notes_metadata") == 2
+
+
+def test_026_accepts_its_own_shape_on_a_stamp_back_and_keeps_rows():
+    with throwaway_db("schema_stat_rerun") as url:
+        insert_stat_note(url, 1, "A.md", (10, 111, 222, 333))
+        _harness.run_alembic(url, "stamp", "031", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        row = fetch(
+            url,
+            "SELECT stat_size, stat_mtime_ns, stat_ctime_ns, stat_ino "
+            "FROM notes_metadata WHERE id = 1",
+        )[0]
+        assert tuple(row) == (10, 111, 222, 333)
+        assert len(stat_checks(url)) == 1
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_026_refuses_an_impostor_column_of_the_wrong_type():
+    """The spec's own example: an `integer` `stat_ino` truncates inode
+    numbers into false matches, so it is refused by name."""
+    with throwaway_db("schema_stat_impostor_type", revision="031") as url:
+        sql(url, "ALTER TABLE notes_metadata ADD COLUMN stat_ino integer")
+        refuse_026(url, must_mention=["notes_metadata.stat_ino is integer"])
+        assert stat_column_state(url, "stat_size") is None
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "not_null",
+            "ALTER TABLE notes_metadata ADD COLUMN stat_size bigint NOT NULL "
+            "DEFAULT 0",
+            "notes_metadata.stat_size is NOT NULL",
+        ),
+        (
+            "server_default",
+            "ALTER TABLE notes_metadata ADD COLUMN stat_mtime_ns bigint DEFAULT 0",
+            "server default",
+        ),
+        (
+            "unmarked",
+            "ALTER TABLE notes_metadata ADD COLUMN stat_ctime_ns bigint",
+            "does not carry 026's comment marker",
+        ),
+    ],
+)
+def test_026_refuses_a_pre_existing_column_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_stat_foreign_{label}", revision="031") as url:
+        sql(url, ddl)
+        refuse_026(url, must_mention=[fragment])
+
+
+def test_026_refuses_an_impostor_check_under_its_name():
+    """Resolved by definition: a `CHECK (true)` carrying 026's name is not
+    026's CHECK, and is refused rather than adopted."""
+    with throwaway_db("schema_stat_impostor_check") as url:
+        sql(url, f"ALTER TABLE notes_metadata DROP CONSTRAINT {STAT_CHECK_NAME}")
+        sql(
+            url,
+            f"ALTER TABLE notes_metadata ADD CONSTRAINT {STAT_CHECK_NAME} "
+            "CHECK (true)",
+        )
+        refuse_026(url, must_mention=[f"a CHECK named {STAT_CHECK_NAME}"])
+
+
+def test_026_refuses_an_unmarked_check_with_its_definition():
+    with throwaway_db("schema_stat_unmarked_check") as url:
+        sql(
+            url,
+            f"COMMENT ON CONSTRAINT {STAT_CHECK_NAME} ON notes_metadata IS NULL",
+        )
+        refuse_026(url, must_mention=["does not carry 026's constraint marker"])
+
+
+def test_downgrade_026_drops_the_marked_unit_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_stat_downgrade") as url:
+        insert_stat_note(url, 1, "A.md", (10, 1, 2, 3))
+        _harness.run_alembic(url, "downgrade", "031", dimensions=DIM)
+        assert alembic_version(url) == "031"
+        for column in STAT_COLUMNS:
+            assert stat_column_state(url, column) is None
+        assert stat_checks(url) == []
+        assert fetchval(url, "SELECT count(*) FROM notes_metadata") == 1
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url, "SELECT count(*) FROM notes_metadata WHERE stat_size IS NULL"
+        ) == 1
+        assert len(stat_checks(url)) == 1
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_026_leaves_a_column_it_did_not_create():
+    """Per object, 023's rule: an unmarked column is left in place and named,
+    and the marked ones are still dropped."""
+    with throwaway_db("schema_stat_downgrade_foreign") as url:
+        sql(
+            url,
+            "COMMENT ON COLUMN notes_metadata.stat_ino IS 'somebody else made this'",
+        )
+        result = _harness.run_alembic(url, "downgrade", "031", dimensions=DIM)
+        assert "leaving notes_metadata.stat_ino in place" in result.stdout
+        assert alembic_version(url) == "031"
+        assert stat_column_state(url, "stat_ino") is not None
+        for column in ("stat_size", "stat_mtime_ns", "stat_ctime_ns"):
+            assert stat_column_state(url, column) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 027 — notes_metadata reloptions, the halfvec HNSW index (#283)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Neither half is visible to `alembic check`. Table reloptions are not
+# compared at all, and the expression index is excluded from the comparison by
+# `alembic/env.py`'s `include_object` (autogenerate on SQLAlchemy 2 would strip
+# its `::halfvec` cast and report spurious drift). So both are asserted here
+# through the catalogue: `pg_class.reloptions`, and the index through
+# `pg_get_indexdef`, `indisvalid` and its operator class — the house rule for
+# indexes (019/021/024). What `alembic check` *can* still say is that removing
+# the legacy index from the model left no drift, and the cases below ask it.
+
+from src.services import vector_index  # noqa: E402
+
+HALFVEC_INDEX = vector_index.INDEX_NAME
+LEGACY_VECTOR_INDEX = vector_index.LEGACY_INDEX_NAME
+NOTES_RELOPTIONS = {
+    "autovacuum_vacuum_scale_factor=0.02",
+    "autovacuum_vacuum_insert_scale_factor=0.02",
+}
+
+
+@contextlib.contextmanager
+def throwaway_db_at(prefix: str, dim: int, revision: str = "head"):
+    """`throwaway_db` at an explicit embedding dimension — 027 builds its
+    index at the configured one, so the dimension is part of the case."""
+    generator = _harness.throwaway_database(prefix, dim, revision=revision)
+    url = next(generator)
+    try:
+        yield url
+    finally:
+        generator.close()
+
+
+def notes_reloptions(url) -> set:
+    value = fetchval(
+        url,
+        "SELECT reloptions FROM pg_class "
+        "WHERE oid = 'public.notes_metadata'::regclass",
+    )
+    return set(value or [])
+
+
+def vector_indexes(url) -> dict:
+    """Every HNSW index on note_embeddings: name -> (indexdef, valid, opclass, oid)."""
+    rows = fetch(
+        url,
+        "SELECT c.relname, pg_get_indexdef(i.indexrelid) AS def, i.indisvalid, "
+        "       opc.opcname, i.indexrelid::bigint AS oid "
+        "FROM pg_index i "
+        "JOIN pg_class c ON c.oid = i.indexrelid "
+        "JOIN pg_am am ON am.oid = c.relam "
+        "JOIN pg_opclass opc ON opc.oid = i.indclass[0] "
+        "WHERE i.indrelid = 'public.note_embeddings'::regclass "
+        "  AND am.amname = 'hnsw'",
+    )
+    return {
+        r["relname"]: (r["def"], r["indisvalid"], r["opcname"], r["oid"])
+        for r in rows
+    }
+
+
+def assert_alembic_check_clean(url, dim):
+    check = _harness.run_alembic(url, "check", dimensions=dim, check=False)
+    assert check.returncode == 0, (
+        f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+    )
+
+
+def test_027_sets_reloptions_and_builds_the_halfvec_index_at_1024():
+    """The spec's scenario at the default dimension: exactly one valid HNSW
+    index, over `halfvec(1024)` with `halfvec_cosine_ops`, and 008's gone."""
+    with throwaway_db_at("schema_027_fresh", 1024) as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert NOTES_RELOPTIONS <= notes_reloptions(url)
+
+        indexes = vector_indexes(url)
+        assert set(indexes) == {HALFVEC_INDEX}, indexes
+        indexdef, valid, opclass, _oid = indexes[HALFVEC_INDEX]
+        assert valid is True
+        assert opclass == "halfvec_cosine_ops"
+        assert (
+            "USING hnsw (((embedding)::halfvec(1024)) halfvec_cosine_ops)" in indexdef
+        ), indexdef
+        assert "m='16'" in indexdef and "ef_construction='64'" in indexdef
+        assert LEGACY_VECTOR_INDEX not in indexes
+        assert_alembic_check_clean(url, 1024)
+
+
+def test_027_builds_at_the_configured_dimension_not_a_literal():
+    with throwaway_db("schema_027_dim64") as url:
+        indexes = vector_indexes(url)
+        assert set(indexes) == {HALFVEC_INDEX}, indexes
+        assert "::halfvec(64)" in indexes[HALFVEC_INDEX][0]
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_027_builds_no_index_above_2000_dimensions():
+    """Above 2000 no index of either kind exists before or after: an exact
+    scan stays exact. The reloptions still apply."""
+    with throwaway_db_at("schema_027_dim3072", 3072) as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert vector_indexes(url) == {}
+        assert NOTES_RELOPTIONS <= notes_reloptions(url)
+        assert_alembic_check_clean(url, 3072)
+
+
+def test_027_chains_from_026_and_replaces_the_legacy_index():
+    with throwaway_db("schema_027_chain", revision="032") as url:
+        assert alembic_version(url) == "032"
+        before = vector_indexes(url)
+        assert set(before) == {LEGACY_VECTOR_INDEX}, before
+        assert before[LEGACY_VECTOR_INDEX][2] == "vector_cosine_ops"
+        assert not NOTES_RELOPTIONS & notes_reloptions(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert set(vector_indexes(url)) == {HALFVEC_INDEX}
+        assert NOTES_RELOPTIONS <= notes_reloptions(url)
+
+
+def test_027_accepts_its_own_index_on_a_stamp_back_without_rebuilding_it():
+    """Stamp-back idempotence: the body re-runs, reconciles the index it built
+    (same OID — verified, not rebuilt), and re-applies the reloptions."""
+    with throwaway_db("schema_027_rerun") as url:
+        oid = vector_indexes(url)[HALFVEC_INDEX][3]
+        _harness.run_alembic(url, "stamp", "032", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        indexes = vector_indexes(url)
+        assert set(indexes) == {HALFVEC_INDEX}
+        assert indexes[HALFVEC_INDEX][1] is True
+        assert indexes[HALFVEC_INDEX][3] == oid
+        assert NOTES_RELOPTIONS <= notes_reloptions(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl",
+    [
+        (
+            "vector_opclass",
+            f"CREATE INDEX {HALFVEC_INDEX} ON note_embeddings "
+            "USING hnsw (embedding vector_cosine_ops)",
+        ),
+        (
+            "other_dimension",
+            f"CREATE INDEX {HALFVEC_INDEX} ON note_embeddings "
+            "USING hnsw ((embedding::halfvec(32)) halfvec_cosine_ops) "
+            "WITH (m = 16, ef_construction = 64)",
+        ),
+        (
+            "other_build_params",
+            f"CREATE INDEX {HALFVEC_INDEX} ON note_embeddings "
+            "USING hnsw ((embedding::halfvec(64)) halfvec_cosine_ops) "
+            "WITH (m = 8, ef_construction = 64)",
+        ),
+    ],
+)
+def test_027_refuses_an_impostor_index_under_its_name(label, ddl):
+    """Reconcile, don't adopt: an index of 027's name the queries' ORDER BY
+    does not match would leave semantic search on a sequential scan."""
+    with throwaway_db(f"schema_027_impostor_{label}") as url:
+        sql(url, f"DROP INDEX {HALFVEC_INDEX}")
+        sql(url, ddl)
+        _harness.run_alembic(url, "stamp", "032", dimensions=DIM)
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0, "027 should have refused"
+        combined = result.stdout + result.stderr
+        assert f"027 found an index named {HALFVEC_INDEX}" in combined, combined
+        assert alembic_version(url) == "032", "nothing should have been recorded"
+
+
+def test_downgrade_027_restores_the_legacy_index_and_resets_reloptions():
+    with throwaway_db("schema_027_downgrade") as url:
+        _harness.run_alembic(url, "downgrade", "032", dimensions=DIM)
+        assert alembic_version(url) == "032"
+        indexes = vector_indexes(url)
+        assert set(indexes) == {LEGACY_VECTOR_INDEX}, indexes
+        _def, valid, opclass, _oid = indexes[LEGACY_VECTOR_INDEX]
+        assert valid is True
+        assert opclass == "vector_cosine_ops"
+        assert not NOTES_RELOPTIONS & notes_reloptions(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert set(vector_indexes(url)) == {HALFVEC_INDEX}
+        assert NOTES_RELOPTIONS <= notes_reloptions(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_027_above_2000_dimensions_builds_nothing():
+    with throwaway_db_at("schema_027_downgrade_3072", 3072) as url:
+        _harness.run_alembic(url, "downgrade", "032", dimensions=3072)
+        assert alembic_version(url) == "032"
+        assert vector_indexes(url) == {}
+        assert not NOTES_RELOPTIONS & notes_reloptions(url)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 028 — concurrency_counters and concurrency_runs (#188, design D8)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `alembic check` sees the columns, the table comments and the indexes. It
+# cannot see the closed-set CHECKs on `mode` and `metric` — and those are what
+# keep a typo'd metric (a pool timeout filed under a name the readiness
+# evaluator never reads, i.e. a false PASS) out of the table. So the CHECKs are
+# asserted by definition through `pg_constraint`, enforced by inserts, and the
+# primary keys, defaults and complete index sets are read from the catalogue.
+
+COUNTERS_MARKER_028 = "event-time minute concurrency counters (028_concurrency_counters)"
+RUNS_MARKER_028 = "one row per process run, coverage watermark (028_concurrency_counters)"
+CHECK_MARKER_028 = "closed set (028_concurrency_counters)"
+MODES_028 = ("off", "shadow", "queue", "enforce")
+METRICS_028 = (
+    "requests", "transport_pressured", "transport_waited", "transport_overrun",
+    "transport_refused", "writer_overrun", "writer_refused",
+    "pool_checkout_timeout", "pool_high_water", "transport_wait_max_ms",
+)
+
+
+def _any_array(column, values):
+    return (
+        f"CHECK (({column} = ANY (ARRAY["
+        + ", ".join(f"'{v}'::text" for v in values)
+        + "])))"
+    )
+
+
+# What PostgreSQL 16 prints for 028's predicates; the migration measures the
+# same strings off a scratch table at runtime, this pins them.
+CANONICAL_MODE_CHECK_028 = _any_array("mode", MODES_028)
+CANONICAL_METRIC_CHECK_028 = _any_array("metric", METRICS_028)
+BUCKET_028 = datetime.datetime(2026, 9, 23, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+def table_comment_028(url, table):
+    return fetchval(url, f"SELECT obj_description('public.{table}'::regclass, 'pg_class')")
+
+
+def columns_028(url, table):
+    return [
+        tuple(r)
+        for r in fetch(
+            url,
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, "
+            "       pg_get_expr(d.adbin, d.adrelid) "
+            "FROM pg_attribute a "
+            "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+            f"WHERE a.attrelid = 'public.{table}'::regclass "
+            "  AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+        )
+    ]
+
+
+def pk_028(url, table):
+    value = fetchval(
+        url,
+        "SELECT array_agg(a.attname ORDER BY k.ord) FROM pg_constraint c "
+        "CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+        "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum "
+        f"WHERE c.conrelid = 'public.{table}'::regclass AND c.contype = 'p'",
+    )
+    return list(value) if value else None
+
+
+def checks_028(url, table):
+    """`{definition: (validated, comment)}` for every CHECK — by definition."""
+    return {
+        " ".join(r["def"].split()): (r["convalidated"], r["comment"])
+        for r in fetch(
+            url,
+            "SELECT pg_get_constraintdef(oid) AS def, convalidated, "
+            "       obj_description(oid, 'pg_constraint') AS comment "
+            f"FROM pg_constraint WHERE conrelid = 'public.{table}'::regclass "
+            "  AND contype = 'c'",
+        )
+    }
+
+
+def indexes_028(url, table):
+    return {
+        r["relname"]: (list(r["cols"]), r["indisunique"], r["indisvalid"])
+        for r in fetch(
+            url,
+            "SELECT c.relname, i.indisunique, i.indisvalid, "
+            "  (SELECT array_agg(a.attname ORDER BY k.ord) "
+            "     FROM unnest(string_to_array(i.indkey::text, ' ')) "
+            "          WITH ORDINALITY AS k(attnum, ord) "
+            "     JOIN pg_attribute a ON a.attrelid = i.indrelid "
+            "                        AND a.attnum = k.attnum::smallint) AS cols "
+            "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            f"WHERE i.indrelid = 'public.{table}'::regclass",
+        )
+    }
+
+
+def insert_counter_028(url, metric="requests", mode="queue", count=1, max_value=None):
+    sql(
+        url,
+        "INSERT INTO concurrency_counters (bucket_start, epoch, mode, metric, count, "
+        " max_value) VALUES ($1, 'abcdef012345', $2, $3, $4, $5)",
+        BUCKET_028, mode, metric, count, max_value,
+    )
+
+
+def insert_run_028(url, mode="queue"):
+    sql(
+        url,
+        "INSERT INTO concurrency_runs (run_id, epoch, mode, started_at, "
+        " completed_through) VALUES (gen_random_uuid(), 'abcdef012345', $1, now(), now())",
+        mode,
+    )
+
+
+def refuse_028(url, *, must_mention):
+    _harness.run_alembic(url, "stamp", "033", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "028 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "033", "nothing should have been recorded"
+    return combined
+
+
+def test_028_closed_sets_match_the_application():
+    """The migration pins its own copies; they must equal what the flush writes
+    and what the settings accept, or a metric would be refused at flush time."""
+    import importlib.util
+    import typing
+
+    from src.config import Settings
+    from src.models import db as models
+    from src.services import concurrency
+
+    spec = importlib.util.spec_from_file_location(
+        "m028", _harness.ROOT / "alembic" / "versions" / "034_concurrency_counters.py"
+    )
+    m028 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m028)
+    assert set(m028.METRICS) == set(METRICS_028) == set(concurrency.METRICS)
+    assert tuple(m028.METRICS) == tuple(models.CONCURRENCY_METRICS)
+    mode_literal = typing.get_args(Settings.model_fields["mcp_concurrency_mode"].annotation)
+    assert set(m028.MODES) == set(MODES_028) == set(mode_literal)
+    assert tuple(m028.MODES) == tuple(models.CONCURRENCY_MODES)
+
+
+def test_028_creates_both_tables_typed_marked_and_enforced_on_a_fresh_db():
+    with throwaway_db("schema_028_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+
+        assert table_comment_028(url, "concurrency_counters") == COUNTERS_MARKER_028
+        assert columns_028(url, "concurrency_counters") == [
+            ("bucket_start", "timestamp with time zone", True, None),
+            ("epoch", "text", True, None),
+            ("mode", "text", True, None),
+            ("metric", "text", True, None),
+            ("count", "bigint", True, "0"),
+            ("max_value", "integer", False, None),
+        ]
+        assert pk_028(url, "concurrency_counters") == [
+            "bucket_start", "epoch", "mode", "metric"]
+        assert checks_028(url, "concurrency_counters") == {
+            CANONICAL_MODE_CHECK_028: (True, CHECK_MARKER_028),
+            CANONICAL_METRIC_CHECK_028: (True, CHECK_MARKER_028),
+        }
+        assert indexes_028(url, "concurrency_counters") == {
+            "concurrency_counters_pkey": (
+                ["bucket_start", "epoch", "mode", "metric"], True, True),
+            "ix_concurrency_counters_bucket_start": (["bucket_start"], False, True),
+        }
+
+        assert table_comment_028(url, "concurrency_runs") == RUNS_MARKER_028
+        assert columns_028(url, "concurrency_runs") == [
+            ("run_id", "uuid", True, None),
+            ("epoch", "text", True, None),
+            ("mode", "text", True, None),
+            ("started_at", "timestamp with time zone", True, None),
+            ("completed_through", "timestamp with time zone", True, None),
+            ("clean_shutdown", "boolean", True, "false"),
+            ("lossy", "boolean", True, "false"),
+        ]
+        assert pk_028(url, "concurrency_runs") == ["run_id"]
+        assert checks_028(url, "concurrency_runs") == {
+            CANONICAL_MODE_CHECK_028: (True, CHECK_MARKER_028),
+        }
+        assert indexes_028(url, "concurrency_runs") == {
+            "concurrency_runs_pkey": (["run_id"], True, True),
+            "ix_concurrency_runs_started_at": (["started_at"], False, True),
+        }
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_028_rejects_a_metric_or_mode_outside_the_closed_set():
+    with throwaway_db("schema_028_enforced") as url:
+        insert_counter_028(url, metric="pool_checkout_timeout")
+        insert_counter_028(url, metric="pool_high_water", max_value=7)
+        with pytest.raises(asyncpg.CheckViolationError):
+            insert_counter_028(url, metric="pool_checkout_timout")
+        with pytest.raises(asyncpg.CheckViolationError):
+            insert_counter_028(url, metric="requests", mode="rehearse")
+        insert_run_028(url, mode="shadow")
+        with pytest.raises(asyncpg.CheckViolationError):
+            insert_run_028(url, mode="Queue")
+        with pytest.raises(asyncpg.UniqueViolationError):
+            insert_counter_028(url, metric="pool_checkout_timeout")
+        assert fetchval(url, "SELECT count(*) FROM concurrency_counters") == 2
+        assert fetchval(
+            url, "SELECT clean_shutdown OR lossy FROM concurrency_runs") is False
+
+
+def test_028_chains_from_027_and_writes_no_rows():
+    with throwaway_db("schema_028_chain", revision="033") as url:
+        assert alembic_version(url) == "033"
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_runs')") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM concurrency_counters") == 0
+        assert fetchval(url, "SELECT count(*) FROM concurrency_runs") == 0
+
+
+def test_028_accepts_its_own_shape_on_a_stamp_back_and_keeps_rows():
+    with throwaway_db("schema_028_rerun") as url:
+        insert_counter_028(url, count=41)
+        insert_run_028(url)
+        oid = fetchval(url, "SELECT 'public.concurrency_counters'::regclass::oid")
+        _harness.run_alembic(url, "stamp", "033", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT 'public.concurrency_counters'::regclass::oid") == oid
+        assert fetchval(url, "SELECT count FROM concurrency_counters") == 41
+        assert fetchval(url, "SELECT count(*) FROM concurrency_runs") == 1
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_028_creates_in_public_under_a_redirected_search_path():
+    with throwaway_db("schema_028_path", revision="033") as url:
+        dbname = fetchval(url, "SELECT current_database()")
+        sql(url, "CREATE SCHEMA decoy")
+        sql(url, f'ALTER DATABASE "{dbname}" SET search_path TO decoy, public')
+        assert fetchval(url, "SHOW search_path") == "decoy, public"
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        for table in ("concurrency_counters", "concurrency_runs"):
+            assert fetchval(url, f"SELECT to_regclass('public.{table}')") is not None
+            assert fetchval(url, f"SELECT to_regclass('decoy.{table}')") is None
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM pg_class c WHERE c.relnamespace = 'decoy'::regnamespace",
+        ) == 0
+        assert fetchval(url, "SHOW search_path") == "decoy, public"
+        _harness.run_alembic(url, "downgrade", "033", dimensions=DIM)
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_runs')") is None
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "unmarked_table",
+            ["COMMENT ON TABLE concurrency_counters IS NULL"],
+            "concurrency_counters already exists but it does not carry 028's "
+            "comment marker",
+        ),
+        (
+            "impostor_metric_check",
+            [
+                "ALTER TABLE concurrency_counters DROP CONSTRAINT "
+                "ck_concurrency_counters_metric",
+                "ALTER TABLE concurrency_counters ADD CONSTRAINT "
+                "ck_concurrency_counters_metric CHECK (true)",
+            ],
+            "not one of 028's closed-set predicates",
+        ),
+        (
+            "unmarked_check",
+            ["COMMENT ON CONSTRAINT ck_concurrency_runs_mode ON concurrency_runs IS NULL"],
+            "does not carry 028's constraint marker",
+        ),
+        (
+            "missing_check",
+            ["ALTER TABLE concurrency_runs DROP CONSTRAINT ck_concurrency_runs_mode"],
+            "missing the closed-set CHECK ck_concurrency_runs_mode",
+        ),
+        (
+            "extra_unique_index",
+            ["CREATE UNIQUE INDEX squat ON concurrency_runs (epoch)"],
+            "unexpected index 'squat'",
+        ),
+        (
+            "missing_index",
+            ["DROP INDEX ix_concurrency_counters_bucket_start"],
+            "missing index ix_concurrency_counters_bucket_start",
+        ),
+        (
+            "wrong_default",
+            ["ALTER TABLE concurrency_runs ALTER COLUMN clean_shutdown SET DEFAULT true"],
+            "clean_shutdown default",
+        ),
+        (
+            "missing_pk",
+            ["ALTER TABLE concurrency_counters DROP CONSTRAINT concurrency_counters_pkey"],
+            "its primary key is absent",
+        ),
+    ],
+)
+def test_028_refuses_a_table_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_028_foreign_{label}") as url:
+        insert_counter_028(url, count=3)
+        for statement in ddl:
+            sql(url, statement)
+        refuse_028(url, must_mention=[fragment])
+        # A refusal changes nothing.
+        assert fetchval(url, "SELECT count FROM concurrency_counters") == 3
+
+
+def test_downgrade_028_drops_the_marked_tables_and_upgrade_rebuilds_them():
+    with throwaway_db("schema_028_downgrade") as url:
+        insert_counter_028(url)
+        _harness.run_alembic(url, "downgrade", "033", dimensions=DIM)
+        assert alembic_version(url) == "033"
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_counters')") is None
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_runs')") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM concurrency_counters") == 0
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_028_leaves_a_table_it_did_not_create():
+    with throwaway_db("schema_028_downgrade_foreign") as url:
+        sql(url, "COMMENT ON TABLE concurrency_runs IS 'somebody else made this'")
+        result = _harness.run_alembic(url, "downgrade", "033", dimensions=DIM)
+        assert "leaving concurrency_runs in place" in result.stdout
+        assert alembic_version(url) == "033"
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_runs')") is not None
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_counters')") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 029 — oauth_codes.grant_id and oauth_tokens.grant_issued_at (#325, #326)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `alembic check` sees both columns' type, nullability and comment, but **not
+# the server default** (`compare_server_default` is off), so the default on
+# `grant_issued_at` — the rolling-deploy safety net — is asserted here through
+# the catalogue or nowhere. The backfill is the other thing autogenerate cannot
+# see: every pre-existing token must carry one migration timestamp, or the
+# deploy logs connectors out (or leaves a family with two clocks).
+
+CODE_GRANT_MARKER_029 = (
+    "grant family the exchange of this code issued (029_oauth_grant_lifetime)"
+)
+ISSUED_AT_MARKER_029 = (
+    "grant family issuance time, inherited by rotation (029_oauth_grant_lifetime)"
+)
+
+
+def column_state_029(url, table, column):
+    rows = fetch(
+        url,
+        "SELECT format_type(a.atttypid, a.atttypmod) AS coltype, a.attnotnull, "
+        "       pg_get_expr(d.adbin, d.adrelid) AS coldefault, "
+        "       col_description(a.attrelid, a.attnum) AS comment "
+        "FROM pg_attribute a "
+        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        "WHERE a.attrelid = $1::regclass "
+        "  AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped",
+        f"public.{table}",
+        column,
+    )
+    return tuple(rows[0]) if rows else None
+
+
+def refuse_029(url, *, must_mention):
+    _harness.run_alembic(url, "stamp", "034", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "029 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "034", "nothing should have been recorded"
+    return combined
+
+
+def test_029_creates_both_columns_with_shape_marker_and_default():
+    with throwaway_db("schema_029_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert column_state_029(url, "oauth_codes", "grant_id") == (
+            "character varying(64)",
+            False,
+            None,
+            CODE_GRANT_MARKER_029,
+        )
+        assert column_state_029(url, "oauth_tokens", "grant_issued_at") == (
+            "timestamp with time zone",
+            True,
+            "now()",
+            ISSUED_AT_MARKER_029,
+        )
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_029_chains_from_028():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_revision("035") is not None
+    assert script.get_revision("035").down_revision == "034"
+
+
+def test_029_backfills_every_pre_existing_token_with_one_migration_timestamp():
+    old = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+    with throwaway_db("schema_029_backfill", revision="034") as url:
+        insert_client(url, "client-a", "none", None)
+        insert_client(url, "client-b", "none", None)
+        insert_client_token(url, "a" * 64, "client-a", created_at=old)
+        insert_client_token(url, "b" * 64, "client-a")
+        insert_client_token(url, "c" * 64, "client-b", created_at=old)
+        insert_code(url, "d" * 64, "client-a", used=True)
+        before = fetchval(url, "SELECT now()")
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        after = fetchval(url, "SELECT now()")
+        assert alembic_version(url) == HEAD_REVISION
+        values = {
+            r[0] for r in fetch(url, "SELECT grant_issued_at FROM oauth_tokens")
+        }
+        assert len(values) == 1, values
+        stamped = values.pop()
+        assert before <= stamped <= after
+        # Not each row's own creation time: the clock starts at migration.
+        assert stamped > old
+        # A spent code has no recoverable lineage.
+        assert fetchval(
+            url, "SELECT count(*) FROM oauth_codes WHERE grant_id IS NOT NULL"
+        ) == 0
+
+
+def test_029_stamp_back_rerun_changes_no_value():
+    recorded = datetime.datetime(2030, 5, 5, tzinfo=datetime.timezone.utc)
+    with throwaway_db("schema_029_rerun") as url:
+        insert_client(url, "client-a", "none", None)
+        insert_client_token(url, "a" * 64, "client-a")
+        insert_code(url, "b" * 64, "client-a", used=True)
+        sql(url, "UPDATE oauth_tokens SET grant_issued_at = $1", recorded)
+        sql(url, "UPDATE oauth_codes SET grant_id = 'g-lineage'")
+
+        _harness.run_alembic(url, "stamp", "034", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT grant_issued_at FROM oauth_tokens") == recorded
+        assert fetchval(url, "SELECT grant_id FROM oauth_codes") == "g-lineage"
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "issued_at_nullable",
+            [
+                "ALTER TABLE oauth_tokens ADD COLUMN grant_issued_at timestamptz "
+                "DEFAULT now()",
+            ],
+            "oauth_tokens.grant_issued_at already exists but it is nullable",
+        ),
+        (
+            "issued_at_no_default",
+            [
+                "ALTER TABLE oauth_tokens ADD COLUMN grant_issued_at timestamptz "
+                "NOT NULL DEFAULT now()",
+                "ALTER TABLE oauth_tokens ALTER COLUMN grant_issued_at DROP DEFAULT",
+            ],
+            "it has no server default",
+        ),
+        (
+            "issued_at_wrong_type",
+            [
+                "ALTER TABLE oauth_tokens ADD COLUMN grant_issued_at timestamp "
+                "NOT NULL DEFAULT now()",
+            ],
+            "not timestamp with time zone",
+        ),
+        (
+            "issued_at_unmarked",
+            [
+                "ALTER TABLE oauth_tokens ADD COLUMN grant_issued_at timestamptz "
+                "NOT NULL DEFAULT now()",
+            ],
+            "does not carry 029's comment marker",
+        ),
+        (
+            "code_grant_not_null",
+            [
+                "ALTER TABLE oauth_codes ADD COLUMN grant_id varchar(64) NOT NULL "
+                "DEFAULT 'x'",
+            ],
+            "oauth_codes.grant_id already exists but it is NOT NULL",
+        ),
+        (
+            "code_grant_wrong_type",
+            ["ALTER TABLE oauth_codes ADD COLUMN grant_id text"],
+            "not character varying(64)",
+        ),
+    ],
+)
+def test_029_refuses_a_pre_existing_column_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_029_foreign_{label}", revision="034") as url:
+        insert_client(url, "client-a", "none", None)
+        insert_client_token(url, "a" * 64, "client-a")
+        for statement in ddl:
+            sql(url, statement)
+        refuse_029(url, must_mention=[fragment, "Nothing has been changed"])
+        # Atomic: the other column was not added either.
+        if label.startswith("issued_at"):
+            assert column_state_029(url, "oauth_codes", "grant_id") is None
+        else:
+            assert column_state_029(url, "oauth_tokens", "grant_issued_at") is None
+
+
+def test_downgrade_029_drops_both_marked_columns_and_upgrade_rebuilds_them():
+    with throwaway_db("schema_029_downgrade") as url:
+        insert_client(url, "client-a", "none", None)
+        insert_client_token(url, "a" * 64, "client-a")
+        _harness.run_alembic(url, "downgrade", "034", dimensions=DIM)
+        assert alembic_version(url) == "034"
+        assert column_state_029(url, "oauth_codes", "grant_id") is None
+        assert column_state_029(url, "oauth_tokens", "grant_issued_at") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url, "SELECT count(*) FROM oauth_tokens WHERE grant_issued_at IS NULL"
+        ) == 0
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_029_refuses_an_unmarked_column_and_changes_nothing():
+    with throwaway_db("schema_029_downgrade_foreign") as url:
+        sql(url, "COMMENT ON COLUMN oauth_tokens.grant_issued_at IS 'somebody else'")
+        result = _harness.run_alembic(
+            url, "downgrade", "034", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert (
+            "oauth_tokens.grant_issued_at does not carry 029's comment marker"
+            in combined
+        )
+        assert alembic_version(url) == HEAD_REVISION
+        # Both were checked before either was dropped.
+        assert column_state_029(url, "oauth_codes", "grant_id") is not None
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 030 — notes_metadata.derived_under (#311)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# One nullable `varchar(64)` with 030's comment marker, no default, no
+# backfill: every pre-existing row reads NULL, "not derived under the current
+# root". `alembic check` compares the type, nullability and comment; the
+# absence of a default and of a backfill are asserted here.
+
+DERIVED_UNDER_MARKER_030 = "re-derive progress digest (030_note_derived_under)"
+
+
+def refuse_030(url, *, must_mention):
+    _harness.run_alembic(url, "stamp", "035", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "030 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "035", "nothing should have been recorded"
+    return combined
+
+
+def test_030_adds_one_nullable_marked_column_with_no_default():
+    with throwaway_db("schema_030_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION == "036"
+        assert column_state_029(url, "notes_metadata", "derived_under") == (
+            "character varying(64)",
+            False,
+            None,
+            DERIVED_UNDER_MARKER_030,
+        )
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_030_chains_from_029():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "036"
+    assert script.get_revision("036").down_revision == "035"
+
+
+def test_030_backfills_nothing():
+    with throwaway_db("schema_030_backfill", revision="035") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_stat_note(url, 2, "b.md", (None, None, None, None))
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url, "SELECT count(*) FROM notes_metadata WHERE derived_under IS NOT NULL"
+        ) == 0
+        assert fetchval(url, "SELECT count(*) FROM notes_metadata") == 2
+
+
+def test_030_stamp_back_rerun_keeps_recorded_markers():
+    with throwaway_db("schema_030_rerun") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        sql(url, "UPDATE notes_metadata SET derived_under = $1", "d" * 64)
+        _harness.run_alembic(url, "stamp", "035", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT derived_under FROM notes_metadata") == "d" * 64
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "wrong_type",
+            ["ALTER TABLE notes_metadata ADD COLUMN derived_under text"],
+            "notes_metadata.derived_under is text, not character varying(64)",
+        ),
+        (
+            "not_null",
+            [
+                "ALTER TABLE notes_metadata ADD COLUMN derived_under varchar(64) "
+                "NOT NULL DEFAULT 'x'",
+            ],
+            "notes_metadata.derived_under is NOT NULL",
+        ),
+        (
+            "default",
+            [
+                "ALTER TABLE notes_metadata ADD COLUMN derived_under varchar(64) "
+                "DEFAULT 'x'",
+            ],
+            "has a server default",
+        ),
+        (
+            "unmarked",
+            ["ALTER TABLE notes_metadata ADD COLUMN derived_under varchar(64)"],
+            "does not carry 030's comment marker",
+        ),
+    ],
+)
+def test_030_refuses_a_pre_existing_column_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_030_foreign_{label}", revision="035") as url:
+        for statement in ddl:
+            sql(url, statement)
+        refuse_030(url, must_mention=[fragment, "Nothing has been changed"])
+
+
+def test_downgrade_030_drops_the_marked_column_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_030_downgrade") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        sql(url, "UPDATE notes_metadata SET derived_under = $1", "d" * 64)
+        _harness.run_alembic(url, "downgrade", "035", dimensions=DIM)
+        assert alembic_version(url) == "035"
+        assert column_state_029(url, "notes_metadata", "derived_under") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url, "SELECT count(*) FROM notes_metadata WHERE derived_under IS NOT NULL"
+        ) == 0, "a re-upgrade leaves every row NULL"
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_030_leaves_a_column_it_did_not_create():
+    with throwaway_db("schema_030_downgrade_foreign") as url:
+        sql(url, "COMMENT ON COLUMN notes_metadata.derived_under IS 'somebody else'")
+        result = _harness.run_alembic(url, "downgrade", "035", dimensions=DIM)
+        assert "030 downgrade: leaving notes_metadata.derived_under" in (
+            result.stdout + result.stderr
+        )
+        assert alembic_version(url) == "035"
+        assert column_state_029(url, "notes_metadata", "derived_under") is not None
+
+
+# Retained fork OIDC and temporal schema tests (identities025/026).
 # ── 025: `users.oidc_subject` and its partial unique index ──────────────────
 #
 # The column is what binds a provider identity to a local account, and the
@@ -5127,23 +6660,23 @@ def test_downgrade_024_refuses_a_table_it_did_not_create():
 # account can satisfy) or carries a default (an identity every new row silently
 # acquires).
 
-OIDC_COLUMN = "oidc_subject"
-OIDC_INDEX = "ux_users_oidc_subject"
+fork_OIDC_COLUMN = "oidc_subject"
+fork_OIDC_INDEX = "ux_users_oidc_subject"
 # Byte identical to `COLUMN_MARKER` in the migration and to
 # `_OIDC_SUBJECT_COLUMN_MARKER` in `src/models/db.py`.
-OIDC_MARKER = "the identity provider's stable subject claim (025_oidc_subject)"
+fork_OIDC_MARKER = "the identity provider's stable subject claim (025_oidc_subject)"
 
 
-def oidc_column_comment(url):
+def fork_oidc_column_comment(url):
     return fetchval(
         url,
         "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
         "WHERE a.attrelid = 'users'::regclass AND a.attname = $1",
-        OIDC_COLUMN,
+        fork_OIDC_COLUMN,
     )
 
 
-def oidc_index_shape(url):
+def fork_oidc_index_shape(url):
     """`(columns, unique, usable, partial-or-expression, predicate)` or None."""
     rows = fetch(
         url,
@@ -5157,7 +6690,7 @@ def oidc_index_shape(url):
         "       pg_get_expr(i.indpred, i.indrelid) AS predicate "
         "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
         "WHERE i.indrelid = 'users'::regclass AND ic.relname = $1",
-        OIDC_INDEX,
+        fork_OIDC_INDEX,
     )
     if not rows:
         return None
@@ -5171,7 +6704,7 @@ def oidc_index_shape(url):
     )
 
 
-def refuse_025(url, *, must_mention):
+def fork_refuse_025(url, *, must_mention):
     """Stamp back to 024, re-run 025, require a refusal, return the message.
 
     `refuse_024`'s device one revision on, and adversarial for its reason: the
@@ -5189,22 +6722,22 @@ def refuse_025(url, *, must_mention):
     return combined
 
 
-def test_025_creates_the_column_and_index_it_promises():
+def test_fork_025_creates_the_column_and_index_it_promises():
     with throwaway_db("schema_oidc_fresh") as url:
         assert alembic_version(url) == HEAD_REVISION
 
         # Nullable, no default, marked. Each of the three is the thing that
         # makes NULL mean "this account has never signed in through a
         # provider", which is every account on the day 025 lands.
-        assert column_shape(url, "users", OIDC_COLUMN) == (
+        assert column_shape(url, "users", fork_OIDC_COLUMN) == (
             False,
             "character varying(255)",
             None,
         )
-        assert oidc_column_comment(url) == OIDC_MARKER
+        assert fork_oidc_column_comment(url) == fork_OIDC_MARKER
 
-        columns, unique, usable, restricted, predicate = oidc_index_shape(url)
-        assert columns == [OIDC_COLUMN]
+        columns, unique, usable, restricted, predicate = fork_oidc_index_shape(url)
+        assert columns == [fork_OIDC_COLUMN]
         assert unique is True, (
             "without uniqueness two rows could claim one provider identity and "
             "which vault a person reached would depend on row order"
@@ -5220,7 +6753,7 @@ def test_025_creates_the_column_and_index_it_promises():
         assert "No new upgrade operations detected" in check.stdout
 
 
-def test_025_writes_no_rows():
+def test_fork_025_writes_no_rows():
     """No existing account has ever authenticated against a provider, so NULL
     is the correct value for all of them and inventing one would be inventing
     an identity claim nobody made."""
@@ -5231,30 +6764,30 @@ def test_025_writes_no_rows():
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
         assert fetchval(
-            url, f"SELECT count(*) FROM users WHERE {OIDC_COLUMN} IS NOT NULL"
+            url, f"SELECT count(*) FROM users WHERE {fork_OIDC_COLUMN} IS NOT NULL"
         ) == 0
         assert fetchval(url, "SELECT count(*) FROM users") == 2
 
 
-def test_025_enforces_one_provider_identity_per_account():
+def test_fork_025_enforces_one_provider_identity_per_account():
     """The invariant the index exists for, asserted against the database."""
     with throwaway_db("schema_oidc_unique") as url:
         insert_user(url, 1, "max")
         insert_user(url, 2, "sam")
-        sql(url, f"UPDATE users SET {OIDC_COLUMN} = 'sub-1' WHERE id = 1")
+        sql(url, f"UPDATE users SET {fork_OIDC_COLUMN} = 'sub-1' WHERE id = 1")
 
         with pytest.raises(asyncpg.exceptions.UniqueViolationError):
-            sql(url, f"UPDATE users SET {OIDC_COLUMN} = 'sub-1' WHERE id = 2")
+            sql(url, f"UPDATE users SET {fork_OIDC_COLUMN} = 'sub-1' WHERE id = 2")
 
         # NULL is not a value the uniqueness covers: every local account has
         # one, and they must not collide with each other.
         insert_user(url, 3, "kim")
         assert fetchval(
-            url, f"SELECT count(*) FROM users WHERE {OIDC_COLUMN} IS NULL"
+            url, f"SELECT count(*) FROM users WHERE {fork_OIDC_COLUMN} IS NULL"
         ) == 2
 
 
-def test_025_creates_in_public_under_a_redirected_search_path():
+def test_fork_025_creates_in_public_under_a_redirected_search_path():
     """021's case, repeated for 025 because the exposure is the same.
 
     Every `op.*` call in 025 is unqualified and resolves through
@@ -5274,8 +6807,8 @@ def test_025_creates_in_public_under_a_redirected_search_path():
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
         assert alembic_version(url) == HEAD_REVISION
-        assert oidc_column_comment(url) == OIDC_MARKER
-        assert oidc_index_shape(url)[0] == [OIDC_COLUMN]
+        assert fork_oidc_column_comment(url) == fork_OIDC_MARKER
+        assert fork_oidc_index_shape(url)[0] == [fork_OIDC_COLUMN]
         assert fetchval(
             url,
             "SELECT count(*) FROM pg_class c "
@@ -5291,7 +6824,7 @@ def test_025_creates_in_public_under_a_redirected_search_path():
         )
 
 
-def test_025_chains_from_024_and_is_the_head():
+def test_fork_025_chains_from_024_and_is_the_head():
     """Adding a revision without teaching this module about it must fail here
     rather than leaving the new migration unexercised."""
     from alembic.config import Config
@@ -5305,11 +6838,11 @@ def test_025_chains_from_024_and_is_the_head():
     assert script.get_revision("025").down_revision == "024"
 
 
-def test_025_accepts_its_own_shape_on_a_stamp_back():
+def test_fork_025_accepts_its_own_shape_on_a_stamp_back():
     """The benign case, and the one `make test-schema` actually runs."""
     with throwaway_db("schema_oidc_rerun") as url:
         insert_user(url, 1, "max")
-        sql(url, f"UPDATE users SET {OIDC_COLUMN} = 'sub-1' WHERE id = 1")
+        sql(url, f"UPDATE users SET {fork_OIDC_COLUMN} = 'sub-1' WHERE id = 1")
 
         _harness.run_alembic(url, "stamp", "024", dimensions=DIM)
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
@@ -5318,63 +6851,63 @@ def test_025_accepts_its_own_shape_on_a_stamp_back():
         # The re-run writes and deletes nothing, so a gate exercise cannot
         # unlink somebody's federated account.
         assert fetchval(
-            url, f"SELECT {OIDC_COLUMN} FROM users WHERE id = 1"
+            url, f"SELECT {fork_OIDC_COLUMN} FROM users WHERE id = 1"
         ) == "sub-1"
 
 
-def test_025_refuses_a_not_null_column_of_its_name():
+def test_fork_025_refuses_a_not_null_column_of_its_name():
     with throwaway_db("schema_oidc_notnull") as url:
-        sql(url, f"UPDATE users SET {OIDC_COLUMN} = 'x' WHERE {OIDC_COLUMN} IS NULL")
-        sql(url, f"ALTER TABLE users ALTER COLUMN {OIDC_COLUMN} SET NOT NULL")
-        refuse_025(url, must_mention=["it is NOT NULL"])
+        sql(url, f"UPDATE users SET {fork_OIDC_COLUMN} = 'x' WHERE {fork_OIDC_COLUMN} IS NULL")
+        sql(url, f"ALTER TABLE users ALTER COLUMN {fork_OIDC_COLUMN} SET NOT NULL")
+        fork_refuse_025(url, must_mention=["it is NOT NULL"])
 
 
-def test_025_refuses_a_column_carrying_a_default():
+def test_fork_025_refuses_a_column_carrying_a_default():
     """A default here is a provider identity every new row silently acquires —
     and under the unique index the second such row cannot insert at all."""
     with throwaway_db("schema_oidc_default") as url:
-        sql(url, f"ALTER TABLE users ALTER COLUMN {OIDC_COLUMN} SET DEFAULT 'x'")
-        refuse_025(url, must_mention=["server default"])
+        sql(url, f"ALTER TABLE users ALTER COLUMN {fork_OIDC_COLUMN} SET DEFAULT 'x'")
+        fork_refuse_025(url, must_mention=["server default"])
 
 
-def test_025_refuses_a_column_of_its_name_it_did_not_create():
+def test_fork_025_refuses_a_column_of_its_name_it_did_not_create():
     with throwaway_db("schema_oidc_unmarked") as url:
-        sql(url, f"COMMENT ON COLUMN users.{OIDC_COLUMN} IS 'somebody else made this'")
-        refuse_025(url, must_mention=["025's comment marker"])
+        sql(url, f"COMMENT ON COLUMN users.{fork_OIDC_COLUMN} IS 'somebody else made this'")
+        fork_refuse_025(url, must_mention=["025's comment marker"])
 
 
-def test_025_refuses_a_non_unique_index_of_its_name():
+def test_fork_025_refuses_a_non_unique_index_of_its_name():
     """The damaging adoption: every other check passes while the invariant
     quietly stops being true."""
     with throwaway_db("schema_oidc_nonunique") as url:
-        sql(url, f"DROP INDEX {OIDC_INDEX}")
+        sql(url, f"DROP INDEX {fork_OIDC_INDEX}")
         sql(
             url,
-            f"CREATE INDEX {OIDC_INDEX} ON users ({OIDC_COLUMN}) "
-            f"WHERE {OIDC_COLUMN} IS NOT NULL",
+            f"CREATE INDEX {fork_OIDC_INDEX} ON users ({fork_OIDC_COLUMN}) "
+            f"WHERE {fork_OIDC_COLUMN} IS NOT NULL",
         )
-        refuse_025(url, must_mention=[OIDC_INDEX, "unique=False"])
+        fork_refuse_025(url, must_mention=[fork_OIDC_INDEX, "unique=False"])
 
 
-def test_025_refuses_a_non_partial_index_of_its_name():
+def test_fork_025_refuses_a_non_partial_index_of_its_name():
     with throwaway_db("schema_oidc_nonpartial") as url:
-        sql(url, f"DROP INDEX {OIDC_INDEX}")
-        sql(url, f"CREATE UNIQUE INDEX {OIDC_INDEX} ON users ({OIDC_COLUMN})")
-        refuse_025(url, must_mention=["partial-or-expression=False"])
+        sql(url, f"DROP INDEX {fork_OIDC_INDEX}")
+        sql(url, f"CREATE UNIQUE INDEX {fork_OIDC_INDEX} ON users ({fork_OIDC_COLUMN})")
+        fork_refuse_025(url, must_mention=["partial-or-expression=False"])
 
 
-def test_025_refuses_an_index_of_its_name_on_another_column():
+def test_fork_025_refuses_an_index_of_its_name_on_another_column():
     with throwaway_db("schema_oidc_wrong_column") as url:
-        sql(url, f"DROP INDEX {OIDC_INDEX}")
+        sql(url, f"DROP INDEX {fork_OIDC_INDEX}")
         sql(
             url,
-            f"CREATE UNIQUE INDEX {OIDC_INDEX} ON users (username) "
+            f"CREATE UNIQUE INDEX {fork_OIDC_INDEX} ON users (username) "
             "WHERE username IS NOT NULL",
         )
-        refuse_025(url, must_mention=[OIDC_INDEX, "username"])
+        fork_refuse_025(url, must_mention=[fork_OIDC_INDEX, "username"])
 
 
-def test_025_refuses_a_differently_restricted_index_of_its_name():
+def test_fork_025_refuses_a_differently_restricted_index_of_its_name():
     """Partial, unique, on the right column — and covering the wrong rows.
 
     `WHERE oidc_subject <> ''` passes every flag check while admitting two rows
@@ -5382,16 +6915,16 @@ def test_025_refuses_a_differently_restricted_index_of_its_name():
     against the server's own rendering rather than the flag being trusted.
     """
     with throwaway_db("schema_oidc_wrong_predicate") as url:
-        sql(url, f"DROP INDEX {OIDC_INDEX}")
+        sql(url, f"DROP INDEX {fork_OIDC_INDEX}")
         sql(
             url,
-            f"CREATE UNIQUE INDEX {OIDC_INDEX} ON users ({OIDC_COLUMN}) "
-            f"WHERE {OIDC_COLUMN} <> ''",
+            f"CREATE UNIQUE INDEX {fork_OIDC_INDEX} ON users ({fork_OIDC_COLUMN}) "
+            f"WHERE {fork_OIDC_COLUMN} <> ''",
         )
-        refuse_025(url, must_mention=["its predicate is"])
+        fork_refuse_025(url, must_mention=["its predicate is"])
 
 
-def test_025_refuses_to_build_the_index_over_pre_existing_duplicates():
+def test_fork_025_refuses_to_build_the_index_over_pre_existing_duplicates():
     """Named as the invariant, not surfaced as a raw `duplicate key value`.
 
     Only reachable on a database where the column was populated outside this
@@ -5401,12 +6934,12 @@ def test_025_refuses_to_build_the_index_over_pre_existing_duplicates():
     with throwaway_db("schema_oidc_duplicates", revision="024") as url:
         insert_user(url, 1, "max")
         insert_user(url, 2, "sam")
-        sql(url, f"ALTER TABLE users ADD COLUMN {OIDC_COLUMN} varchar(255)")
+        sql(url, f"ALTER TABLE users ADD COLUMN {fork_OIDC_COLUMN} varchar(255)")
         sql(
             url,
-            f"COMMENT ON COLUMN users.{OIDC_COLUMN} IS $${OIDC_MARKER}$$",
+            f"COMMENT ON COLUMN users.{fork_OIDC_COLUMN} IS $${fork_OIDC_MARKER}$$",
         )
-        sql(url, f"UPDATE users SET {OIDC_COLUMN} = 'sub-1'")
+        sql(url, f"UPDATE users SET {fork_OIDC_COLUMN} = 'sub-1'")
 
         result = _harness.run_alembic(
             url, "upgrade", "head", dimensions=DIM, check=False
@@ -5417,35 +6950,35 @@ def test_025_refuses_to_build_the_index_over_pre_existing_duplicates():
         assert alembic_version(url) == "024"
 
 
-def test_downgrade_025_drops_its_work_and_upgrade_rebuilds_it():
+def test_fork_downgrade_025_drops_its_work_and_upgrade_rebuilds_it():
     with throwaway_db("schema_oidc_downgrade") as url:
         _harness.run_alembic(url, "downgrade", "024", dimensions=DIM)
         assert alembic_version(url) == "024"
-        assert column_shape(url, "users", OIDC_COLUMN) is None
-        assert oidc_index_shape(url) is None
+        assert column_shape(url, "users", fork_OIDC_COLUMN) is None
+        assert fork_oidc_index_shape(url) is None
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
         assert alembic_version(url) == HEAD_REVISION
-        assert oidc_column_comment(url) == OIDC_MARKER
-        assert oidc_index_shape(url)[1] is True
+        assert fork_oidc_column_comment(url) == fork_OIDC_MARKER
+        assert fork_oidc_index_shape(url)[1] is True
         check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
         assert check.returncode == 0, (
             f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
         )
 
 
-def test_downgrade_025_refuses_a_column_it_did_not_create():
+def test_fork_downgrade_025_refuses_a_column_it_did_not_create():
     """013's rule on the way back down: undo *this* migration, not drop
     somebody else's column of the same name — which on `users` would take every
     federated link with it."""
     with throwaway_db("schema_oidc_downgrade_foreign") as url:
-        sql(url, f"COMMENT ON COLUMN users.{OIDC_COLUMN} IS 'somebody else made this'")
+        sql(url, f"COMMENT ON COLUMN users.{fork_OIDC_COLUMN} IS 'somebody else made this'")
         result = _harness.run_alembic(
             url, "downgrade", "024", dimensions=DIM, check=False
         )
         assert result.returncode != 0
         assert "025's comment marker" in result.stdout + result.stderr
-        assert column_shape(url, "users", OIDC_COLUMN) is not None
+        assert column_shape(url, "users", fork_OIDC_COLUMN) is not None
         assert alembic_version(url) == HEAD_REVISION
 
 
@@ -5461,11 +6994,11 @@ def test_downgrade_025_refuses_a_column_it_did_not_create():
 # it is `semantic_search` quoting a paragraph the author deleted back to an
 # agent as though the note still said it.
 
-VALIDITY_MARKER = "embedding validity interval (026_temporal_embeddings)"
-VALIDITY_INDEX = "ix_note_embeddings_validity"
+fork_VALIDITY_MARKER = "embedding validity interval (026_temporal_embeddings)"
+fork_VALIDITY_INDEX = "ix_note_embeddings_validity"
 
 
-def validity_comment(url, column):
+def fork_validity_comment(url, column):
     return fetchval(
         url,
         "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
@@ -5474,7 +7007,7 @@ def validity_comment(url, column):
     )
 
 
-def validity_index_columns(url):
+def fork_validity_index_columns(url):
     return fetchval(
         url,
         "SELECT array_agg(a.attname ORDER BY k.ord) "
@@ -5486,11 +7019,11 @@ def validity_index_columns(url):
         "WHERE i.indrelid = 'public.note_embeddings'::regclass "
         "  AND ic.relname = $1 "
         "GROUP BY ic.relname",
-        VALIDITY_INDEX,
+        fork_VALIDITY_INDEX,
     )
 
 
-def seed_pre_026_vectors(url):
+def fork_seed_pre_026_vectors(url):
     """One note with two chunk vectors, written before validity existed."""
     insert_user(url, 1, "alice")
     sql(
@@ -5508,7 +7041,7 @@ def seed_pre_026_vectors(url):
     )
 
 
-def test_the_validity_columns_are_nullable_undefaulted_and_marked():
+def test_fork_the_validity_columns_are_nullable_undefaulted_and_marked():
     with throwaway_db("schema_validity_fresh") as url:
         assert alembic_version(url) == HEAD_REVISION
         for column in ("valid_from", "valid_to"):
@@ -5529,8 +7062,8 @@ def test_the_validity_columns_are_nullable_undefaulted_and_marked():
                 "a server default would stamp an interval on the rows the "
                 "ordinary embed pass writes, which know no interval"
             )
-            assert validity_comment(url, column) == VALIDITY_MARKER
-        assert validity_index_columns(url) == ["valid_to", "valid_from"]
+            assert fork_validity_comment(url, column) == fork_VALIDITY_MARKER
+        assert fork_validity_index_columns(url) == ["valid_to", "valid_from"]
         check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
         assert check.returncode == 0, (
             f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
@@ -5538,13 +7071,13 @@ def test_the_validity_columns_are_nullable_undefaulted_and_marked():
         assert "No new upgrade operations detected" in check.stdout
 
 
-def test_025_reads_every_pre_existing_vector_as_current():
+def test_fork_025_reads_every_pre_existing_vector_as_current():
     """The whole compatibility story. Every row that exists when 025 runs was
     written by the ordinary embed pass and describes the note as it stands, so
     NULL/NULL is not a placeholder — it is the correct value, and the read path
     goes on returning exactly the rows it returned before."""
     with throwaway_db("schema_validity_backfill", revision="024") as url:
-        seed_pre_026_vectors(url)
+        fork_seed_pre_026_vectors(url)
         assert column_shape(url, "note_embeddings", "valid_to") is None
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
@@ -5563,11 +7096,11 @@ def test_025_reads_every_pre_existing_vector_as_current():
         ) == 2
 
 
-def test_rerunning_025_leaves_recorded_intervals_alone():
+def test_fork_rerunning_025_leaves_recorded_intervals_alone():
     """Stamp-back idempotence, the shape the schema gate itself performs. A
     history the backfill has since written must survive it."""
     with throwaway_db("schema_validity_rerun", revision="024") as url:
-        seed_pre_026_vectors(url)
+        fork_seed_pre_026_vectors(url)
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
         sql(
             url,
@@ -5584,10 +7117,10 @@ def test_rerunning_025_leaves_recorded_intervals_alone():
         assert fetchval(
             url, "SELECT valid_to FROM note_embeddings WHERE id = 2"
         ) is None
-        assert validity_comment(url, "valid_to") == VALIDITY_MARKER
+        assert fork_validity_comment(url, "valid_to") == fork_VALIDITY_MARKER
 
 
-def test_025_refuses_a_column_of_unknown_provenance():
+def test_fork_025_refuses_a_column_of_unknown_provenance():
     """013's philosophy: reconcile a database that demonstrably has our shape,
     refuse to guess for one that does not. A naive-timestamp `valid_to`
     somebody else created would misplace every interval boundary."""
@@ -5603,12 +7136,12 @@ def test_025_refuses_a_column_of_unknown_provenance():
         assert alembic_version(url) == "024", "nothing should have been recorded"
 
 
-def test_025_refuses_an_index_name_it_did_not_create():
+def test_fork_025_refuses_an_index_name_it_did_not_create():
     """An index of the right name over the wrong columns would be adopted
     silently and would then serve nothing, while `alembic check` sees only that
     an index by that name exists."""
     with throwaway_db("schema_validity_idx_squat", revision="024") as url:
-        sql(url, f"CREATE INDEX {VALIDITY_INDEX} ON note_embeddings (note_id)")
+        sql(url, f"CREATE INDEX {fork_VALIDITY_INDEX} ON note_embeddings (note_id)")
         result = _harness.run_alembic(
             url, "upgrade", "head", dimensions=DIM, check=False
         )
@@ -5619,7 +7152,7 @@ def test_025_refuses_an_index_name_it_did_not_create():
         assert alembic_version(url) == "024"
 
 
-def test_downgrade_025_deletes_history_and_keeps_the_present():
+def test_fork_downgrade_025_deletes_history_and_keeps_the_present():
     """The ordering that makes the downgrade safe rather than merely reversible.
 
     A historical row is a vector over text the note no longer contains, and
@@ -5630,7 +7163,7 @@ def test_downgrade_025_deletes_history_and_keeps_the_present():
     which are exactly the ones with `valid_to IS NULL`, all survive.
     """
     with throwaway_db("schema_validity_downgrade") as url:
-        seed_pre_026_vectors(url)
+        fork_seed_pre_026_vectors(url)
         zero = "[" + ",".join(["0"] * DIM) + "]"
         sql(
             url,
@@ -5643,7 +7176,7 @@ def test_downgrade_025_deletes_history_and_keeps_the_present():
         _harness.run_alembic(url, "downgrade", "025", dimensions=DIM)
         assert alembic_version(url) == "025"
         assert column_shape(url, "note_embeddings", "valid_to") is None
-        assert validity_index_columns(url) is None
+        assert fork_validity_index_columns(url) is None
 
         remaining = fetch(
             url, "SELECT id, chunk_text FROM note_embeddings ORDER BY id"
@@ -5654,20 +7187,20 @@ def test_downgrade_025_deletes_history_and_keeps_the_present():
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
         assert alembic_version(url) == HEAD_REVISION
-        assert validity_comment(url, "valid_from") == VALIDITY_MARKER
-        assert validity_index_columns(url) == ["valid_to", "valid_from"]
+        assert fork_validity_comment(url, "valid_from") == fork_VALIDITY_MARKER
+        assert fork_validity_index_columns(url) == ["valid_to", "valid_from"]
         check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
         assert check.returncode == 0, (
             f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
         )
 
 
-def test_downgrade_025_refuses_a_column_it_did_not_create():
+def test_fork_downgrade_025_refuses_a_column_it_did_not_create():
     """013's rule on the way back down: undo *this* migration, not delete a
     column somebody else put there under this name — and in particular do not
     delete rows on the strength of one."""
     with throwaway_db("schema_validity_downgrade_foreign") as url:
-        seed_pre_026_vectors(url)
+        fork_seed_pre_026_vectors(url)
         sql(
             url,
             "COMMENT ON COLUMN note_embeddings.valid_to IS "
@@ -5681,3 +7214,38 @@ def test_downgrade_025_refuses_a_column_it_did_not_create():
         assert column_shape(url, "note_embeddings", "valid_to") is not None
         assert fetchval(url, "SELECT count(*) FROM note_embeddings") == 2
         assert alembic_version(url) == HEAD_REVISION
+
+
+@pytest.mark.parametrize("fork_revision", ["025", "026"])
+def test_fork_existing_release_upgrades_without_losing_owned_data(fork_revision):
+    """Real fork releases keep OIDC identities, note bytes and temporal meaning.
+
+    Numeric upstream revisions25/26 were already used for different fork
+    artifacts. Advancing the new chain must neither stamp over those identities
+    nor make previously historical vectors current.
+    """
+    with throwaway_db("schema_fork_compat_" + fork_revision, revision=fork_revision) as url:
+        fork_seed_pre_026_vectors(url)
+        sql(url, "UPDATE users SET oidc_subject = 'synthetic-fork-subject' WHERE id = 1")
+        if fork_revision == "026":
+            sql(url, "UPDATE note_embeddings SET valid_from = '2020-01-01T00:00:00Z', "
+                     "valid_to = '2021-01-01T00:00:00Z' WHERE id = 1")
+        user_before = fetch(url, "SELECT id, username, password_hash, oidc_subject, vault_path FROM users ORDER BY id")
+        note_before = fetch(url, "SELECT id, user_id, file_path, title, content_hash, embedded_content_hash, indexed_at, modified_at FROM notes_metadata ORDER BY id")
+        vector_before = fetch(url, "SELECT id, note_id, chunk_index, chunk_text, embedding::text FROM note_embeddings ORDER BY id")
+        oidc_index_before = fork_oidc_index_shape(url)
+        intervals_before = fetch(url, "SELECT id, valid_from, valid_to FROM note_embeddings ORDER BY id") if fork_revision == "026" else None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == "036"
+        assert fetch(url, "SELECT id, username, password_hash, oidc_subject, vault_path FROM users ORDER BY id") == user_before
+        assert fetch(url, "SELECT id, user_id, file_path, title, content_hash, embedded_content_hash, indexed_at, modified_at FROM notes_metadata ORDER BY id") == note_before
+        assert fetch(url, "SELECT id, note_id, chunk_index, chunk_text, embedding::text FROM note_embeddings ORDER BY id") == vector_before
+        assert fork_oidc_index_shape(url) == oidc_index_before
+        intervals = fetch(url, "SELECT id, valid_from, valid_to FROM note_embeddings ORDER BY id")
+        if intervals_before is not None:
+            assert intervals == intervals_before
+        else:
+            assert [tuple(row) for row in intervals] == [(1, None, None), (2, None, None)]
+        assert fork_validity_index_columns(url) == ["valid_to", "valid_from"]
+        assert_alembic_check_clean(url, DIM)

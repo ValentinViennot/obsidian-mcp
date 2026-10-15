@@ -34,6 +34,11 @@ from src.services.embeddings import (
 )
 
 
+@pytest.fixture(autouse=True)
+def fork_batch_size(monkeypatch):
+    monkeypatch.setattr(settings, "ollama_embed_batch_size", OLLAMA_BATCH_LIMIT)
+
+
 @pytest.fixture
 def ollama_settings(monkeypatch):
     monkeypatch.setattr(settings, "ollama_url", "http://ollama:11434")
@@ -176,9 +181,9 @@ async def test_a_failed_sub_batch_falls_back_to_one_request_per_chunk(monkeypatc
 
     async def _post(payload_input, *, timeout):  # noqa: ARG001
         seen.append(payload_input)
-        if isinstance(payload_input, list):
+        if len(payload_input) > 1:
             raise ConnectError("connection reset")
-        return [[float(int(payload_input.split("-")[1]))]]
+        return [[float(int(payload_input[0].split("-")[1]))]]
 
     monkeypatch.setattr(provider, "_post", _post)
 
@@ -187,7 +192,7 @@ async def test_a_failed_sub_batch_falls_back_to_one_request_per_chunk(monkeypatc
     assert out == [[float(i)] for i in range(5)]
     # One failed array request, then five single-string requests, in order.
     assert isinstance(seen[0], list) and len(seen[0]) == 5
-    assert seen[1:] == [f"chunk-{i}" for i in range(5)]
+    assert seen[1:] == [[f"chunk-{i}"] for i in range(5)]
 
 
 @pytest.mark.asyncio
@@ -200,9 +205,9 @@ async def test_only_the_failed_sub_batch_degrades(monkeypatch):
     n = OLLAMA_BATCH_LIMIT * 2
 
     async def _post(payload_input, *, timeout):  # noqa: ARG001
-        if isinstance(payload_input, str):
-            string_requests.append(payload_input)
-            return [[float(int(payload_input.split("-")[1]))]]
+        if len(payload_input) == 1:
+            string_requests.append(payload_input[0])
+            return [[float(int(payload_input[0].split("-")[1]))]]
         array_requests.append(len(payload_input))
         if payload_input[0] == "chunk-0":
             raise ConnectError("first sub-batch is cursed")
@@ -284,9 +289,8 @@ async def test_an_empty_batch_issues_no_request(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_embed_one_still_sends_a_bare_string(ollama_settings):
-    """The single-input request shape is unchanged by batching: every
-    deployment this has run against accepts a bare string, and
+async def test_embed_one_sends_one_explicit_input(ollama_settings):
+    """The single-input request uses the same one-element array as upstream, and
     `semantic_search` embeds its query through this path on every call."""
     provider = OllamaProvider()
 
@@ -297,4 +301,17 @@ async def test_embed_one_still_sends_a_bare_string(ollama_settings):
         out = await provider.embed_one("a query")
 
     assert out == [0.5, 0.25]
-    assert json.loads(route.calls[0].request.read())["input"] == "a query"
+    assert json.loads(route.calls[0].request.read())["input"] == ["a query"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('count', [0, 2])
+async def test_query_embedding_refuses_wrong_vector_cardinality_without_retry(ollama_settings, count):
+    provider = OllamaProvider()
+    with respx.mock(base_url='http://ollama:11434') as mock:
+        route = mock.post('/api/embed').mock(
+            return_value=Response(200, json={'embeddings': [[0.5, 0.25]] * count})
+        )
+        with pytest.raises(ProviderBatchSizeMismatch, match=f'{count} vectors for 1 input'):
+            await provider.embed_one('a query')
+        assert route.call_count == 1

@@ -4,7 +4,10 @@
 > `src/services/rate_limits.py`, `src/services/refusals.py`, the failed-auth
 > budget in `src/mcp_server/auth.py`, the gate order in `_tracked`
 > (`src/mcp_server/tools.py`), or any `MCP_RATE_LIMIT_*` /
-> `MCP_AUTH_FAILURE_*` / `DEFAULT_DAILY_REQUEST_LIMIT` setting. The
+> `MCP_AUTH_FAILURE_*` / `DEFAULT_DAILY_REQUEST_LIMIT` setting — and, for the
+> concurrency half, `src/services/concurrency.py`, `pool_budget.py`,
+> `concurrency_counters.py`, `concurrency_readiness.py`, the pool subclass in
+> `src/database.py` and every `MCP_CONCURRENCY_*` setting. The
 > operator-facing marker register lives in
 > [usage attribution](usage-attribution.md); the daily quota's own history is
 > in there too.
@@ -28,13 +31,19 @@ nothing to slow it and nothing to tell it to stop.
 | L | Control | Where | Scope key | Default (setting) | Refusal | Marker |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Failed-auth budget | `APIKeyMiddleware`, before the credential lookup | address slot (salted fixed table) | 60 / 300 s (`MCP_AUTH_FAILURE_LIMIT`, `MCP_AUTH_FAILURE_WINDOW_SECONDS`; null ⇒ off) | HTTP **429** + `Retry-After` — **transport, not a tool result** | none; one WARNING per slot per window |
+| 1a | Request occupancy (#261, #188) | `APIKeyMiddleware`, before auth session through ASGI completion | global / presented-bearer fingerprint | 64 / 20, waiters 64 / 16, sharing one 2 s transport deadline with 1b; mode default **shadow** | enforce: transport 429 after the deadline or on waiter overflow; queue: admitted with an overrun; shadow: observation only. A disconnected waiter is released at once | `mcp_concurrency_pressure` event; request-level `concurrency_counters`; authenticated observations can accompany tool rows |
+| 1b | Auth-session occupancy (#261, #188) | around the middleware's own DB session only | global | 2, waiters 32, same deadline as 1a | enforce: transport 429 before opening a session; queue/shadow as 1a | same transport event and counters |
+| 1c | Body-memory budget (#322) | `APIKeyMiddleware`, after authentication and the auth permit, before the app reads a byte; **POST only** | process (two lanes: ≤ 1 MiB small, the rest large) | cgroup limit × 0.5 ÷ 8 (128 MiB on 2 GiB), 15 s wait, 8 waiters; **always on, every mode** | transport **429** `code: body_memory` + `Retry-After: 2`; **413** for a declared length above the per-request limit | `mcp_concurrency_pressure`, `reason: body:memory`; **not** in `concurrency_counters` |
 | 2 | General velocity bucket | `_tracked`, first gate | principal | 120/min, burst 30 (`MCP_RATE_LIMIT_PER_MINUTE`, `MCP_RATE_LIMIT_BURST`) | in-band, sentinel line | `rate_limited`, scope `principal` — **coalesced** |
 | 3 | Write velocity bucket | `_tracked` (write tools) **and** `PUT /transfer/upload` | principal | 60/min, burst 15 (`MCP_WRITE_RATE_LIMIT_PER_MINUTE`, `MCP_WRITE_RATE_LIMIT_BURST`) | in-band on a tool; **429** on the transfer route | `rate_limited`, scope `principal_write` — **coalesced** |
 | 4 | Vault admission (#66) | `_tracked` | user | — | in-band | `no_vault_assigned` (and the three vault-root quarantine markers, #199) |
 | 5a | Unencodable-argument screen (#149) | `_tracked` | argument | — | in-band | `argument_not_encodable` |
-| 5b | Query length cap | `_tracked`, beside 5a | argument | 8,192 (`MAX_SEARCH_QUERY_CHARS`) | in-band | `argument_too_long` — **own row** |
+| 5b | Query and import-URL length caps | `_tracked`, beside 5a | argument | 8,192 (`MAX_SEARCH_QUERY_CHARS`; `MAX_IMPORT_URL_CHARS` for `import_from_url`'s `url`, #322) | in-band | `argument_too_long` — **own row** |
+| 5c | Atomic tool slots (#261, #188) | `_tracked`, after argument screens and before quota | class / principal / tenant / global | classes embedding 1 / vector 1 / write 1 / scan 2 / light 4; principal 3 / tenant 4 / global 6; 5 s wait; mode default **shadow** | enforce: in-band sentinel after the wait; queue: admitted with an overrun, call runs; shadow: call runs | `slot_timeout`, coalesced, only for actual enforcement refusals; `concurrency_shadow` / `concurrency_queue` annotate otherwise |
 | 6 | Daily quota (#162) | `_tracked`, last pre-body gate | api key | 5,000 for **new** keys (`DEFAULT_DAILY_REQUEST_LIMIT`) | in-band | `over_quota` |
 | 7 | Provider input rejection | inside the body, on the provider's answer | argument | the provider's own limit | in-band, `argument_too_long` **code** | `provider_input_rejected` — **post-body** |
+| K | Key-creation budget (#323) — *upstream of every row above: it bounds how fast new principals appear* | `POST /api/keys` **and** `POST /admin/keys/create`, after validation, the unlimited rule and the cap | account (exact) **and** trusted address, both must admit | 10 / account and 20 / address per 3600 s (`KEY_CREATION_ACCOUNT_LIMIT`, `KEY_CREATION_ADDRESS_LIMIT`, `KEY_CREATION_WINDOW_SECONDS`; null ⇒ that counter off) | JSON **429** + `Retry-After`; form flash + 303 | `key_creation_throttled` event; no `usage_logs` row |
+| K2 | Active-key cap (#323) | the same two routes, under a `users` row lock | non-admin account | 25 active keys (`KEY_MAX_ACTIVE_PER_ACCOUNT`; null ⇒ off); admins and single-user exempt | JSON **409**; form flash + 303 | none — an ordinary, visible quota |
 
 The eight write-class tools (L3) are `create_note`, `edit_note`, `move_note`,
 `delete_note`, `set_frontmatter`, `write_file`, `delete_file` and
@@ -72,7 +81,7 @@ middleware, which binds a principal or answers 401/429. The failed-auth budget
 
 ## Gate order, and the invariant it preserves
 
-L2 → L3 → L4 → L5 → L6 (quota) → body.
+L2 → L3 → L4 → L5a/b → L5c (slots) → L6 (quota) → body → telemetry.
 
 - **A token is not a quota slot.** A rate token refills, so consuming one on a
   call a later gate refuses is correct — the refusal itself costs work. The
@@ -85,8 +94,29 @@ L2 → L3 → L4 → L5 → L6 (quota) → body.
   keeps its #162 position as the **last** pre-body gate, so a call refused for
   having no vault, for an unencodable argument, for an over-long query — or now
   for exceeding its rate — consumes no daily slot. Its `quota_counters` row is
-  untouched. Removing the once-proposed concurrency slots restored this to
-  exactly the shape #162 designed, with one more gate above it.
+  untouched. The atomic slot gate (#261) also precedes quota, and an admitted
+  lease stays held through the response-neutral telemetry tail, releasing in
+  `finally` on success, quota refusal, exception or cancellation. Waiting holds
+  neither partial permits nor a DB connection. "Durable" means the daily
+  quota: a call refused for concurrency has already spent its rate tokens, and
+  they stay spent (#188 D9, below).
+
+**The order is unchanged by the request-path commits (performance-2026-09,
+#279), but the quota now commits asynchronously (L1, an owner decision taken
+by default).** `quotas.admit` issues `SET LOCAL synchronous_commit = off` before
+`ADMISSION_SQL`, and again before the prune in its own next transaction. An
+asynchronously committed increment is visible to every other session at commit,
+so the conditional increment under the row lock still admits exactly `limit`
+calls per key per UTC day under any concurrency
+(`tests/integration/test_perf_async_commit_pg.py` repeats the N-of-more-than-N
+case). What changes is durability across a PostgreSQL server or host crash:
+increments committed in the preceding ~600 ms can be lost. That undercounts the
+key, in the caller's favour. It can never overcount, and it can never refuse a
+call the synchronous form would have admitted. The admission is still fail
+closed and still emits `quota_admission_failed`, and a rate-refused call still
+issues no quota statement. Writes that grant or revoke (OAuth code exchange,
+refresh rotation, revocation, transfer tokens, users) stay synchronous; the
+rule is that only bookkeeping whose loss undercounts may commit asynchronously.
 
 Because L2/L3 sit *above* the vault gate, a call can be refused before its
 vault root is resolved, which the `mcp-request-routing` requirement did not
@@ -321,6 +351,35 @@ tick rather than after another whole interval; a requeue after an *immediate*
 failure adds to whatever has accumulated since. Exceptions count as failures:
 an exception is not evidence the row landed.
 
+**The one exception: a row the database rejects for its data is dropped**
+(#310). The requeue used to cover every failure, and that was a loop. The
+template captures the caller's arguments, and a NUL, a lone surrogate or a
+NaN in one of them made the INSERT fail with a class-22 SQLSTATE. A
+flush-path requeue restores the original start, so the same unstorable row
+was due again on the very next tick, forever: one failing INSERT and one
+`usage_log_failed` per tick until the process restarted. `params` is now
+rendered before every insert (see "What reaches `params` is rendered, not
+trusted" in [usage attribution](usage-attribution.md)), so this should not
+happen any more. The coalescer still classifies, as a fallback.
+`write_planned_row` calls `write_usage_row_outcome`, which returns
+`landed | failed | unstorable`. `unstorable` means the terminal insert failed
+with class 22, 54000 or a bare `UnicodeEncodeError`, by the indexer's own
+`poison_sqlstate`. Such a row is released **without** requeue: no window is
+re-created and nothing is added to an open window's `pending`. Its weight is
+reported by one `usage_refusal_row_dropped` emission attempt. Every other
+failure (writer permit refused, connection lost, an exception) is requeued
+exactly as before.
+
+So the exact Σ `(1 + suppressed)` invariant holds **while every row for a key
+is storable**. A dropped row's weight is accounted for only best effort. The
+event goes through the suppressor, whose summary counts records, not their
+`count` weights, and it names neither the principal nor the scope, so two
+coalescer keys for one user and tool cannot be separated. That is accepted
+(design L3 in the archived change): it is reachable only through a renderer
+defect. A deterministic failure that carries **no** SQLSTATE (a serialisation
+`TypeError`) is still `failed` and still requeued (L5). Widening the drop to
+unclassified errors would risk dropping rows over transient faults.
+
 **In-flight rows pin their entry.** Planning increments an entry-local count;
 acknowledgement or requeue releases it. The idle sweep refuses an entry while
 that count is nonzero, even after a flush retired all its windows. Otherwise a
@@ -426,21 +485,109 @@ A `server_default` would be a schema change, would apply to every future insert
 path, and still could not express "grandfather the rows that exist".
 **Existing keys are untouched.**
 
-- **JSON API.** Omitted vs. explicit-`null` is distinguished by
-  `model_fields_set`, not by truthiness: an omitted field means the default, an
-  explicit `null` still means **unlimited**, and an explicit value wins. The
-  setting is read per request, never captured at import.
-- **Panel.** The default is materialised only as the create form's pre-filled
-  value. A blank submitted field is an explicit unlimited with **no POST-side
-  substitution**, so the operator's last view of the field is what the key
-  receives. `keys_page` passes the default to the template; the create handler
-  never reads the setting. The edit path substitutes nothing, on either
-  surface.
+Since #323 (owner decision) the rule is the same on both surfaces, and lives
+once, in `src/services/api_keys.py` (`resolve_create_limit`,
+`resolve_edit_limit`), which both create handlers and both edit handlers call:
+
+- **A blank or omitted limit gets the default.** On the JSON API "omitted" is
+  told from explicit `null` by `model_fields_set`, never by truthiness. On the
+  panel a blank submitted field gets the default too; the form is still
+  pre-filled with it. Before #323 a blank form field meant unlimited, so a
+  scripted blank form minted principals with no daily quota at all.
+- **Unlimited is an administrator's explicit request only**: an explicit JSON
+  `null`, or the panel's `unlimited` box (`value="1"`, rendered for admins
+  only, and winning over any number sent beside it). A non-admin's request is
+  a 403 / flash recorded as `panel_forbidden` (`unlimited_requires_admin`) —
+  refused, never silently downgraded to a limited key.
+- **With the default null, a create that names no limit is refused** as
+  missing a required one (400 / flash). It no longer becomes unlimited.
+- **The edit path never applies the default.** A blank edit is a validation
+  error for everyone; only an admin clears a limit, explicitly.
+- The setting is read per request, never captured at import.
 
 **Why 5,000.** ~1,600 tool calls per 30 days across all credentials, so
 5,000/day is two orders of magnitude of headroom and cannot interrupt a real
 session, while a runaway stops the same day. At 120/min it takes ≥ 42 minutes
 to spend. It binds only keys created after this shipped.
+
+## Key creation is one budget across two representations (#323)
+
+Every new API key is a new `/mcp` principal, and a new principal starts with a
+full general (30) and write (15) burst. Until #323 only `POST /api/keys` was
+throttled (5/min per address, slowapi); `POST /admin/keys/create` was not, so a
+session plus its CSRF token could script it and reset both per-principal
+buckets at will — and, with a blank limit field, skip the daily quota too.
+
+**Why not slowapi.** slowapi namespaces its storage key by the decorated
+endpoint, so the same decorator on both routes is two independent buckets and
+a caller alternating JSON and form requests gets both allowances.
+`shared_limit` would share the bucket but charges every request that reaches
+the decorator — invalid names, non-admin unlimited attempts — so a typo would
+spend allowance, and its state would live in a backend nothing else here uses.
+
+**What it is.** `rate_limits.try_charge_key_creation(account_key, address)`,
+a synchronous function both handlers call, beside the login budget it copies:
+
+- **Two counters, both must admit, charged together.** One keyed **exactly**
+  on the authenticated account — `("user", users.id)`, or `("single-user",)`
+  for the sentinel, whose id is None — and one on the trusted client address
+  (`request.client.host` after `ProxyHeadersMiddleware`; no address is one
+  shared `None` bucket, a bound rather than a bypass). Neither subsumes the
+  other: rotating addresses must not outrun the account counter, rotating
+  accounts must not outrun the address counter. Both are checked, then both
+  are incremented, with no `await` between — atomic on the single loop. If
+  either refuses, neither is charged.
+- **Fixed windows** opened by a counter's first charge,
+  `KEY_CREATION_WINDOW_SECONDS` (3600). A fixed window can admit up to 2× the
+  limit across a boundary (L3, accepted; the login budget's shape).
+- **Charged last.** The order on both routes is: auth and CSRF → pure
+  validation and the unlimited rule → the active-key cap → the budget →
+  insert. A refused check spends no allowance; a cap refusal spends no
+  velocity. A charged creation whose commit then fails is not refunded (L2: a
+  refund path is a second piece of state to get wrong, and over-charging is
+  the safe direction).
+- **Admins are subject to it.** A scripted admin session is where it matters
+  most. Not a lockout: the window heals itself and a restart clears it.
+- **Refusals.** JSON: 429 with `Retry-After` (seconds until the refusing window
+  ends, never more than the window) and a `detail` naming the wait, not the
+  counter. Form: a flash and a 303 to `/admin/keys`. Either way no row is
+  written and one `key_creation_throttled` event is emitted, its suppression
+  subject the same exact account identity (never the address — the sentinel
+  has no id, and an address subject would give a rotating caller fresh log
+  allowance). The JSON route's 5/min slowapi limit stays, in addition.
+- **The refusal records an actor captured *before* the rollback (#332).** The
+  rollback that releases the cap's row lock expires the acting `User`, which
+  was loaded through the same request session; reading `user.id` after it is a
+  lazy load — `MissingGreenlet`, so the refusal became a 500 and the event was
+  never emitted. Both routes take `actor_snapshot(user)` first and hand that to
+  `_log_key_creation_throttled`. Do not move the snapshot below the rollback,
+  and do not "simplify" it back to passing `user`: the hermetic tests use a
+  `SimpleNamespace` that nothing can expire, so only
+  `tests/integration/test_issue_332_rollback_expiry_pg.py` (and the expiring
+  stand-in in `tests/test_issue_332_refusal_after_rollback.py`) would notice.
+
+**The active-key cap bounds the stock, not the flow.** At 10/hour a non-admin
+could add 240 keys a day and thousands a month, each with its own bursts, which
+defeats the per-principal buckets another way and pushes towards
+`MCP_LIMITER_MAX_TRACKED_PRINCIPALS`. `KEY_MAX_ACTIVE_PER_ACCOUNT` (25)
+counts `is_active` keys — revoked keys do not count, expired-but-unrevoked keys
+do — inside the creating transaction under `SELECT … FOR UPDATE` on the
+owning `users` row, so concurrent creates cannot overshoot it. Admins and the
+single-user operator are exempt (L7). An account already over it is
+grandfathered: nothing is revoked, and its next create is refused until it
+revokes below the cap. A refusal is 409 / flash naming the cap and the remedy,
+and is not a security event.
+
+**Rollback** is configuration: null `KEY_CREATION_ACCOUNT_LIMIT`,
+`KEY_CREATION_ADDRESS_LIMIT` and `KEY_MAX_ACTIVE_PER_ACCOUNT`.
+`KEY_CREATION_WINDOW_SECONDS` stays a valid integer (it is inert with both
+counters off). The blank/null limit semantics are code; only an image rollback
+restores "blank or null means unlimited for anyone".
+
+**Related, out of scope (L6).** OAuth grants are principals too and can be
+minted with no creation budget beyond the `/register` and `/token` address
+throttles, and they carry no daily quota. Same class of finding on a different
+surface; recorded as an owner question, not closed silently.
 
 ## The quota's retry interval comes from the admission's own clock read
 
@@ -473,10 +620,10 @@ a comment there recording the decision.
 Three details make the in-app control correct.
 
 - **The address comes from `ProxyHeadersMiddleware`**, which is added on the
-  app and therefore wraps the mount, and is honoured only for peers inside the
-  trusted private ranges (`--forwarded-allow-ips`). A budget keyed on a
-  spoofable header is **worse than none**; `request-trust`'s restricted
-  proxy-header requirement is the dependency.
+  app and therefore wraps the mount, and is honoured only for the peers
+  `TRUSTED_PROXY_IPS` names. A budget keyed on a spoofable header is **worse
+  than none**; `request-trust`'s restricted proxy-header requirement is the
+  dependency.
 - **Every 401 branch increments** — missing bearer, unknown credential,
   ownerless, inactive user, expired, cross-user grant, missing vault scope —
   because a prober picks the cheapest one, and a budget covering six of seven
@@ -508,6 +655,108 @@ against credential guessing; #194's own verification withdrew that (256-bit
 > failures / 5 minutes — no working client fails 60 times in 5 minutes), by
 > `MCP_AUTH_FAILURE_LIMIT=null`, and by the one WARNING naming the address the
 > first time a slot engages.
+
+## The panel login budget is keyed by account, exactly, and is not a lockout
+
+`POST /admin/auth/login` keeps its 5/min per-address slowapi limit and gains a
+per-**account** failed-attempt budget beside it (#189). The two are additive
+and neither subsumes the other: an address-keyed limit hands an attacker a
+fresh allowance for every address they can rotate through, and an
+account-keyed limit alone lets one address walk many accounts.
+
+**slowapi cannot express it.** `src/limiter.py` says why in as many words: its
+`key_func` is synchronous and runs before the handler, and the submitted
+username is in the form body — reading it there would consume the stream the
+handler needs. So the budget lives in `src/services/rate_limits.py`, next to
+the other in-process controls.
+
+**It does not reuse the salted slot table, and that is the load-bearing
+decision.** That table merges colliding keys, which is a *bound* for the `/mcp`
+failed-auth budget — addresses are unbounded and free to mint, so a shared slot
+only makes the control stricter and nobody can choose whom to collide with. For
+this key space it would be a **cross-account denial**: ten failures against a
+colliding name would refuse a different account's *correct* password, and an
+attacker submitting random non-existent usernames could saturate every slot
+without knowing any victim's name. The budget is therefore a plain
+`dict[users.id, window]` — exact keys, no salt, no capacity policy to get
+wrong — swept on access so it holds at most one counter per account that has
+failed recently. The key space is the users table, which is small and
+administrator-controlled; that is the whole bound.
+
+A failure is counted **only when the submitted username resolves to a row**.
+There is nothing to brute-force behind a name that matches no account, so there
+is nothing to bound, and those attempts stay under the address limit alone —
+which is what makes "a different username is unaffected" literally true rather
+than probabilistically true. Keying is by row and not by the `is_active` flag,
+so budget behaviour never becomes a side channel for account state.
+
+The check runs **after** the user lookup, because it needs the id, and
+**before** `verify_password`, because a budget consulted after the comparison
+bounds nothing — the guess has already been answered.
+
+**Four properties make it a bound rather than a lockout.** Only failures are
+counted and the window is short (ten in fifteen minutes, self-healing, no
+durable state, no administrative unlock). An authenticated session is
+unaffected — `login_form` short-circuits a valid session to the panel, so a
+flood can delay a *fresh* password sign-in and nothing else. The threshold sits
+far above a human typo rate and far below an online guessing budget worth
+having. And the refusal is equivalent in content to an ordinary failed login.
+
+**"Equivalent in content" has an exact scope, and it excludes two things.**
+Equivalence means the same HTTP status, the same rendered template and the same
+user-visible message for the same submitted inputs — a 401 login page, never a
+429. Excluded: **timing**, because a throttled attempt skips bcrypt, and part
+of that signal is new (for one active account, attempts 1–10 run the comparison
+and attempt 11 does not, so an observer who can time responses can tell an
+exhausted budget from an unexhausted one for a name they already know exists);
+and **per-response nondeterminism** — a freshly rendered page carries a CSRF
+token and may carry a session cookie, which differ between any two responses.
+The guarantee is over response content, and it is stated that way rather than
+as an unqualified "only the log knows". The only place the distinction is
+recorded is `panel_login_account_throttled` (see
+[security event logging](security-event-logging.md)), whose subject is the
+client address and never the submitted username.
+
+What remains, stated rather than hidden: a sustained flood can deny *password*
+sign-in for one named account for the flood's duration plus the window.
+Accepted, strictly preferable to unbounded per-account guessing against
+credentials that guard other tenants' vaults, and recoverable without waiting
+by restarting the container — which clears in-process state, like every other
+control in this file.
+
+## Proxy trust is one setting, canonicalised, and uvicorn's layer is off
+
+Every control in this file keys on the address `ProxyHeadersMiddleware`
+resolves, so the list of peers allowed to set `X-Forwarded-*` is part of the
+rate-limit design and not an unrelated deployment detail. It was expressed
+twice and inconsistently until #189: a hard-coded literal in `src/main.py` and
+a `--forwarded-allow-ips` in the `Dockerfile` that excluded the real proxy
+subnet and was therefore inert.
+
+`TRUSTED_PROXY_IPS` (pydantic, CSV or JSON) is now the only statement of it.
+Its default is exactly the previously effective list, so a deploy that changes
+no environment value changes no client-IP resolution. Narrowing it to the
+proxy's own address is an operator decision that must not need a code change —
+the deployment's Docker network is shared with containers that run user-
+supplied code by design, and any of them can forge the header.
+
+**uvicorn's layer is switched off (`--no-proxy-headers`), not aligned.** Merely
+agreeing is a state an operator can break from the environment: uvicorn's
+`proxy_headers` defaults to *enabled* and its `forwarded_allow_ips` reads
+`$FORWARDED_ALLOW_IPS`. One control means one control.
+
+**Entries are stored canonicalised, and that is not cosmetic.**
+`ip_network("192.168.0.10/24", strict=False)` accepts host bits and answers
+`192.168.0.0/24`, but the un-canonicalised string is what uvicorn's stricter
+parse rejects, keeping it as a literal that matches no peer. The failure is
+silent and inverts the intent: every proxied request then retains the *proxy's*
+address, so all callers collapse into one limiter bucket. `Settings` therefore
+stores `str(ip_network(...))` — a bare address stays bare — and the regression
+test drives that case through the **real** installed middleware rather than
+through our own parser. A malformed entry refuses startup naming it; a trust
+list that quietly loses a range is worse than one that fails. The effective
+canonical list is logged once at startup, because a trust boundary nobody can
+read from the logs is a trust boundary nobody audits.
 
 ## Limiter state is bounded by construction, and each registry says how
 
@@ -552,11 +801,28 @@ last used.
 > fail-closed was rejected (it turns a bookkeeping cap into an outage for a
 > legitimate credential).
 
+**Accounts** are the third key space and the only **exactly** keyed one. The
+panel login budget is a plain dict keyed on `users.id`, swept on access, so it
+holds at most one counter per account that has failed recently and cannot grow
+with the number of usernames an attacker submits. No table, no salt, no cap:
+merging two keys here would refuse an unrelated account's correct password,
+which is why the salted address table is deliberately not reused for it.
+
+The **key-creation budget** (#323) has an account dict of the same shape —
+exact, keyed on `("user", users.id)` or the one fixed single-user key, swept on
+access — and beside it an **address** dict that is exact too, without being a
+salted table, because it is charged only on an *admitted* creation: it holds at
+most one entry per admitted creation in the window, which is at most accounts ×
+the account limit, so an attacker cannot grow it without a session and spent
+account allowance. Refused attempts create no entry in either dict.
+
 ## Limiter state is in-process, and `--workers 1` is part of the contract
 
-All bucket, coalescing and failed-authentication state lives in the worker
-process and is **not** persisted, replicated or shared. A restart begins with
-every bucket full and every counter zero.
+All bucket, coalescing, failed-authentication, panel-login-budget and
+key-creation-budget state lives in the worker process and is **not** persisted, replicated or shared. A
+restart begins with every bucket full and every counter zero — which is also
+the login budget's recovery path if an operator does not want to wait out a
+flood's window.
 
 That is sound because there is exactly **one** uvicorn worker; because
 instantaneous pressure is meaningless to persist across a process that no
@@ -598,9 +864,10 @@ allocated in full and is therefore a direct memory bound.
 so the boot failure names `ck_api_keys_daily_request_limit`'s 1..1,000,000
 rather than a bare field bound — the domain is what an operator has to satisfy.
 
-With the concurrency lattice deferred there is no pool equation and no
-class-sum rule left to check, and `src/database.py` is untouched. Settings
-validation enforces only:
+The original rate settings validate the following rules. The concurrency
+settings add hierarchy, coherence and per-class pool-budget validation,
+described under concurrency below; pool sizes remain 5 + 10, shared constants
+consumed by the engine and validation.
 
 - each bucket's rate and burst are **both set or both null** — a rate with no
   burst is not "a bucket with a default burst", it is a control an operator
@@ -633,62 +900,553 @@ the page to see. The full reading rules are in
 | `MCP_AUTH_FAILURE_LIMIT` | `60` | Failed `/mcp` authentications per address per window before a 429. Null disables. |
 | `MCP_AUTH_FAILURE_WINDOW_SECONDS` | `300` | The window that limit is counted over. |
 | `MCP_AUTH_FAILURE_TABLE_SIZE` | `4096` | Counter slots in the salted fixed-size address table. Memory is O(size). |
+| `TRUSTED_PROXY_IPS` | `127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | The peers whose `X-Forwarded-*` headers are honoured — the address every control here keys on. CSV or JSON, stored canonicalised, empty trusts nobody. The only such control; uvicorn's is off. |
+| `PANEL_LOGIN_FAILURE_LIMIT` | `10` | Failed panel sign-ins one **account** may accrue per window before further attempts are refused without comparing the password. Null disables. |
+| `PANEL_LOGIN_FAILURE_WINDOW_SECONDS` | `900` | The window that budget is counted over. |
 | `MCP_RATE_LIMIT_PER_MINUTE` | `120` | Sustained tool calls per minute per principal. Null (with the burst) disables the general bucket. |
 | `MCP_RATE_LIMIT_BURST` | `30` | Capacity of the general bucket. |
 | `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `60` | Sustained vault-mutating calls per minute per principal (the eight write tools plus `PUT /transfer/upload`). |
 | `MCP_WRITE_RATE_LIMIT_BURST` | `15` | Capacity of the write bucket. |
 | `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals holding their own limiter entry before the shared overflow entry. |
 | `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one coalescing window stays open. |
-| `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** key receives when the caller does not say otherwise. Null creates unlimited keys. |
+| `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** key receives when the caller names none (omitted JSON field, blank form field). Null makes the limit **required** on create; unlimited is only ever an administrator's explicit request (#323). |
+| `KEY_CREATION_ACCOUNT_LIMIT` | `10` | Keys one **account** may create per window, across both creation routes. Null disables the account counter. |
+| `KEY_CREATION_ADDRESS_LIMIT` | `20` | Keys created from one trusted client address per window, across both routes and all accounts. Null disables the address counter. |
+| `KEY_CREATION_WINDOW_SECONDS` | `3600` | The fixed window both key-creation counters are counted over. Not nullable: disable the counters instead. |
+| `KEY_MAX_ACTIVE_PER_ACCOUNT` | `25` | Active keys a **non-admin** account may hold; creation beyond it is refused (409 / flash). Admins and single-user exempt. Null disables. |
 | `MAX_SEARCH_QUERY_CHARS` | `8192` | Module constant, not a setting: the longest `query` `keyword_search` / `semantic_search` accept. |
+| `MAX_IMPORT_URL_CHARS` | `8192` | Module constant, not a setting: the longest `url` `import_from_url` accepts (#322). Not the memory bound. |
+| `MCP_BODY_MEMORY_BUDGET_BYTES` | unset | The body-memory budget in bytes (≥ 64 MiB). **Unset means derive, never off**; refused at startup above the safe allocation of a readable cgroup limit. |
+| `MCP_BODY_MEMORY_FRACTION` | `0.5` | Share of the cgroup limit given to request bodies, 0.1–0.5. |
+| `MCP_BODY_MEMORY_MULTIPLIER` | `8` | Peak memory per raw body byte, 8–32; 8 is the measured floor. |
+| `MCP_BODY_BUDGET_WAIT_SECONDS` | `15` | How long a body that does not fit waits before its 429, 0–60. |
+| `MCP_BODY_BUDGET_WAITERS` | `8` | Body waiters across both lanes, 1–256. |
 
 Every nullable one accepts an **empty value**, `null` or `none` as "off". Zero
-is refused at boot.
+is refused at boot. The `MCP_CONCURRENCY_*` settings are not nullable (`off` is
+a mode); their defaults are under concurrency below, and `.env.example` carries
+the full block.
 
-## What is deliberately absent: concurrency
+## Concurrency: four modes, earned one step at a time (#261, #188)
 
-**Nothing here bounds concurrency.** Every concurrency control — the
-pre-authentication in-flight ceilings (identity-blind, per-credential
-fingerprint, and the authentication-concurrency semaphore), the per-class /
-per-tenant / per-principal / global tool slots, the `slot_timeout` refusal, and
-the boot validator that checked those numbers against the connection pool — was
-removed from this change and deferred to a follow-up, `mcp-concurrency-slots`.
+`src/services/concurrency.py` owns one process controller with four admission
+points: the **request envelope** and the **auth permit** in
+`APIKeyMiddleware` (the transport stages), the **tool lattice** in `_tracked`,
+and the **writer permit** around every `write_usage_row`. Keep one worker. The
+earlier rate-limit change deferred these controls because authentication,
+rotating credentials and refusal logging each exposed holes in partial designs;
+#261 built them in shadow, and #188 (`concurrency-enforce-ready`) made
+enforcement reachable.
 
-**Why.** Three successive cross-family review rounds each produced a *new
-class* of finding in exactly that area — first the pool being exhaustible on
-the authentication path itself, then tenant-level admission reachable through
-rotated tokens, then the refusal rows' own pool usage. Each round's fix was
-locally correct and each opened a fresh interaction between admission ceilings,
-the 5 + 10 pool and the slot lattice. That pattern is the engineering
-workflow's non-convergence signal: it means the design is a heuristic being
-tuned, not a rule being stated, and the right response is to stop adding rounds
-and narrow the change. **Rate limiting needs no arithmetic against the pool and
-no lattice; concurrency limiting needs both**, and it deserves its own change
-with its own review budget.
+| Mode | Waits | Where `enforce` would refuse for capacity | Row annotation |
+| --- | --- | --- | --- |
+| `off` | never | no accounting at all | none, not even provenance |
+| `shadow` (**default**) | never; the configured waits are only *reported* | the call runs; the miss is recorded as pressure | `concurrency_shadow` |
+| `queue` | exactly as `enforce`: deadlines, waiter bounds, eligible FIFO | the lease is **granted** with an `overrun` mark | `concurrency_queue` |
+| `enforce` | bounded | transport 429, in-band `slot_timeout`, or a dropped audit row at the writer | the refusal row |
 
-**How it will ship.** `mcp-concurrency-slots` ships in **shadow mode first**:
-the slots are computed and the would-be refusal is recorded in `usage_logs` —
-the same markers, a `shadow: true` flag — while every call still runs. Only
-after a period of real traffic shows what the ceilings would actually have
-refused does enforcement turn on. That is the correct order for a control whose
-failure mode is refusing a legitimate agent, and it is only possible because
-the observability half of this change landed first.
+**Promotion is an operator `.env` edit and a recreate, never automatic**, and
+each step is earned with durable numbers (the rollout below). **Rollback is one
+line**: `MCP_CONCURRENCY_MODE=<previous>`. That is why every other setting
+validates identically in all four modes — the old rule "shadow requires
+`MCP_CONCURRENCY_WAIT_SECONDS=0`" is gone, and shadow reports the waits it did
+not apply as `configured_wait_ms` instead — and why the **epoch** (below)
+excludes the mode: evidence collected in shadow stays attributable to the
+configuration queue then runs.
 
-**What holds meanwhile.** The one *proven* pool-exhaustion path —
-`PUT /transfer/upload` re-checking out a connection and holding it across a
-semaphore wait and the whole body stream — was closed by **#208**. Concurrency
-on the tool surface remains unbounded until the follow-up ships; a bounded
-arrival rate bounds how fast concurrency can build, which is a mitigation and
-not a bound.
+**Why shadow alone could not be flipped.** The shadow window of 2026-09-13 to
+09-21 (8.2 days, 1,073 calls, two tenants, all defaults) said enforcement as
+built would have refused about **9.6 % of legitimate tool calls** as
+`slot_timeout` (`read_note` 71, `keyword_search` 16, `get_vault_guide` 14) and
+answered up to ~153 requests with a transport 429. Five blockers followed: the
+transport stages could not wait; the pool budget was exactly saturated so only
+one configuration validated, pinning `other = 1` for 15 of the 25 tools; the
+shadow `code` was the *last* observation, under-reporting tool pressure ~11×;
+nothing surfaced the data; and a writer wait extends every slot hold with no
+evidence of what that costs. PGDATA then moved to NVMe (2026-09-23, commits
+~40–100 ms → ~2.5 ms), so **no pre-change row is evidence for any flip** — the
+evaluator excludes them unconditionally — but they remain evidence about the
+shape: zero-wait ceilings of 1–2 refuse an agent's ordinary parallel reads. A
+false refusal of a legitimate agent call breaks the live path, so the design
+**waits within bounded time before refusing**.
 
-Two findings were carried forward to that change rather than answered here: a
-per-tenant *reservation* for the embedding class (with two slots and N tenants
-there is nothing to reserve), and "acquire the global slot first, then narrow
-inward" (global-first makes a task hold the global slot while waiting for a
-class slot, so one saturated class parks tasks that block every tenant).
+### The transport stages wait, within one deadline, and notice a disconnect
+
+The request envelope admits global + bearer-fingerprint dimensions together,
+before any DB lookup, and its lease lasts until the whole downstream ASGI
+request finishes — GET/SSE streams, initialization and notifications included.
+SHA-256 fingerprints stay in bounded memory and are erased when their last
+reference drains. The separate **auth permit** encloses only the middleware's
+own session, cache warming and teardown included; even an invalid-auth
+response is sent after that session and permit have closed. The auth permit is
+**kept** rather than left to the pool: the pool's own queue is a 30 s timeout
+ending in a 500, shared with the panel and `/token`.
+
+- **One deadline for both stages**, `MCP_CONCURRENCY_TRANSPORT_WAIT_SECONDS`
+  (default 2, max 5), started when the middleware first asks for the request
+  lease. Waiters are bounded: request 64 (global) and fingerprint 16, auth 32.
+  A request waiting for the envelope holds a registry reference only; one
+  waiting for the auth permit holds its request lease; **neither holds a DB
+  connection**. Queueing is cheap now and refusing is not: at auth 2 and ~5 ms
+  per session, a 2 s deadline drains ~800 queued authentications.
+- **In `enforce`, deadline expiry or waiter overflow** returns the existing
+  transport 429 (`code`, `scope`, `limit`, `Retry-After: 1`), outside the
+  in-band refusal contract. It queries no credential and writes no usage row.
+- **A disconnect is not a cancellation.** uvicorn reports a client leaving
+  through ASGI `receive`; it never cancels the middleware's coroutine, so a
+  waiter nobody reads for would learn only at its deadline — and could then
+  authenticate for nobody. `ReceiveWatch` (`src/mcp_server/auth.py`) is
+  therefore the **only caller of `receive`** from the first wait until
+  transport admission ends. It keeps reading **past `more_body: false`** —
+  after the last body message the next `receive` blocks until the client
+  leaves, which is exactly what it is waiting for (a watcher that stopped at
+  the complete body missed that disconnect, SR2-1). `http.disconnect` releases
+  the waiter, the references and any request lease at once; no credential
+  query, no response. The middleware checks the flag again after the auth
+  grant and before opening its session.
+- **Every consumed message is replayed, intact.** Messages are appended as
+  received — never dropped, split, merged or reordered. The handoff cancels
+  and awaits the watcher (a completed `receive` is already in the list because
+  the append precedes the next await; a cancelled pending one consumed
+  nothing), and the app's `receive` yields the list and then delegates.
+- **Memory is a process-wide replay budget, not a per-request cap.**
+  `MCP_CONCURRENCY_REPLAY_BUDGET_BYTES` (32 MiB, range 1–256 MiB). When it is
+  exhausted the watcher **stops calling `receive`** and keeps what it holds, so
+  nothing is ever lost; that request is then deadline-bounded (≤ 5 s) instead
+  of disconnect-aware (L8). The per-request alternatives failed review: a
+  64 KiB cap that drops the crossing message is lossy, because a message is
+  sized only after `receive` consumed it (SR2-2), and "body limit × waiters" is
+  61 MiB (`mcp_max_request_body_bytes`; the SDK's 4 MiB default does not apply
+  here) × 96 ≈ 5.7 GiB. The honest bound is **budget + 96 waiters × one uvicorn
+  message**, and one message is at most `HIGH_WATER_LIMIT` (64 KiB, the point
+  at which uvicorn pauses reading and hands back everything accumulated) plus
+  one socket read (256 KiB) ≈ 320 KiB — **≈ 62 MiB** (L11, SR3-2). A guard test
+  pins `HIGH_WATER_LIMIT == 65536`; a uvicorn upgrade that changes it, or the
+  loop's read size, must re-derive the figure.
+
+### Five tool classes, each with an independent ceiling
+
+| Class | Tools | Ceiling | Connections |
+| --- | --- | --- | --- |
+| `embedding` | `semantic_search` | 1 | 1 |
+| `vector` | `find_related` | 1 | 1 |
+| `write` | the eight write-class tools (L3) | 1 | 2 |
+| `scan` | `keyword_search`, `list_notes`, `get_tags`, `get_neighborhood`, `find_orphans`, `list_files` | 2 | 1 |
+| `light` | `read_note`, `read_file`, `get_recent`, `get_vault_guide`, `get_backlinks`, `get_links`, `request_upload`, `check_upload`, `request_download` | 4 | 1 |
+
+#261's `other` held 15 of the 25 tools and was pinned to 1. Raising it alone
+would let one tenant's scans hold every cheap-read slot, so it was split by
+cost. `MCP_CONCURRENCY_OTHER=1` — the old `.env.example` value, which expressed
+no intent — is ignored with one WARNING; any other value is refused at boot,
+naming `MCP_CONCURRENCY_LIGHT` and `MCP_CONCURRENCY_SCAN`. Unknown
+registrations cannot silently land in a class. `CLASS_MAPPING_VERSION` is part
+of the epoch, so rows from another classification never mix into one window.
+
+A tool acquires class, tenant, principal and global counters in **one
+non-awaiting transition**, after the argument screens and before quota. A
+queued call holds none of those permits. Eligible FIFO wakes the oldest call
+that can acquire **all** dimensions, so a saturated class cannot park global
+capacity. Tenants are authenticated user IDs (with one stable NULL-owner
+identity); principals are key IDs or OAuth grant IDs, so a refresh cannot reset
+them. There is no per-tenant embedding reservation or starvation SLA: one
+embedding slot cannot reserve work for N tenants.
+
+The tool wait is one monotonic deadline (`MCP_CONCURRENCY_WAIT_SECONDS`,
+default 5, max 10). Zero means immediate admission or refusal, not disabled
+control. Grants transfer ownership before waking a waiter, a grant racing the
+timeout grants exactly once, and cancellation before or after a grant returns
+every captured lease. Registry overflow is sticky while any overflow lease **or
+waiter** exists; unknown identities share the overflow entry until it drains,
+so an active identity cannot obtain fresh capacity. Dedicated entries have a
+bounded reverse index; no active entry is evicted or migrated.
+
+**Defaults:** requests 64 / fingerprint 20; auth 2; tools 6 / tenant 4 /
+principal 3; class ceilings as tabled; tool waiters 64 global / 32 tenant / 16
+principal; keyed registry 1024; writers 1 with 64 waiters and a maximum
+0.25 s wait. Writer admission is independent of the authenticated principal, so
+background and coalesced refusal flushes cannot bypass it. Writer leases cover
+the whole usage write including the FK retry; the failed session closes before
+the retry opens.
+
+### The pool budget: per-class multipliers, no class sum
+
+`src/services/pool_budget.py` is the single source: pool 5 + overflow 10, four
+connections of headroom, and `CLASS_CONNECTIONS` (write 2, every other class
+1). `tool_demand(tools, caps)` fills the `tools` slots highest multiplier
+first, which is the exact maximum of `Σ m·n` per class under `n ≤ cap` and
+`Σ n ≤ tools`. Settings refuse `auth + tool_demand + writers + 4 > 15` and name
+every term. At the defaults: **2 + 7 + 1 + 4 = 14**.
+
+- **The multiplier is measured, not assumed.** The non-write paths are
+  sequential: quota admission commits and releases before the body, the auth
+  session closes before the tool runs, and the usage write happens after the
+  body under the writer permit (budgeted in `writers`). A real-PG test drives
+  **every registered tool** through `_tracked` and asserts its per-task
+  checkout peak ≤ `CLASS_CONNECTIONS[class]`. A tool that measures higher
+  raises its class's multiplier here; it is not waved through. `write` stays
+  at 2 because its paths depend on input size (L7). #261's flat ×2, which
+  priced a `read_note` like a `move_note`, is gone.
+- **The class-sum rule is gone, and the bound did not weaken.** The global
+  `tools` counter already bounds total admitted tools and admission is atomic;
+  independent class ceilings (each ≤ `tools`) bound class *shares* — e.g.
+  `embedding` ≤ 1 protects the provider. Under the sum rule exactly one
+  configuration validated.
+- **This bounds MCP's configured contribution, not pool availability.** The
+  indexer, panel, OAuth and transfer share the pool and can consume the
+  headroom; it is not reserved (L4). Raising the pool was rejected: the
+  Postgres instance is shared, and the pool was never the measured bottleneck.
+
+### Coherence, and a log line because validation is not proof
+
+Besides the pool budget, the validator refuses a child above its parent
+(fingerprint ≤ requests, principal ≤ tenant ≤ tools, each class ≤ tools,
+principal ≤ tenant ≤ global tool waiters, fingerprint ≤ request waiters) and
+requires **`fingerprint ≥ principal + principal_waiters`**: one principal's
+admitted and waiting tools each hold a request lease, and the transport
+envelope must not refuse what the tool stage would have queued.
+
+A fully pinned legacy `.env` can still validate (`FINGERPRINT=4 ≥ PRINCIPAL 2 +
+PRINCIPAL_WAITERS 2`), so passing validation does not prove the intended
+settings are live. Startup therefore logs **one INFO line** — `MCP concurrency
+effective settings: mode=… epoch=… pool_demand=… limits=…` — and the deploy
+compares it with the intended block.
+
+### `queue`: a rehearsal that measures the real waits
+
+Every stage (request, auth, tool, writer) runs enforcement's admission. Where
+enforcement would refuse **for capacity** — deadline expiry, waiter overflow, a
+zero-wait miss — queue grants and marks the admission `overrun`. Only the
+concurrency outcome changes:
+
+- The call proceeds through the remaining gates, and they keep their
+  authority. An overrun followed by a quota refusal is an ordinary `over_quota`
+  pre-body refusal: no body, no quota consumed, classified exactly as before.
+  `concurrency_queue` only annotates; it never changes classification.
+- An overrun writes no `slot_timeout` row and returns no refusal. A writer
+  overrun still writes its row (and counts `writer_overrun`).
+- Shutdown refusal stays a refusal in every mode.
+- Queue bounds added latency, **not occupancy**: during an overrun occupancy
+  may exceed the ceilings, as in shadow (L1).
+
+A shadow counterfactual estimator was rejected: its estimate resolves after the
+row is written, and it is biased by calls enforcement would not have run. Queue
+measures the same quantity exactly.
+
+### The lease stays held through telemetry
+
+An admitted tool lease covers quota, the body and the response-neutral
+telemetry tail, released in `finally` on success, quota refusal, exception or
+cancellation. #188 proposed releasing it before telemetry, to stop a writer wait
+from extending the slot hold, and spec review rejected that (SR1-1):
+`write_usage_row` returns `False` after its 0.25 s writer wait and an ordinary
+completed-call row is not requeued, so a lease held through its own usage write
+is the backpressure that limits how fast further completed writes queue behind
+a slow writer. Early release reproduced a **lost audit row for a completed
+write** that the current lifetime saves — worse than a few milliseconds of slot
+hold. The coupling is bounded instead (≤ 0.25 s, and ~ms writer holds since
+NVMe) and **measured**: queue-mode `queue_ms` includes any writer-extended hold,
+so E1/E4 see it before enforcement is possible (L10). Worst-case added latency
+for one call is transport + tool + writer wait, **7.25 s** at the defaults
+(L3).
+
+### A concurrency refusal spends rate tokens, and no quota
+
+Gate order is buckets → vault → argument screens → tool slots → quota. A call
+refused at the slot gate has already spent a general-bucket token — and a
+write token for a write-class tool — as every later pre-body refusal has since
+#162 ("a tool that always fails would be free"). **The guarantee "nothing
+durable is consumed by a call that does not run" covers the durable daily
+quota (`quota_counters`) only.** Rate tokens are in-memory velocity state; they
+refill and are not refunded (L9). Refunding would need reservation machinery
+on the hottest path. Queue mode never refuses for capacity, so it never
+produces the case.
+
+### Durable evidence: provenance, event-time counters and a run watermark
+
+The flip question has to be answered from numbers that survive restarts and
+can be windowed, which neither in-process since-boot counters nor the rotating
+security-event log can give.
+
+- **Row provenance.** Whenever the mode is not `off`, every row `_tracked` and
+  its refusal, coalescer and failure paths write carries `params.concurrency =
+  {v: 2, mode, epoch}` — unpressured rows included, so a v2 row is
+  distinguishable from a legacy one. The **epoch** is the first 12 hex digits
+  of the SHA-256 of every `mcp_concurrency_*` setting except `mode`, plus the
+  class mapping version. Shapes: [usage attribution](usage-attribution.md).
+- **Transport, writer and pool outcomes** go to `concurrency_counters` in
+  event-time minute buckets (migration 028; the tables are in
+  [schema and migrations](schema-and-migrations.md)). Each `/mcp` request that
+  reaches admission counts once in `requests` and at most once more, by its
+  **worst** outcome (`transport_pressured` | `_waited` | `_overrun` |
+  `_refused`); `writer_overrun`, `writer_refused` and `pool_checkout_timeout`
+  are counts; `pool_high_water` and `transport_wait_max_ms` are bucket maxima.
+  A shutdown refusal is not a capacity outcome and is not counted as
+  `transport_refused` — otherwise every deploy would trip the enforce
+  rollback. An ownerless usage row per pressured request stays forbidden (#261:
+  it turns an unauthenticated flood into writes); the counters cost one
+  statement a minute.
+- **Pool timeouts are counted at the shared checkout boundary.**
+  `CountingQueuePool` (`src/database.py`) overrides `_do_get`, counts
+  `sqlalchemy.exc.TimeoutError` — the pool's own, not a provider's
+  `TimeoutError` — and re-raises the same object, for **every** engine
+  consumer: MCP auth, quota, tool bodies, usage writers, panel, `/token`,
+  transfer, indexer. Counting `tool_exception` rows would miss most of those
+  and confuse unrelated timeouts.
+- **One transaction a minute** drains the accumulator at `t`, upserts the
+  drained buckets under their original keys, and sets the run's
+  `completed_through = floor_minute(t)` — the **completed-interval watermark**.
+  A failed flush merges back under the original keys and does not advance it.
+  The shutdown flush (after the coalescer's `flush_all()`, before
+  `engine.dispose()`) sets it to exactly `t` with `clean_shutdown = true`. The
+  commit is synchronous; it does not join #279's allow-list. More than 60
+  unflushed minutes drops the oldest and marks the run `lossy`.
+- **Coverage.** A run covers `[started_at, completed_through]` unless lossy. A
+  gap between runs is covered **only after a clean shutdown**; after a hard
+  kill, OOM or crash it is uncovered however short the restart, because the
+  killed run's unflushed tail may have held incidents (L2; heartbeat spacing
+  could not tell a recreate from a kill, SR2-3). Bucket time is event time,
+  never flush time (SR2-4). Every evaluation boundary is a whole minute — start
+  rounded up, end rounded down, **clean-shutdown ends included**, because a
+  bucket is keyed by minute, epoch and mode rather than run, and an exact end
+  would pull a same-configuration successor's incident from the shared minute
+  into the earlier window (SR3-1).
+- **One source per numerator.** Tool-stage figures come only from usage rows;
+  transport, writer and pool figures only from counters. Nothing is counted
+  twice.
+
+### Readiness and the rollout
+
+`src/services/concurrency_readiness.py` holds one read-only `window_stats` and
+one pure `evaluate(stats, target)`; the `/admin/performance` verdict and `make
+concurrency-report` both call them, so they cannot disagree. A window
+qualifies only if it is **covered**, holds v2 evidence of **exactly one mode
+and one epoch** (the target's source mode and the configured epoch), meets the
+minimum length and call count, and ends at or before the durable watermark.
+Anything else gives INSUFFICIENT_DATA for **every** criterion, with the latest
+qualifying sub-window start — a quiet covered window is evidence, an uncovered
+one is not.
+
+**Step 0 — deploy in shadow.** Reconcile the deploy-dir `.env` concurrency
+block to `.env.example` (the old block pins #261's values and can still
+validate) and dry-run the settings against it with the new image. After the
+recreate, compare the startup INFO line with the intended block; `make
+db-check` must be clean after 028. Exercise one tool per class live, and
+confirm rows carry `params.concurrency`, the new run has a `concurrency_runs`
+row, and its `completed_through` advances each minute.
+
+**Step 1 — shadow → queue.** A covered window of **≥ 3 days** and **≥ 300
+executed calls**, all shadow, one epoch:
+
+| ID | Criterion (source) | Threshold |
+| --- | --- | --- |
+| Q1 | Tool-pressured executed calls / executed calls (rows) | ≤ 10 % |
+| Q2 | `transport_pressured` / `requests` (counters) | ≤ 5 % |
+| Q3 | `pool_checkout_timeout` (counters) | 0 |
+
+Tool pressure is read from the **observations**, never from `code`, so a row
+whose tool observation is not the first still counts.
+
+**Step 2 — queue → enforce.** A covered window of **≥ 7 days** and **≥ 1,000
+executed calls**, all queue, one epoch; each criterion must hold over the whole
+window **and** over its last 72 h:
+
+| ID | Criterion (source) | Threshold |
+| --- | --- | --- |
+| E1 | Distinct calls with a tool-stage overrun (rows) | ≤ max(1, 0.1 % of executed calls) |
+| E2 | `transport_overrun` requests (counters) | 0 |
+| E3 | `writer_overrun` (counters) | 0 |
+| E4 | Tool `queue_ms` p99 across executed calls (rows) | ≤ 500 ms |
+| E5 | Max tool `queue_ms` over every v2 row carrying one, including calls then refused pre-body (e.g. `over_quota`) / tool wait (rows); `transport_wait_max_ms` / transport wait (counters) | ≤ 0.5 each |
+| E6 | `pool_checkout_timeout` (counters); max `pool_high_water` | 0; ≤ 13 |
+
+**Rollback triggers**, checked daily for the first 7 days of each new mode:
+
+- **queue → shadow:** any 24 h with tool `queue_ms` p95 > 1,000 ms, or an
+  agent-side timeout attributable to queueing;
+- **enforce → queue:** any `transport_refused` > 0; weighted `slot_timeout` >
+  max(2, 0.2 % of calls) in any 24 h; or any `pool_checkout_timeout`.
+
+**`make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso]`** runs the
+evaluator inside the container from the database alone, for the configured
+epoch and the target's source mode (shadow for `queue`, queue for `enforce`).
+`DAYS` defaults to the target's minimum and must be in (0, 35] — the prune
+horizon; `END` defaults to the watermark, and an explicit end past it is
+INSUFFICIENT_DATA, so an unflushed tail is never certified. It prints a table
+and **one JSON line**, which is what gets posted on #188. Exit codes: **0**
+every criterion PASS; **1** any FAIL (FAIL outranks INSUFFICIENT_DATA);
+**2** INSUFFICIENT_DATA; **64** a usage error. The thresholds are module
+constants calibrated to ~130 calls a day across two tenants (L6): re-run the
+report after a tenant is added.
+
+### Lifecycle
+
+The lifespan installs the controller explicitly and logs the effective-settings
+line; requests never replace live state. It registers the run and starts the
+60 s counter flush (sandbox mode skips both). Shutdown refuses and wakes
+pending tool work, runs the coalescer's final `flush_all()`, then the clean
+counter flush, then closes writers before `engine.dispose()`. Captured leases
+release their own controller even across explicit lifecycle and test resets.
+No asyncio primitive is created at module import. Production saturation tests
+are prohibited: calibrate from shadow and queue evidence, and test enforcement
+only in isolated environments.
+
+### Accepted limitations (#188)
+
+- **L1** Queue bounds latency, not occupancy.
+- **L2** A hard kill loses up to ~60 s of counter increments; windows spanning
+  its gap read INSUFFICIENT_DATA, however quick the restart.
+- **L3** Worst-case added latency is transport + tool + writer wait (7.25 s).
+- **L4** The budget bounds MCP's configured contribution; headroom is not
+  reserved.
+- **L5** A shared credential is a shared fingerprint and principal.
+- **L6** Thresholds are calibrated to current traffic.
+- **L7** Per-class multipliers are measured on fixtures; `write` keeps 2.
+- **L8** While the replay budget is exhausted a waiting request is
+  deadline-bounded, not disconnect-aware, and one whose client left may
+  authenticate once. It never loses bytes.
+- **L9** Rate tokens spent before a concurrency refusal are not refunded.
+- **L10** Writer-extended slot holds remain; queue measures them.
+- **L11** Worst-case replay memory ≈ 62 MiB, derived from uvicorn's
+  `HIGH_WATER_LIMIT` and the loop's read size.
+
+## The body-memory budget is always on (#322)
+
+`/mcp` accepts bodies up to `mcp_max_request_body_bytes` — `max(2 ×
+MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB`, 61 MiB by default — so that
+a supported 25 MB `write_file` reaches the tool. That limit is per request.
+Before #322 nothing bounded the bytes in flight across requests, and every
+near-limit body is copied several times before any tool gate runs: the SDK's
+`RequestBodyLimitMiddleware` accumulates a `bytearray` and copies it to
+`bytes`, `json.loads` builds the string, Pydantic and FastMCP keep their own
+copies, and `_tracked`'s `named_params()` ran `import_from_url`'s logging
+transform (`urlsplit(str(url))`) on the full argument. The ASVS reproduction
+took RSS from 57 MiB to 456 MiB with one 60 MiB envelope (≈ 6.7×), so five
+synchronised requests from one write-capable credential, well inside its
+write burst, crossed the 2 GiB limit and restarted the only worker: every
+tenant down. The concurrency controller does not cover this: it counts
+requests, not bytes, and ships in `shadow`.
+
+`src/services/body_budget.py` is the bound. The requirements are in
+[`mcp-request-routing`](../../openspec/specs/mcp-request-routing/spec.md) and
+the design in the `mcp-body-budget` change (D1–D8, under
+`openspec/changes/archive/` once archived); what must not be undone:
+
+- **A memory-safety bound, not a tuning knob (D1).** Its own module, enforced
+  in every `MCP_CONCURRENCY_MODE` including `off`, with no shadow mode and no
+  off switch. Running it in shadow would leave the bug in place. Owner
+  decision, re-confirmed after the Codex spec review.
+- **Derived from the process's own cgroup limit (D2).**
+  `memory_budget = MCP_BODY_MEMORY_BUDGET_BYTES`, else
+  `floor(MCP_BODY_MEMORY_FRACTION × L)`, else 1 GiB when no limit is readable
+  (WARNING). `capacity = memory_budget // MCP_BODY_MEMORY_MULTIPLIER`, the
+  small lane is `capacity // 8`, the large lane the rest. 2 GiB → 1 GiB → 128
+  MiB → 16 / 112 MiB: one 61 MiB maximum write plus 51 MiB of other large
+  traffic, with 16 MiB always free for small requests. `L` is the minimum
+  finite `memory.max` on the process's own cgroup v2 path (from
+  `/proc/self/cgroup` and `/proc/self/mountinfo`) and its ancestors up to the
+  mount; only when v2 yields nothing, v1's `memory.limit_in_bytes` at the
+  memory controller's mount root.
+- **Overrides move only in the safe direction.** The multiplier's floor is
+  the measured 8 (fraction 0.8 × multiplier 4 on 2 GiB would admit five
+  61 MiB bodies, which is the reproduced OOM); the fraction's ceiling is 0.5;
+  and a budget above the safe allocation
+  `min(0.5 × L, L − (384 MiB + MCP_CONCURRENCY_REPLAY_BUDGET_BYTES))` of a
+  readable limit is refused. There is no setting that re-opens the OOM.
+- **Startup refuses an unusable budget, in the lifespan only.** CRITICAL and
+  exit 1 when the large lane cannot hold one maximum request body, the small
+  lane one 1 MiB envelope, or the budget exceeds the safe allocation. With the
+  defaults that means a container of at least ≈ 1.1 GiB. The check runs in
+  `body_budget.configure()` from the FastAPI lifespan (after the sandbox
+  branch), **never** in `Settings`: the k3s `alembic` initContainer imports
+  `src.config.settings` under its own 1 GiB limit, which derives a 56 MiB
+  large lane, and a check in `Settings` would fail every migration.
+  `tests/test_body_budget_config.py` pins both halves. Owner decision: the
+  refusal stays.
+- **Placement (D4).** In `APIKeyMiddleware`, after authentication (an
+  unauthenticated caller never holds or waits for budget), after the auth
+  permit (a body wait holds no database connection), before the app. uvicorn
+  applies flow control, so a body nobody `receive()`s costs at most
+  `HIGH_WATER_LIMIT` plus one socket read: a gate before the first app
+  `receive` really does bound what the process accepts.
+- **POST only.** The SDK buffers POST bodies alone; GET (the SSE stream),
+  DELETE and every other method bypass. Costing a bodyless GET at the chunked
+  worst case would hold 61 MiB for a stream's lifetime.
+- **Accounting (D3).** The declared `Content-Length` is reserved up front; a
+  declaration above the per-request limit gets the SDK's own 413 at once; 0
+  reserves nothing; an absent or unparseable length is costed at the full
+  limit in the large lane (L5). Never incremental: a request holding part of
+  the budget while it waits for the rest can deadlock with another. A
+  counting `receive` delivers `http.disconnect` in place of any message that
+  would cross the reservation, and for every call after it.
+- **Lanes (D5).** A request declaring ≤ 1 MiB uses the small lane, and
+  borrows large-lane bytes only while no large request waits. Large requests
+  are strict FIFO, no barging: a waiting maximum write is never overtaken.
+  Releases credit the source lane and re-run admission, small first.
+- **Waiting and refusal (D6).** FIFO, up to `MCP_BODY_BUDGET_WAIT_SECONDS`
+  (15) with at most `MCP_BODY_BUDGET_WAITERS` (8) waiters across both lanes,
+  disconnect-aware through a second `ReceiveWatch` over the first one's
+  replay (bytes it reads draw on the shared replay budget, so #188 L8 carries
+  over). Then HTTP **429**,
+  `{"error", "code": "body_memory", "scope": "small"|"large", "limit": <lane capacity>}`,
+  `Retry-After: 2`: the same keys as the concurrency 429. A transport refusal
+  outside `MCP-REFUSAL` (nothing has been parsed — parsing is the memory being
+  protected), consuming no rate token, no quota slot and no usage row.
+  Telemetry is `mcp_concurrency_pressure` with `reason: body:memory`,
+  outcome `refused` or `waited` (> 100 ms), and is **not** fed to
+  `concurrency_counters`: body pressure is not concurrency pressure and must
+  not move the enforce-readiness evidence.
+- **Release on every exit (D7).** The middleware's outer `finally` releases
+  the lease and aborts the body watcher and then the transport watcher, so
+  neither a reservation, replay-budget bytes nor a pending `receive` task
+  outlives the request — normal return, SDK 400/413, a raising app, a
+  disconnect, or a cancellation before or after the handoff. A waiter that
+  exits hands back a grant that raced it.
+- **The `import_from_url` URL cap (D8)** is `MAX_IMPORT_URL_CHARS` (8,192)
+  through the existing L5b screen, and `_url_host` returns `<over-long>`
+  without parsing a longer value. It removes the canonicalisation peak; it is
+  **not** the fix.
+
+**Measured (2026-10-09, `scripts/measure_body_amplification.py`, fresh
+uvicorn worker, envelopes of `mcp_max_request_body_bytes − 4 KiB`):** a
+text-mode `write_file` of six-byte escapes peaks at **3.17×** the body, an
+`import_from_url`-shaped envelope at **4.09×** (6.7× before the URL cap). Six
+simultaneous maximum writes at a 1 GiB budget all succeeded, serialised, with
+peak growth 437 MiB against a bound of 1 GiB + 32 MiB + 128 MiB.
+`tests/integration/test_body_budget_stack_pg.py` re-measures both under
+`make test-integration` (opt-in `BODY_BUDGET_RSS_TESTS=1`, not CI: a peak-RSS
+bound on a shared runner measures the runner). A ratio above the multiplier
+means raising the multiplier's default and floor, never loosening the guard.
+
+### Accepted limitations (#322)
+
+- **L1** The budget bounds body-derived memory by a measured multiplier, not
+  by accounting each allocation; a path that amplifies more is only partly
+  bounded until re-measured.
+- **L2** Released memory may not return to the OS; RSS can stay high after a
+  burst, but the peak stays bounded.
+- **L3** Large requests are strict FIFO: head-of-line blocking among them.
+- **L4** No per-principal share of the large lane; one principal is bounded
+  only by its buckets.
+- **L5** A chunked request is costed at the full per-request limit.
+- **L6** Bytes the transport watcher reads while waiting sit in the replay
+  budget (≤ ≈ 62 MiB), not this one.
+- **L7** The cgroup is read once at startup.
+- **L8** Sandbox mode is exempt (it bypasses the middleware).
+- **L9** Responses are not budgeted (read responses are capped separately).
+- **L10** On cgroup v1 only the controller's mount root is read; a v1 process
+  nested below it is not resolved.
+- **L11** Non-POST methods bypass; a future SDK that buffered another
+  method's body would need this re-checked.
 
 ## Alternatives rejected
 
+- **Lowering the global body limit** (#322). It breaks the documented 25 MB
+  `write_file`.
+- **Folding the body budget into concurrency `enforce`** (#322). Mode-gated
+  and default shadow, so the bug would stay open in the default configuration.
+- **A URL cap alone, or an in-band `MCP-REFUSAL` for the body budget**
+  (#322). Every other near-limit envelope still buffers; and nothing is parsed
+  yet to answer in band.
 - **slowapi on the `/mcp` mount.** Keyed on the remote address — wrong scope:
   shared egress merges tenants, and one tenant with two agents is one bucket.
   It is decorator-shaped for routes, not an ASGI mount, and it produces an HTTP
@@ -701,18 +1459,29 @@ class slot, so one saturated class parks tasks that block every tenant).
 - **Persisting bucket state in PostgreSQL** (the `quota_counters` shape). A
   statement on the hottest path in the server, to bound something meaningless
   once the process is gone, with the durable ceiling already one layer up.
-- **Refunding a token on a refusal.** #162's reasoning: a tool that always
-  fails would be free.
+- **Refunding a token on a refusal** — a concurrency refusal included (#188
+  D9). #162's reasoning: a tool that always fails would be free.
+- **Going straight from shadow to enforce with long waits**, and **per-class
+  tool waits** (#188). Queue exists so the waits are measured before any
+  capacity refusal is possible; one tool deadline keeps the arithmetic
+  readable.
+- **Early release of the tool lease before telemetry** (#188, SR1-1). Above:
+  it lost audit rows for completed writes.
+- **Transport evidence from security-event logs or since-boot counters**, and
+  **counting pool timeouts from `tool_exception` rows** (#188 D8, D10). Above.
 - **Enforcing the query cap inside the search bodies.** It would be a
   post-body marker polluting the percentiles.
 - **Fail-open or fail-closed on principal-registry overflow.** Above.
 
 ## Standing residuals
 
-- Concurrency is not bounded by this change (`mcp-concurrency-slots`).
+- Default shadow mode does not enforce concurrency ceilings, and queue bounds
+  latency, not occupancy; only `enforce` bounds, and it bounds MCP's
+  contribution only, not every shared pool consumer. The #188 accepted
+  limitations L1–L11 are listed under concurrency above.
 - OAuth grants and grandfathered NULL-limit keys have **velocity bounds only**.
-- The transport 429s — L1 and the transfer redemption — sit outside the in-band
-  refusal contract.
+- The transport 429s — L1, the body-memory budget (1c, `code: body_memory`)
+  and the transfer redemption — sit outside the in-band refusal contract.
 - A hard kill loses at most one coalescing interval of refusal counts per key.
 - Past 10,000 principals the shared overflow entries lose per-principal
   attribution but not their counts.

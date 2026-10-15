@@ -2,13 +2,13 @@ import logging
 import os
 import re
 import secrets
+from dataclasses import dataclass
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-import httpx
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -46,6 +46,7 @@ from src.models.db import (
     UsageLog,
 )
 from src.oauth.grants import (
+    grant_expired,
     live_family_scopes,
     lock_account_guard,
     revoke_grant_family,
@@ -57,7 +58,7 @@ from src.oauth.scope import (
     has_vault_scope,
     token_has_write,
 )
-from src.services import security_events, vault_overlap
+from src.services import panel_csp, security_events, vault_overlap
 from src.services.filters import current_embedding_predicate
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
@@ -65,7 +66,9 @@ from src.services.index_state import (
     embedding_fingerprint,
     set_state,
 )
-from src.services.indexer import invalidate_hnsw_index_cache
+from src.services.indexer import clear_sweep_state, invalidate_hnsw_index_cache
+from src.services import api_keys as key_issuance
+from src.services.rate_limits import KeyCreationRefusal
 from src.services.quotas import (
     apply_daily_request_limit,
     consumed_today,
@@ -114,6 +117,7 @@ from src.services.usage_stats import (
     tool_aggregates,
 )
 from src.services.vault import warm_user_vault_cache
+from src.services.transport_security import embedding_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +161,34 @@ def _actor(user) -> tuple[int | None, str | None]:
     return getattr(user, "id", None), getattr(user, "username", None)
 
 
+@dataclass(frozen=True)
+class ActorSnapshot:
+    """The acting user's identity as plain values, read **before** a rollback.
+
+    `AsyncSession.rollback()` expires every persistent instance in the
+    session, and the panel's acting `User` is loaded through the request's own
+    session — so after a rollback, `user.id` is not an attribute read but a
+    lazy load, which under asyncio raises `MissingGreenlet` and turns a refusal
+    into a 500 (#332). A refusal branch that rolls back and then records who
+    acted takes this snapshot first and hands *it* to the recorder. It carries
+    the attributes `_actor`, `api_keys.account_subject` and the panel's admin
+    checks read, so it is a drop-in for the user on those paths.
+    """
+
+    id: int | None
+    username: str | None
+    is_admin: bool
+
+
+def actor_snapshot(user) -> ActorSnapshot:
+    """Capture `ActorSnapshot` from a `User` or the single-user sentinel."""
+    return ActorSnapshot(
+        id=getattr(user, "id", None),
+        username=getattr(user, "username", None),
+        is_admin=bool(getattr(user, "is_admin", False)),
+    )
+
+
 def _reembed_serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(settings.secret_key, salt="reembed-confirm")
 
@@ -181,7 +213,10 @@ def _humanize_delta(dt: datetime | None) -> str:
 
 router = APIRouter(prefix="/admin", tags=["panel"])
 templates = Jinja2Templates(
-    directory=os.path.join(os.path.dirname(__file__), "templates")
+    directory=os.path.join(os.path.dirname(__file__), "templates"),
+    # The panel CSP (#195): `csp_nonce` for the templates, and the marker that
+    # puts this response under the policy.
+    context_processors=[panel_csp.template_context],
 )
 
 
@@ -349,6 +384,43 @@ def _log_panel_forbidden(
         route=_request_route(request),
         method=_request_method(request),
     )
+
+
+def _log_key_creation_throttled(
+    request: Request | None,
+    user,
+    refusal: KeyCreationRefusal,
+) -> None:
+    """One `key_creation_throttled` record for a budget refusal (#323).
+
+    Shared by both create routes so the two refusals are one record shape. The
+    subject is the budget's own exact account identity
+    (`key_issuance.account_subject`), never the address: in single-user mode
+    the sentinel has no id, and an address-derived subject would give a caller
+    rotating addresses a fresh log allowance per address. `client_ip` is a
+    field only. Exactly one emitter call per refusal; the suppressor decides
+    whether it reaches the sink.
+    """
+    actor_user_id, actor_username = _actor(user)
+    security_events.emit(
+        "key_creation_throttled",
+        subject=key_issuance.account_subject(user),
+        actor_user_id=actor_user_id,
+        actor_username=actor_username,
+        client_ip=security_events.client_ip(request),
+        route=_request_route(request),
+        method=_request_method(request),
+        reason=refusal.reason,
+        limit_count=refusal.limit,
+        window_seconds=refusal.window_seconds,
+    )
+
+
+def key_creation_throttled_message(refusal: KeyCreationRefusal) -> str:
+    """The user-facing budget refusal. Names the wait, not the counter."""
+    minutes = max(1, -(-refusal.retry_after_seconds // 60))
+    unit = "minute" if minutes == 1 else "minutes"
+    return f"Too many keys created recently — try again in {minutes} {unit}."
 
 
 def _panel_context(
@@ -604,11 +676,12 @@ async def change_password(
 
     if not verify_password(current_password, fresh.password_hash, user_id=fresh.id):
         await session.rollback()
+        # `actor_id`, not `fresh.id`: the rollback expired `fresh` (#332).
         return _refuse_password_change(
             request,
             CREDENTIAL_REFUSAL,
             reason="wrong_current_password",
-            user_id=fresh.id,
+            user_id=actor_id,
         )
 
     if verify_password(new_password, fresh.password_hash, user_id=fresh.id):
@@ -620,7 +693,7 @@ async def change_password(
             request,
             CREDENTIAL_REFUSAL,
             reason="same_as_current",
-            user_id=fresh.id,
+            user_id=actor_id,
         )
 
     fresh.password_hash = hash_password(new_password)
@@ -1068,13 +1141,13 @@ async def keys_page(
         "active": "keys", "keys": keys, "new_key": new_key, "key_error": key_error,
         "quota_day": quota_day,
         "quota_limit_max": DAILY_REQUEST_LIMIT_MAX,
-        # The configured default for *new* keys (#194), and the **only** place
-        # the panel applies it: the create form is pre-filled with it, and
-        # `create_key_form` substitutes nothing. So the operator's last view of
-        # that field is what the key receives — clearing the box creates an
-        # unlimited key, exactly as it always did. None leaves the box empty,
-        # which is the same page this was before the setting existed. Existing
-        # keys are untouched by it in either direction.
+        # The configured default for *new* keys (#194). The create form is
+        # pre-filled with it, and since #323 `create_key_form` also applies it
+        # to a blank field — clearing the box no longer means unlimited; only
+        # an administrator's Unlimited box does (`is_admin` from
+        # `_panel_context` gates that control in the template). None leaves the
+        # box empty and makes the field required. Existing keys are untouched
+        # by it in either direction.
         "quota_limit_default": settings.default_daily_request_limit,
     }))
 
@@ -1128,40 +1201,70 @@ async def create_key_form(
     name: str = Form(...),
     permission: str = Form("read"),
     daily_request_limit: str = Form(""),
+    unlimited: str = Form(""),
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
+    # The order is the JSON twin's (`src/api/routes.py` `create_key`), and the
+    # point of it is that nothing before step 3 charges anything: validation,
+    # then the limit rule, then the active-key cap under a `users` row lock,
+    # then the shared key-creation budget, then the insert (#323 D3).
     name_error = _key_name_error(name)
     if name_error is not None:
         _flash_key_error(request, name_error)
         return RedirectResponse("/admin/keys", status_code=303)
 
-    # Server-side, above the DB CHECK (#162). Both layers: the constraint is
-    # what makes the invariant true of the data, and this is what makes it
-    # fixable — a violated CHECK is a 500 with no key and no explanation.
-    #
-    # **No default substitution here, deliberately** (#194, D9). A blank field
-    # is an explicit unlimited: `DEFAULT_DAILY_REQUEST_LIMIT` reaches the panel
-    # only as `keys_page`'s pre-filled value, so what the operator saw in the
-    # box is what the key gets. Substituting it on this side would mean an
-    # operator who deliberately cleared the field got a limited key anyway —
-    # the surprise that gets a quota feature turned off — and would give the
-    # default two places to be overridden instead of one. The JSON API
-    # distinguishes omitted from null and applies the default there
-    # (`_created_key_limit`); a form has no such distinction to make, because
-    # every submission carries the field.
-    limit, limit_error = parse_limit_form_value(daily_request_limit)
-    if limit_error is not None:
-        _flash_key_error(request, limit_error)
-        return RedirectResponse("/admin/keys", status_code=303)
-
-    raw_key = f"omcp_{secrets.token_hex(24)}"
     # The keys.html <select> only constrains the UI; a scripted/tampered POST
     # can submit any value. Mirror the JSON API's invariant (src/api/routes.py)
     # and fail safe to read-only so the column never holds nonsense like
     # "admin" or a trailing-space "readwrite " that silently behaves as read.
     if permission not in ("read", "readwrite"):
         permission = "read"
+
+    # **A blank field gets the default; only an admin's Unlimited box means
+    # NULL** (owner decision, #323). Before, a blank field was an explicit
+    # unlimited, which made a scripted blank form a way to mint principals with
+    # no daily quota at all. The box is the only unlimited request the form
+    # can make and only exactly `"1"` counts; when it is set the number is
+    # ignored (panel.js disables the input, and a scripted value alongside is
+    # discarded). A non-admin's form never renders the box, so a non-admin
+    # `unlimited=1` is tampered — refused and recorded, not downgraded.
+    wants_unlimited = unlimited == "1"
+    value: int | None = None
+    if not wants_unlimited:
+        # Server-side, above the DB CHECK (#162): a violated CHECK is a 500
+        # with no key and no explanation. A non-number is an error, never a
+        # silent blank.
+        value, limit_error = parse_limit_form_value(daily_request_limit)
+        if limit_error is not None:
+            _flash_key_error(request, limit_error)
+            return RedirectResponse("/admin/keys", status_code=303)
+    limit, refusal = key_issuance.resolve_create_limit(
+        user, provided=value is not None, value=value, unlimited=wants_unlimited
+    )
+    if refusal is not None:
+        if refusal.code == key_issuance.REFUSAL_FORBIDDEN_UNLIMITED:
+            _log_panel_forbidden(
+                request, key_issuance.FORBIDDEN_UNLIMITED_REASON, user, user.id
+            )
+        _flash_key_error(request, refusal.message)
+        return RedirectResponse("/admin/keys", status_code=303)
+
+    admission = await key_issuance.admit_key_creation(
+        session, user, security_events.client_ip(request)
+    )
+    if admission is not None:
+        # Before the rollback, which expires `user` (#332).
+        actor = actor_snapshot(user)
+        await session.rollback()
+        if isinstance(admission, KeyCreationRefusal):
+            _log_key_creation_throttled(request, actor, admission)
+            _flash_key_error(request, key_creation_throttled_message(admission))
+        else:
+            _flash_key_error(request, admission.message)
+        return RedirectResponse("/admin/keys", status_code=303)
+
+    raw_key = f"omcp_{secrets.token_hex(24)}"
     # Always stamp the creator's user_id (even admins get their own keys
     # attributed to themselves — admin's omniscient view doesn't extend to
     # "create keys on behalf of"; that's a separate per-user-edit action).
@@ -1244,10 +1347,17 @@ async def set_key_limit_form(
     request: Request,
     key_id: int,
     daily_request_limit: str = Form(""),
+    unlimited: str = Form(""),
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
-    """Set, change, or clear a key's daily request limit (#162).
+    """Set, change, or clear a key's daily request limit (#162, #323).
+
+    Since #323 a blank field is a validation error for everyone, not a clear:
+    clearing a limit to unlimited is an administrator's explicit request (the
+    `unlimited` box, which only admins are shown), and a non-admin's is refused
+    and recorded as `panel_forbidden`. The edit path never applies the default
+    to an existing key (`key_issuance.resolve_edit_limit`).
 
     The enable-reset rule and its single transaction live in
     `src.services.quotas.apply_daily_request_limit`, shared with the JSON API's
@@ -1260,9 +1370,22 @@ async def set_key_limit_form(
     api_key = result.scalar_one_or_none()
     _assert_key_owner(api_key, user, request=request)
 
-    limit, limit_error = parse_limit_form_value(daily_request_limit)
-    if limit_error is not None:
-        _flash_key_error(request, limit_error)
+    wants_unlimited = unlimited == "1"
+    value: int | None = None
+    if not wants_unlimited:
+        value, limit_error = parse_limit_form_value(daily_request_limit)
+        if limit_error is not None:
+            _flash_key_error(request, limit_error)
+            return RedirectResponse("/admin/keys", status_code=303)
+    limit, refusal = key_issuance.resolve_edit_limit(
+        user, value=value, unlimited=wants_unlimited
+    )
+    if refusal is not None:
+        if refusal.code == key_issuance.REFUSAL_FORBIDDEN_UNLIMITED:
+            _log_panel_forbidden(
+                request, key_issuance.FORBIDDEN_UNLIMITED_REASON, user, api_key.user_id
+            )
+        _flash_key_error(request, refusal.message)
         return RedirectResponse("/admin/keys", status_code=303)
 
     await apply_daily_request_limit(session, api_key, limit)
@@ -1325,6 +1448,13 @@ def _token_status(token, now: datetime, owner_active: bool) -> str:
     if token.revoked:
         return "revoked"
     if token.expires_at <= now:
+        return "expired"
+    if grant_expired(token.grant_issued_at, now):
+        # The grant family is at or past its absolute deadline (#326), so the
+        # middleware refuses this token (`reason=grant_lifetime_exceeded`) and
+        # the token endpoint will not rotate it — even though its own
+        # `expires_at` is still ahead, which happens after the setting is
+        # shortened. The #76 rule: never show live what the middleware refuses.
         return "expired"
     if not has_vault_scope(token.scope):
         # `offline_access` says the grant may carry a refresh token, not that
@@ -1986,6 +2116,15 @@ async def performance_page(
     # latencies happened around, and a quiet 24 hours with no pass in it is
     # exactly when an operator needs to see the last one that did run.
     runs = await recent_indexer_runs(session, uid)
+    # The concurrency section (#188, D6): per-tool/class pressure for
+    # everyone, scoped exactly as above; live occupancy, durable counters,
+    # coverage and the readiness verdict for admins only — never computed,
+    # let alone rendered, for anyone else.
+    from src.services.concurrency_readiness import panel_section
+
+    concurrency_section = await panel_section(
+        session, WINDOWS[window], user_id=uid, is_admin=_is_admin(user)
+    )
 
     slowest = []
     for r in slowest_rows:
@@ -2019,6 +2158,7 @@ async def performance_page(
             # deploy, a quiet weekend) and gets its own copy rather than a
             # table of zeroes that reads like a measurement.
             "has_data": any(t["executed"] or t["refusals"] for t in tools),
+            "concurrency": concurrency_section,
         }),
     )
 
@@ -2252,14 +2392,28 @@ async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
     `InFailedSQLTransaction` instead of the original error. It runs first, so
     the render that follows has a usable session.
 
+    **The rollback expires the acting user, so it is re-loaded (#332).** The
+    dashboard's `User` was loaded through this same session, and a rollback
+    expires every persistent instance in it; the caller's very next step is
+    `_panel_context(request, user)`, whose `user.is_admin` would then be a lazy
+    load — `MissingGreenlet` under asyncio, a 500 on exactly the page this
+    boundary exists to save. So the identity this function records is captured
+    before the rollback, and a real `User` is refreshed after it (one primary-
+    key read on a session the rollback has just made usable again). A refresh
+    that fails too is recorded and left: the database is then down, not merely
+    two tables, and nothing here can render around that.
+
     The failure is logged at ERROR, which means the ring buffer catches it and
     the health page shows an operator *why* their strip is missing.
     """
+    actor = actor_snapshot(user)
     try:
         return await _health_strip(session, user)
     except Exception as exc:  # noqa: BLE001 - the strip must never take the page down
         try:
             await session.rollback()
+            if isinstance(user, User):
+                await session.refresh(user)
         except Exception as rollback_exc:  # noqa: BLE001 - best effort; the render is what matters
             # Same event as the read failure below (D18's table names both):
             # they are two ways for the same feature to be unavailable, and an
@@ -2268,14 +2422,14 @@ async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
             security_events.emit(
                 "panel_health_strip_failed",
                 level=logging.ERROR,
-                subject=security_events.subject_for(user_id=getattr(user, "id", None)),
+                subject=security_events.subject_for(user_id=actor.id),
                 exc_info=True,
                 error_type=type(rollback_exc).__name__,
             )
         security_events.emit(
             "panel_health_strip_failed",
             level=logging.ERROR,
-            subject=security_events.subject_for(user_id=getattr(user, "id", None)),
+            subject=security_events.subject_for(user_id=actor.id),
             exc_info=True,
             error_type=type(exc).__name__,
         )
@@ -2289,8 +2443,8 @@ async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
         # strip is gone; this is not.
         return {
             "unavailable": True,
-            "show_ops": _is_admin(user),
-            "quarantine": _quarantine_view(_is_admin(user)),
+            "show_ops": actor.is_admin,
+            "quarantine": _quarantine_view(actor.is_admin),
         }
 
 
@@ -2589,7 +2743,7 @@ async def settings_page(
     provider_ok = False
     try:
         if provider == "ollama":
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with embedding_http_client(5.0) as client:
                 r = await client.get(f"{settings.ollama_url}/api/tags")
                 provider_ok = r.status_code == 200
         else:
@@ -2733,7 +2887,9 @@ async def trigger_reindex(
     request: Request,
     user=Depends(require_admin_panel),
 ):
-    _spawn(_reindex_background())
+    # An operator's Reindex is a full-hash pass (#282, D12): every note read
+    # and hashed whatever its recorded stat, and the exclusion sweep forced.
+    _spawn(_reindex_background(full_hash=True))
     if "application/json" in request.headers.get("accept", ""):
         return JSONResponse({"status": "started"})
     return RedirectResponse("/admin/settings", status_code=303)
@@ -2805,9 +2961,60 @@ async def trigger_reembed(
                 if not await _record_embedding_fingerprint(fresh, request):
                     return RedirectResponse("/admin/settings", status_code=303)
                 await fresh.commit()
+        # Every certification was just rewritten: forget the clean-sweep
+        # record so the next embed pass sweeps (#282, D13).
+        clear_sweep_state()
 
     _spawn(_reindex_background())
     return RedirectResponse("/admin/settings", status_code=303)
+
+
+@router.get("/settings/confirm-empty-vault", response_class=HTMLResponse)
+async def confirm_empty_vault_page(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
+):
+    """Single-user "Confirm vault is empty" (#309, D5): the confirmation page.
+
+    The token rules and why the re-embed pattern was not reused are in
+    `empty_vault_confirm`. Multi-user mode confirms per user, on
+    `/admin/users/{id}/confirm-empty-vault`; here it renders the refusal.
+    """
+    from src.control_panel import empty_vault_confirm
+
+    return await empty_vault_confirm.render_confirm_page(
+        request,
+        session,
+        user,
+        None,
+        templates,
+        post_action="/admin/settings/confirm-empty-vault",
+        cancel_url="/admin/settings",
+    )
+
+
+@router.post("/settings/confirm-empty-vault")
+async def confirm_empty_vault(
+    request: Request,
+    token: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_admin_panel),
+):
+    """Redeem the token: grant the single-user scope its empty-prune
+    permission and start a pass for it alone. Existing `_reindex_background`
+    callers are untouched; this one goes through `index_scope_now`."""
+    from src.control_panel import empty_vault_confirm
+
+    return await empty_vault_confirm.handle_confirm_post(
+        request,
+        session,
+        user,
+        None,
+        token,
+        back_url="/admin/settings",
+        done_url="/admin/settings",
+    )
 
 
 @router.post("/settings/reset-embeddings")
@@ -2824,12 +3031,15 @@ async def reset_embeddings(
     """
     from sqlalchemy import delete
     from src.models.db import NoteEmbedding, NoteMetadata
+    from src.services import vector_index
 
     dim = int(settings.embedding_dimensions)
-    # pgvector caps HNSW-indexable vectors at 2000 dims; above that, CREATE
-    # INDEX ... USING hnsw hard-errors. Skip the index so the reset still
-    # completes; semantic_search falls back to a sequential scan. See issue #6.
-    hnsw = dim <= 2000
+    # No vector index is built above 2000 dims (pgvector's HNSW limit for
+    # `vector`, and #283's decision not to turn those deployments' exact scan
+    # into an approximate one). Skip the index so the reset still completes;
+    # semantic_search falls back to a sequential scan. See issue #6. The name,
+    # the condition and the DDL all come from `vector_index`, the one owner.
+    hnsw = vector_index.index_enabled(dim)
 
     recorded = True
     with _pause_indexer():
@@ -2859,9 +3069,9 @@ async def reset_embeddings(
                 # service is still up (#142).
                 await acquire_generation_lock_unbounded(fresh)
                 await fresh.execute(text("SET LOCAL statement_timeout = '5min'"))
-                await fresh.execute(
-                    text("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw")
-                )
+                # Both names: the halfvec index, and 008's `vector` one on a
+                # database that has not reached 027.
+                await fresh.execute(text(vector_index.drop_index_sql()))
                 await fresh.execute(delete(NoteEmbedding))
                 await fresh.execute(
                     text(
@@ -2873,13 +3083,7 @@ async def reset_embeddings(
                     text("UPDATE notes_metadata SET embedded_content_hash = NULL")
                 )
                 if hnsw:
-                    await fresh.execute(
-                        text(
-                            "CREATE INDEX ix_note_embeddings_embedding_hnsw "
-                            "ON note_embeddings USING hnsw (embedding vector_cosine_ops) "
-                            "WITH (m = 16, ef_construction = 64)"
-                        )
-                    )
+                    await fresh.execute(text(vector_index.create_index_sql(dim)))
                 else:
                     # Already conditional on the configured dimension, and it
                     # stays that way: pgvector refuses an HNSW index above 2000
@@ -2904,6 +3108,7 @@ async def reset_embeddings(
         # cached answer is right again — re-probing costs one query and being
         # wrong here costs a dropped index nobody notices.
         invalidate_hnsw_index_cache()
+        clear_sweep_state()
 
     if not recorded:
         if "application/json" in request.headers.get("accept", ""):
@@ -2955,7 +3160,7 @@ async def reset_progress(
     })
 
 
-async def _reindex_background():
+async def _reindex_background(full_hash: bool = False):
     # Panel-triggered on-demand reindex. Mirrors `run_indexer_loop` so the
     # multi-user-mode case fans out to every active user; in single-user
     # mode it stays a single legacy pass with user_id=None.
@@ -2971,7 +3176,8 @@ async def _reindex_background():
     # pass in the history took ten times as long as its neighbours.
     from src.services.indexer import (
         index_vault, embed_vault, _active_user_ids, detect_root_overlaps,
-        index_pass_lock, record_indexer_run,
+        index_pass_lock, record_indexer_run, record_index_outcome,
+        record_embed_outcome,
     )
     # E4 — **before `index_pass_lock` is taken.** Reindex Now, re-embed and
     # reset embeddings all land in this function, and it is a separate entry
@@ -2989,9 +3195,15 @@ async def _reindex_background():
             for uid in await _active_user_ids():
                 async with record_indexer_run("manual", uid) as stats:
                     try:
-                        stats.record_index(await index_vault(user_id=uid))
+                        index_result = await index_vault(
+                            user_id=uid, full_hash=full_hash
+                        )
+                        stats.record_index(index_result)
                     except Exception as e:
                         stats.record_error("index", e)
+                        # #308 D4: the panel is an entrypoint like any other;
+                        # its outcome feeds the same `/health` counters.
+                        record_index_outcome(uid, False)
                         security_events.emit(
                             "panel_ondemand_index_failed",
                             level=logging.ERROR,
@@ -2999,10 +3211,13 @@ async def _reindex_background():
                             user_id=uid,
                             error_type=type(e).__name__,
                         )
+                    else:
+                        record_index_outcome(uid, True, index_result)
                     try:
-                        stats.record_embedded(await embed_vault(user_id=uid))
+                        embedded = await embed_vault(user_id=uid)
                     except Exception as e:
                         stats.record_error("embed", e)
+                        record_embed_outcome(uid, raised=True)
                         security_events.emit(
                             "panel_ondemand_embed_failed",
                             level=logging.ERROR,
@@ -3010,7 +3225,43 @@ async def _reindex_background():
                             user_id=uid,
                             error_type=type(e).__name__,
                         )
+                    else:
+                        stats.record_embedded(embedded)
+                        record_embed_outcome(uid, embedded)
         else:
             async with record_indexer_run("manual", None) as stats:
-                stats.record_index(await index_vault())
-                stats.record_embedded(await embed_vault())
+                # Each stage on its own, as the loop's tick does (#308 D9,
+                # #309 D3): an index stage that raised — an indeterminate
+                # empty root, say — must not stop the embed stage over the
+                # rows already committed. Both outcomes are written to the
+                # run row and reach the `/health` counters (#308 D4).
+                try:
+                    index_result = await index_vault(full_hash=full_hash)
+                    stats.record_index(index_result)
+                except Exception as e:
+                    stats.record_error("index", e)
+                    record_index_outcome(None, False)
+                    security_events.emit(
+                        "panel_ondemand_index_failed",
+                        level=logging.ERROR,
+                        subject=security_events.subject_for(user_id=None),
+                        user_id=None,
+                        error_type=type(e).__name__,
+                    )
+                else:
+                    record_index_outcome(None, True, index_result)
+                try:
+                    embedded = await embed_vault()
+                except Exception as e:
+                    stats.record_error("embed", e)
+                    record_embed_outcome(None, raised=True)
+                    security_events.emit(
+                        "panel_ondemand_embed_failed",
+                        level=logging.ERROR,
+                        subject=security_events.subject_for(user_id=None),
+                        user_id=None,
+                        error_type=type(e).__name__,
+                    )
+                else:
+                    stats.record_embedded(embedded)
+                    record_embed_outcome(None, embedded)

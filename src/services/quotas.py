@@ -93,6 +93,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ADMISSION_SQL",
+    "ASYNC_COMMIT_SQL",
     "DAILY_REQUEST_LIMIT_MAX",
     "DAILY_REQUEST_LIMIT_MIN",
     "OVER_QUOTA_PARAM",
@@ -127,6 +128,11 @@ ADMISSION_SQL = text(
     "WHERE quota_counters.count < :limit "
     "RETURNING count"
 )
+
+#: Issued first in the admission's transaction and again in the prune's
+#: (performance-2026-09 D2). `SET LOCAL`, never `SET`: it ends with the
+#: transaction, so it cannot reach a later checkout of the pooled connection.
+ASYNC_COMMIT_SQL = text("SET LOCAL synchronous_commit = off")
 
 #: The opportunistic prune. Runs only after an admission whose `RETURNING
 #: count` is 1 — the INSERT branch, i.e. the first admission of a new UTC day
@@ -327,6 +333,17 @@ async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> Adm
     `_tracked` that never reached `_log_usage`, leaving an enforcement outage
     with no line anywhere naming the key it happened to.
 
+    **Both transactions commit asynchronously (L1, an owner decision taken by
+    default, performance-2026-09).** Each begins with `SET LOCAL
+    synchronous_commit = off`. An asynchronously committed increment is
+    visible to every other session at commit, so the conditional increment
+    under the row lock still admits exactly `limit` calls per key per UTC day
+    under any concurrency. Only its durability changes: a PostgreSQL server or
+    host crash can lose increments committed in the preceding ~600 ms, which
+    undercounts the key in the caller's favour. It can never overcount, and it
+    can never refuse a call the synchronous form would have admitted. An
+    application crash or restart loses nothing committed.
+
     The prune runs only on the INSERT branch — a `RETURNING count` of 1 is the
     row having just been created, since the `DO UPDATE` adds to a count that is
     at least 1 — and its failure is swallowed: a call that has already been
@@ -339,6 +356,10 @@ async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> Adm
     day = utc_day(decided_at)
     async with async_session() as session:
         try:
+            # Asynchronous commit, scoped to this transaction (L1, above).
+            # Inside the `try`, so a failure here is the same fail-closed,
+            # evented admission failure as one of the statement itself.
+            await session.execute(ASYNC_COMMIT_SQL)
             count = (
                 await session.execute(
                     ADMISSION_SQL, {"key_id": key_id, "day": day, "limit": limit}
@@ -362,6 +383,9 @@ async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> Adm
 
         if count == 1:
             try:
+                # A new transaction: the admission's `SET LOCAL` ended with
+                # its commit, so the prune sets its own.
+                await session.execute(ASYNC_COMMIT_SQL)
                 await session.execute(
                     PRUNE_SQL, {"cutoff": day - _dt.timedelta(days=PRUNE_AFTER_DAYS)}
                 )
@@ -463,7 +487,7 @@ def limit_value_error(value: int) -> str | None:
     if value < DAILY_REQUEST_LIMIT_MIN:
         return (
             f"Daily request limit must be at least {DAILY_REQUEST_LIMIT_MIN}. "
-            "Leave it empty for unlimited; to stop a key entirely, revoke it."
+            "To stop a key entirely, revoke it."
         )
     if value > DAILY_REQUEST_LIMIT_MAX:
         return (
@@ -474,13 +498,14 @@ def limit_value_error(value: int) -> str | None:
 
 
 def parse_limit_form_value(raw: str | None) -> tuple[int | None, str | None]:
-    """A form field to `(limit, error)`. Empty means unlimited, not zero.
+    """A form field to `(limit, error)`. Empty means "no value", not zero.
 
-    `("", None)` and `(None, None)` both mean "no limit" — an operator clearing
-    the box is clearing the limit, which is the documented way to return a key
-    to unlimited. A value that is not an integer is an error rather than a
-    silent clear, because silently discarding "1oo" would look exactly like
-    success.
+    `(None, None)` is "the field was blank". What a blank *means* is not this
+    function's decision: since #323 a blank create field gets the default and a
+    blank edit is an error (`src/services/api_keys.py`), and unlimited is only
+    ever an administrator's explicit request. A value that is not an integer is
+    an error rather than a silent blank, because silently discarding "1oo"
+    would look exactly like success.
     """
     if raw is None:
         return None, None
@@ -491,7 +516,7 @@ def parse_limit_form_value(raw: str | None) -> tuple[int | None, str | None]:
         value = int(text_value)
     except ValueError:
         return None, (
-            "Daily request limit must be a whole number, or empty for unlimited."
+            "Daily request limit must be a whole number."
         )
     error = limit_value_error(value)
     if error is not None:

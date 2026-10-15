@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import copy
+import enum
 import errno
 import inspect
 import json
@@ -38,6 +39,7 @@ from src.config import (
     MAX_BLAME_LINES,
     MAX_CHUNKS_PER_NOTE,
     MAX_HISTORY_COMMITS,
+    MAX_IMPORT_URL_CHARS,
     MAX_LINKS_PER_NOTE,
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
@@ -52,6 +54,7 @@ from src.mcp_server.auth import (
     current_daily_request_limit,
     current_oauth_token_id,
     current_permission,
+    current_transport_queue_ms,
 )
 from src.mcp_server.read_result import (
     ReadNoteResult,
@@ -61,11 +64,13 @@ from src.mcp_server.read_result import (
     screen_unrenderable,
 )
 from src.models.db import UsageLog
-from src.services import git_vault, rate_limits, refusals, security_events, timing
+from src.services import concurrency, git_vault, rate_limits, refusals, security_events, timing
+from src.services.tool_outcomes import BodyOutcome, body_refusal as _body_refusal
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_embedding_validity, apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
 from src.services.search import full_text_search
+from src.services.usage_params import render_usage_params
 from src.services.usage_stats import OVER_QUOTA_PARAM
 from src.services import git_history, transfer, vault_fs, vault_sync
 from src.services.vault import (
@@ -292,8 +297,20 @@ def _violated_user_fk(exc: Exception) -> bool:
 
 
 async def _insert_usage(values: dict) -> None:
+    """Insert one `usage_logs` row in its own, asynchronously committed
+    transaction.
+
+    `SET LOCAL synchronous_commit = off` is the transaction's first statement
+    (performance-2026-09 D2), for the initial insert and the FK-cleared retry
+    alike, since both come through here. The commit is still visible to every
+    other session when it returns, so `write_usage_row`'s `True` keeps meaning
+    "committed and visible"; only durability across a PostgreSQL server or
+    host crash is weakened, by at most ~600 ms (L2). `SET LOCAL` ends with the
+    transaction, so the pooled connection does not carry it further.
+    """
     async with async_session() as session:
         try:
+            await session.execute(text("SET LOCAL synchronous_commit = off"))
             session.add(UsageLog(**values))
             await session.commit()
         except Exception:
@@ -321,7 +338,7 @@ async def _log_usage(
             oauth_token_id=current_oauth_token_id.get(),
             user_id=current_user_id.get(),
             tool=tool,
-            params=params,
+            params=_with_provenance(params),
             duration_ms=duration_ms,
             response_size=response_size,
             **_actor_columns(),
@@ -329,7 +346,103 @@ async def _log_usage(
     )
 
 
+class UsageWriteOutcome(enum.Enum):
+    """How one usage write ended (#310, design D5).
+
+    `unstorable` is the one a retry cannot fix: the terminal insert attempt was
+    refused for its *data* — SQLSTATE class 22, 54000, or a bare
+    `UnicodeEncodeError` — by the indexer's own poison classification. Every
+    other failure (writer permit refused, connection lost, a serialisation
+    error with no SQLSTATE) is `failed`, and a coalesced caller requeues it.
+    """
+
+    LANDED = "landed"
+    FAILED = "failed"
+    UNSTORABLE = "unstorable"
+
+
 async def write_usage_row(values: dict) -> bool:
+    """Bound every usage write, including initial insert and dangling-FK retry.
+
+    Acquire before opening any session; refusal is a failed audit, never a
+    failed completed tool. Coalesced callers requeue their unconfirmed weight
+    — they call `write_usage_row_outcome`, which tells them whether a failure
+    was the data (#310). This is that function collapsed to "did it land".
+    """
+    return await write_usage_row_outcome(values) is UsageWriteOutcome.LANDED
+
+
+async def write_usage_row_outcome(values: dict) -> UsageWriteOutcome:
+    """`write_usage_row` without the collapse to a boolean (#310, D5)."""
+    controller = concurrency.get_controller()
+    admission = await controller.writer()
+    if not admission.admitted:
+        if admission.pressure is not None and admission.pressure.scope != "shutdown":
+            # Enforce only: queue mode admits with an overrun instead (D7).
+            _count_concurrency("writer_refused")
+        try:
+            security_events.emit(
+                "usage_log_failed",
+                subject=security_events.subject_for(user_id=values.get("user_id")),
+                tool=values.get("tool"),
+                reason="concurrency_capacity",
+            )
+        except Exception:
+            pass
+        return UsageWriteOutcome.FAILED
+    try:
+        if admission.overrun is not None:
+            # Queue mode: enforce would have refused this writer. The row is
+            # written all the same; the overrun is counted and annotated.
+            _count_concurrency("writer_overrun")
+        # The writer observation rides on this same actual row, merged through
+        # the same stage-ordered function as every other stage (D4). Never a
+        # second row to observe logging, and never a replaced actual error.
+        if admission.shadow is not None:
+            values = _merge_observation(
+                values, "concurrency_shadow", admission.pressure,
+                lambda obs: concurrency.shadow_metadata(
+                    obs, configured_wait_ms=controller.configured_wait_ms()))
+        elif controller.mode == "queue" and admission.observation is not None:
+            values = _merge_observation(
+                values, "concurrency_queue", admission.observation,
+                concurrency.queue_metadata)
+        return await _write_usage_row_admitted(values)
+    finally:
+        admission.lease.release()
+
+
+def _merge_observation(values: dict, key: str, observation, build) -> dict:
+    params = dict(values.get("params") or {})
+    previous = (params.get(key) or {}).get("observations", ())
+    params[key] = build((*previous, observation))
+    return dict(values, params=params)
+
+
+def _count_concurrency(metric: str) -> None:
+    """One durable-counter increment (#188 D8); bookkeeping never fails a call."""
+    try:
+        concurrency.counters().record(metric)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _with_provenance(params: dict) -> dict:
+    """`params.concurrency = {v, mode, epoch}` on a row `_tracked` writes (D8).
+
+    Unconditional whenever the mode is not `off`: an unpressured row is marked
+    too, so the readiness evaluator can tell a v2 row from a legacy one and
+    one mode or epoch from another.
+    """
+    try:
+        if concurrency.get_controller().mode == "off":
+            return params
+        return {**params, "concurrency": concurrency.provenance()}
+    except Exception:  # noqa: BLE001 - never fail a row over its provenance
+        return params
+
+
+async def _write_usage_row_admitted(values: dict) -> "UsageWriteOutcome":
     """Insert one prepared `usage_logs` row, and do not lose it to a dangling
     credential.
 
@@ -359,12 +472,25 @@ async def write_usage_row(values: dict) -> bool:
     the log can tell "the tool failed and here is the row" from "the tool failed
     and the row is missing". Every existing caller ignores the value and is
     unchanged.
+
+    **`params` is rendered first, exactly once** (#310, design D2). Every row
+    the MCP side writes passes through here — the success tail, the
+    body-exception row, every pre-body refusal and every coalesced
+    `rate_limited` / `slot_timeout` row — after every telemetry and
+    observation merge, so `render_usage_params` sees what is about to be
+    inserted and the FK-cleared retry below is built from the rendered values.
+    An absent `params` key stays absent and `None` stays `None`. Since #310 the
+    answer is three-valued: a terminal failure the indexer's poison
+    classification calls *data* (class 22, 54000) is `UNSTORABLE`, which a
+    coalesced caller drops instead of requeueing; everything else is `FAILED`.
     """
+    if values.get("params") is not None:
+        values = dict(values, params=render_usage_params(values["params"]))
     tool = values.get("tool")
     subject = security_events.subject_for(user_id=values.get("user_id"))
     try:
         await _insert_usage(values)
-        return True
+        return UsageWriteOutcome.LANDED
     except Exception as e:
         if not _is_fk_violation(e):
             # `error_type` and not the exception's text: a failed insert's
@@ -379,7 +505,7 @@ async def write_usage_row(values: dict) -> bool:
                 reason="initial",
                 error_type=type(e).__name__,
             )
-            return False
+            return _failure_outcome(e)
         retry = dict(values, key_id=None, oauth_token_id=None)
         if _violated_user_fk(e):
             retry["user_id"] = None
@@ -392,7 +518,7 @@ async def write_usage_row(values: dict) -> bool:
 
     try:
         await _insert_usage(retry)
-        return True
+        return UsageWriteOutcome.LANDED
     except Exception as e:
         security_events.emit(
             "usage_log_failed",
@@ -401,10 +527,35 @@ async def write_usage_row(values: dict) -> bool:
             reason="after_clearing_fks",
             error_type=type(e).__name__,
         )
-        return False
+        return _failure_outcome(e)
 
 
-_MAX_PARAM_LEN = 200  # truncate long string params (e.g. note content)
+def _failure_outcome(exc: BaseException) -> "UsageWriteOutcome":
+    """`UNSTORABLE` for a data-class failure, else `FAILED` (#310, D5).
+
+    The classification is the indexer's `poison_sqlstate`, reused rather than
+    reimplemented: it walks `orig` and `__cause__` (never `__context__`),
+    lets the first SQLSTATE decide, and never calls a connection or interface
+    failure poison. Imported here because `indexer` imports half the server.
+    Any failure to classify is `FAILED` — the conservative answer, which keeps
+    today's requeue.
+    """
+    try:
+        from src.services.indexer import poison_sqlstate  # local: avoids a cycle
+
+        if poison_sqlstate(exc) is not None:
+            return UsageWriteOutcome.UNSTORABLE
+    except Exception:  # noqa: BLE001
+        pass
+    return UsageWriteOutcome.FAILED
+
+
+# Truncate long top-level string params (e.g. note content). Counted in code
+# points, before rendering, so the cut cannot split a surrogate pair or an
+# escape; `render_usage_params` can then grow a rendered string to at most
+# 6 × _MAX_PARAM_LEN + 1 stored characters (every code point a lone
+# surrogate, `\udXXX`) — #310, design D4.
+_MAX_PARAM_LEN = 200
 _MAX_QUERY_RESULTS = 500
 _MAX_SEMANTIC_RESULTS = 50
 
@@ -795,8 +946,7 @@ async def _confirmed_publication(uid: int | None, publish):
     try:
         return None, await confirmed_publication(uid, publish)
     except VaultAssignmentChanged as exc:
-        timing.record("error", _VAULT_REASSIGNED_MARKER)
-        return str(exc), None
+        return _body_refusal(str(exc), _VAULT_REASSIGNED_MARKER), None
     except VaultAnchorUnavailable as exc:
         # The bound root itself could not be resolved — a cold cache, or an
         # ownerless credential in multi-user mode. The admission gate refuses
@@ -811,8 +961,7 @@ async def _confirmed_publication(uid: int | None, publish):
         # `src/services/usage_stats.py` as a value meaning "the body never
         # started". Sharing it made the most expensive refusal in the server
         # invisible to the latency view.
-        timing.record("error", _ANCHOR_LOST_AT_PUBLISH_MARKER)
-        return str(exc), None
+        return _body_refusal(str(exc), _ANCHOR_LOST_AT_PUBLISH_MARKER), None
 
 
 #: Exception type -> `(caller-facing message, usage_logs marker, event reason)`
@@ -1265,6 +1414,20 @@ def _rate_limited_message(scope: str, retry_after: int) -> str:
     )
 
 
+def _slot_timeout_message(pressure: concurrency.Pressure, queue_ms: float) -> str:
+    waited = f" after waiting {queue_ms / 1000:.3f} seconds" if queue_ms > 0 else " now"
+    return refusals.render(
+        f"Error: no concurrency capacity is available{waited} "
+        f"(scope {pressure.scope}, limit {pressure.limit}). The call was refused "
+        "before its body ran and spent no daily quota. Retry later or reduce "
+        "parallel calls; no release time is guaranteed.",
+        refusals.Refusal(
+            code=refusals.SLOT_TIMEOUT, scope=pressure.scope,
+            limit=pressure.limit, limit_unit=refusals.CONCURRENT_CALLS,
+        ),
+    )
+
+
 def _rate_refusal_template(tool_name: str, params: dict, scope: str) -> dict:
     """The complete row a coalescing window will write, captured when it opens.
 
@@ -1281,16 +1444,24 @@ def _rate_refusal_template(tool_name: str, params: dict, scope: str) -> dict:
     a call that never ran; the pre-body predicate keeps such rows out of the
     latency aggregates regardless.
     """
+    # Auth/request pressure belongs to the actual refusal row too, without
+    # replacing its real error or creating a synthetic observed request.
+    measured = timing.current() or {}
+    for key in ("concurrency_shadow", "concurrency_queue"):
+        if measured.get(key) is not None:
+            params = {**params, key: measured[key]}
     return dict(
         key_id=current_api_key_id.get(),
         oauth_token_id=current_oauth_token_id.get(),
         user_id=current_user_id.get(),
         tool=tool_name,
-        params={
+        # Provenance is captured with the template, so a deferred flush
+        # carries the mode and epoch the refusal happened under (#188 D8).
+        params=_with_provenance({
             **params,
             "error": _RATE_LIMITED_MARKER,
             _RATE_LIMIT_SCOPE_PARAM: scope,
-        },
+        }),
         duration_ms=0,
         response_size=0,
         **_actor_columns(),
@@ -1342,6 +1513,7 @@ def _tracked(
     refusal_result=None,
     write_class: bool = False,
     arg_char_caps: dict[str, int] | None = None,
+    resource_class: str | None = None,
 ):
     """Decorator that times the call and logs it to usage_logs.
 
@@ -1378,12 +1550,15 @@ def _tracked(
     screen already lives there, and auditing each interpolation one at a time
     is how the #149 class stayed open for two audit rounds.
 
-    **The gate order is L2 → L3 → L4 → L5 → L6 → body** — general bucket,
-    write bucket, vault admission, the two argument screens, daily quota, and
+    **The gate order is L2 → L3 → L4 → L5 → slots → L6 → body** — general bucket,
+    write bucket, vault admission, the two argument screens, concurrency, daily quota, and
     only then the tool. The buckets are first because they are the only gate
     that is pure arithmetic; the quota stays **last** because it is the only
     gate that consumes something durable, and nothing durable may be spent by a
     call that does not run.
+
+    `resource_class` declares a class for internal test tools; registered tools
+    use concurrency.TOOL_CLASSES and cannot override that closed mapping.
     """
     transforms = transforms or {}
     arg_char_caps = arg_char_caps or {}
@@ -1454,9 +1629,30 @@ def _tracked(
             # statement of any kind. Its count lands on the next row that key
             # writes, or on the tick / shutdown flush.
             log_row = True
+            slot_lease = None
             try:
                 refusal = None
                 extra: dict = {}
+                controller = concurrency.get_controller()
+                mode = controller.mode
+                # The middleware's transport observations (#188 D4): zero-wait
+                # would-refuses in shadow, waits and overruns in queue. They
+                # annotate this call's own row and never replace its outcome.
+                transport_observations = (
+                    concurrency.request_observations.get()
+                    if mode in ("shadow", "queue") else ()
+                )
+                configured_wait_ms = controller.configured_wait_ms()
+                if mode == "shadow":
+                    if shadow := concurrency.shadow_metadata(
+                            transport_observations,
+                            configured_wait_ms=configured_wait_ms):
+                        timing.record("concurrency_shadow", shadow)
+                elif mode == "queue":
+                    if queued := concurrency.queue_metadata(transport_observations):
+                        timing.record("concurrency_queue", queued)
+                if mode in ("queue", "enforce"):
+                    timing.record("transport_queue_ms", current_transport_queue_ms.get())
 
                 # ── L2 and L3: the two per-principal token buckets, the first
                 # gates in the decorator (design D3).
@@ -1589,6 +1785,60 @@ def _tracked(
                         )
                         extra = {"error": _ARGUMENT_TOO_LONG_MARKER}
                 if refusal is None:
+                    # All tool dimensions are admitted together before quota,
+                    # with one bounded wait and no held database connection.
+                    principal = current_principal.get()
+                    if principal is not None:
+                        admission = await controller.tool(
+                            tool_name, current_user_id.get(), principal,
+                            resource_class=resource_class,
+                        )
+                        # The lease is held through quota, the body and the
+                        # telemetry tail, and released in the outer `finally`
+                        # (D5: the lease stays held through telemetry).
+                        slot_lease = admission.lease
+                        if mode != "off":
+                            timing.record("queue_ms", admission.queue_ms)
+                        if mode == "shadow":
+                            shadow = concurrency.shadow_metadata(
+                                (*transport_observations, admission.pressure),
+                                configured_wait_ms=configured_wait_ms,
+                            )
+                            if shadow is not None:
+                                timing.record("concurrency_shadow", shadow)
+                        elif mode == "queue":
+                            # An ordinary wait or an overrun. An overrun is a
+                            # grant: it takes no `slot_timeout` path and goes
+                            # on to the quota gate exactly like any other call
+                            # (D7); the annotation never changes its outcome.
+                            queued = concurrency.queue_metadata(
+                                (*transport_observations, admission.observation))
+                            if queued is not None:
+                                timing.record("concurrency_queue", queued)
+                        if not admission.admitted:
+                            pressure = admission.pressure
+                            refusal = _slot_timeout_message(pressure, admission.queue_ms)
+                            def slot_template():
+                                try:
+                                    params = named_params()
+                                except Exception:
+                                    params = {}
+                                row = _rate_refusal_template(tool_name, params, pressure.scope)
+                                row["params"].pop(_RATE_LIMIT_SCOPE_PARAM, None)
+                                row["params"].update(
+                                    error=refusals.SLOT_TIMEOUT,
+                                    concurrency_scope=pressure.scope,
+                                    queue_ms=admission.queue_ms,
+                                )
+                                return row
+                            planned = rate_limits.record_rate_refusal(
+                                principal, tool_name, refusals.SLOT_TIMEOUT,
+                                pressure.scope, slot_template,
+                            )
+                            log_row = False
+                            if planned is not None:
+                                await rate_limits.write_planned_row(planned)
+                if refusal is None:
                     # L6 — the last admission gate (#162), deliberately after
                     # every other one: a call refused for having no vault or for
                     # an unencodable argument must consume no quota, because
@@ -1681,6 +1931,31 @@ def _tracked(
                     # Whatever the service measured. Absent for tools that
                     # measure nothing, so `params` keeps its current shape.
                     logged.update(timing.current() or {})
+                    # Only the terminal typed body result decides this outcome.
+                    # A plain string, even one quoting a sentinel, is content.
+                    body_outcome = (
+                        result if isinstance(result, BodyOutcome)
+                        else result._body_outcome if isinstance(result, ReadNoteResult)
+                        else None
+                    ) if refusal is None else None
+                    if body_outcome is not None:
+                        logged["error"] = body_outcome.marker
+                        logged["body_outcome"] = body_outcome.disposition
+                        # Generic observation failure must not suppress the
+                        # usage row or alter a completed publication's result.
+                        try:
+                            security_events.emit(
+                                "tool_body_outcome",
+                                subject=_security_subject(),
+                                tool=tool_name,
+                                reason=body_outcome.marker,
+                                outcome=body_outcome.disposition,
+                                user_id=current_user_id.get(),
+                                key_id=current_api_key_id.get(),
+                                oauth_token_id=current_oauth_token_id.get(),
+                            )
+                        except Exception:
+                            pass
                     if log_row:
                         await _log_usage(
                             tool_name, logged, duration_ms, _response_size(result)
@@ -1692,40 +1967,36 @@ def _tracked(
                     # own text is withheld because a `transforms` or
                     # serialisation failure quotes the arguments or the result,
                     # which are note content and vault paths (design D2).
-                    security_events.emit(
-                        "tool_telemetry_failed",
-                        subject=_security_subject(),
-                        tool=tool_name,
-                        error_type=type(tail_exc).__name__,
-                    )
-                # **After the usage row, before the result goes back.** After,
-                # so `duration_ms` measures the tool and not the commit — a
-                # latency view that folded git into `edit_note` would report a
-                # slow filesystem as a slow tool. Before the return, because
-                # "the commit exists by the time the agent is told the write
-                # succeeded" is the property that makes the history usable, and
-                # a background task would reorder against the next call's
-                # commit and be dropped outright at shutdown.
-                #
-                # Nothing was recorded unless a publication actually succeeded,
-                # so a refusal, a `dry_run` and a `No changes` result all reach
-                # this line and do nothing.
+                    try:
+                        security_events.emit(
+                            "tool_telemetry_failed",
+                            subject=_security_subject(),
+                            tool=tool_name,
+                            error_type=type(tail_exc).__name__,
+                        )
+                    except Exception:
+                        pass
                 if git_token is not None:
                     await _commit_vault_writes(tool_name)
                 return result
             finally:
-                if sync_guard is not None:
-                    await sync_guard.__aexit__(None, None, None)
-                timing.clear(token)
-                _current_tool_name.reset(name_token)
-                if git_token is not None:
-                    git_vault.clear(git_token)
+                try:
+                    if sync_guard is not None:
+                        await sync_guard.__aexit__(None, None, None)
+                finally:
+                    if slot_lease is not None:
+                        slot_lease.release()
+                    timing.clear(token)
+                    _current_tool_name.reset(name_token)
+                    if git_token is not None:
+                        git_vault.clear(git_token)
 
         # Structural marker. `tests/test_issue_66_*` asserts that every tool
         # registered on the MCP server delegates to something carrying it, so
         # "the admission gate is inherited by construction" is checked rather
         # than asserted.
         wrapper.__tracked_tool__ = tool_name
+        wrapper.__concurrency_class__ = resource_class or concurrency.TOOL_CLASSES.get(tool_name)
         return wrapper
     return decorator
 
@@ -1962,14 +2233,20 @@ async def read_note_impl(
     metadata_budget = settings.max_read_response_chars
     cap = settings.max_read_response_chars
 
-    def _fail(message: str) -> ReadNoteResult:
+    def _fail(message: BodyOutcome) -> ReadNoteResult:
         # `_scalar_safe` is the last line of defence, not the first: the path
         # and the selector are both refused at admission when they carry an
         # unpaired surrogate, precisely so no error message has to quote one.
         # It stays because an error string that cannot be serialized is a
         # protocol error, and this function is the only place every one of them
         # passes through.
-        result = ReadNoteResult(error=_scalar_safe(_bounded(message, metadata_budget)))
+        # Sanitize before truncation: escaping a surrogate expands its prose.
+        # Reserve the authoritative machine line, never truncate it away.
+        sentinel_budget = len(refusals.sentinel_line(message.refusal)) + 1
+        prose = _bounded(_scalar_safe(message.prose), metadata_budget - sentinel_budget)
+        outcome = message.with_prose(prose)
+        result = ReadNoteResult(error=str(outcome))
+        result._body_outcome = outcome
         # An over-long or unencodable path is refused before it is echoed
         # anywhere; every other error names the path the caller asked for,
         # exactly.
@@ -1983,23 +2260,23 @@ async def read_note_impl(
     try:
         note = read_file(path, user_id=uid)
     except FileNotFoundError:
-        return _fail(f"Note not found: {path}")
+        return _fail(_body_refusal(f"Note not found: {path}", "not_found"))
     except ValueError as e:
-        return _fail(str(e))
+        return _fail(_body_refusal(str(e), "validation_failed"))
 
     if limit is not None:
         if limit < 1:
-            return _fail(f"read_note: limit must be >= 1 (got {limit}).")
+            return _fail(_body_refusal(f"read_note: limit must be >= 1 (got {limit}).", "invalid_argument"))
         cap = min(limit, cap)
     if offset < 0:
-        return _fail(f"read_note: offset must be >= 0 (got {offset}).")
+        return _fail(_body_refusal(f"read_note: offset must be >= 0 (got {offset}).", "invalid_argument"))
     content = note["content"]
     heading: str | None = None
     body = content
     if section is not None:
         parts, err = extract_section_parts(content, section)
         if err is not None:
-            return _fail(err)
+            return _fail(_body_refusal(err, "selector_unresolved"))
         heading, body = parts
 
     total = len(body)
@@ -2009,13 +2286,13 @@ async def read_note_impl(
         # only a *continuation* offset can run off the end.
         if offset == total:
             return _fail(
-                f"read_note: offset {offset:,} is exactly the end of "
+                _body_refusal(f"read_note: offset {offset:,} is exactly the end of "
                 f"{_origin_label(section)} in {path} ({total:,} chars) — the "
-                "whole selection has been read, there is nothing further."
+                "whole selection has been read, there is nothing further.", "read_window_unavailable")
             )
         return _fail(
-            f"read_note: offset {offset:,} is past the end of "
-            f"{_origin_label(section)} in {path} ({total:,} chars)."
+            _body_refusal(f"read_note: offset {offset:,} is past the end of "
+            f"{_origin_label(section)} in {path} ({total:,} chars).", "read_window_unavailable")
         )
 
     truncated = offset > 0 or next_offset is not None
@@ -2081,13 +2358,18 @@ async def list_notes_impl(
     limit = _clamp_limit(limit)
     uid = current_user_id.get()
     async with async_session() as session:
-        stmt = select(NoteMetadata).order_by(NoteMetadata.modified_at.desc())
+        # Only the columns the listing renders (#280, D6); `file_path` breaks
+        # exact `modified_at` ties so membership and order at the LIMIT no
+        # longer depend on the plan.
+        stmt = select(
+            NoteMetadata.file_path, NoteMetadata.file_size, NoteMetadata.modified_at
+        ).order_by(NoteMetadata.modified_at.desc(), NoteMetadata.file_path.asc())
         stmt = apply_note_filters(
             stmt, folder=folder or None, tags=tags, frontmatter=frontmatter, user_id=uid
         )
         stmt = stmt.limit(limit)
         result = await session.execute(stmt)
-        notes = result.scalars().all()
+        notes = result.all()
 
     if not notes:
         return f"No markdown files in '{folder or '/'}'"
@@ -2150,13 +2432,20 @@ async def get_recent_impl(
     limit = _clamp_limit(limit)
     uid = current_user_id.get()
     async with async_session() as session:
-        query = select(NoteMetadata).order_by(NoteMetadata.modified_at.desc())
+        # Only the columns the listing renders (#280, D6), with the same
+        # `file_path` tie-break as `list_notes`.
+        query = select(
+            NoteMetadata.file_path,
+            NoteMetadata.title,
+            NoteMetadata.tags,
+            NoteMetadata.modified_at,
+        ).order_by(NoteMetadata.modified_at.desc(), NoteMetadata.file_path.asc())
         query = apply_note_filters(
             query, folder=folder, tags=tags, frontmatter=frontmatter, user_id=uid
         )
         query = query.limit(limit)
         result = await session.execute(query)
-        notes = result.scalars().all()
+        notes = result.all()
 
     if not notes:
         return "No recent notes found"
@@ -2219,8 +2508,7 @@ async def semantic_search_impl(
         # of the latency percentiles. The caller-facing code and the
         # operator-facing marker answer different questions and are permitted
         # to differ — here they do.
-        timing.record("error", _PROVIDER_INPUT_REJECTED_MARKER)
-        return refusals.render(
+        return BodyOutcome(
             "Error: the embedding provider refused this query as too large "
             f"for its own input limit: {exc.reason} The query is under "
             f"{MAX_SEARCH_QUERY_CHARS} characters, but a character cap cannot "
@@ -2241,6 +2529,7 @@ async def semantic_search_impl(
                 limit=None,
                 limit_unit=None,
             ),
+            marker=_PROVIDER_INPUT_REJECTED_MARKER,
         )
     if not results:
         return f"No semantic results for '{query}' (embeddings may still be building)"
@@ -2427,7 +2716,7 @@ def _precondition_refusal(
     length — and none carries a retry delay: no interval makes a stale hash
     match, a malformed one canonical, or a file smaller than a cap.
     """
-    return refusals.render(
+    return BodyOutcome(
         prose,
         refusals.Refusal(
             code=code,
@@ -2437,6 +2726,7 @@ def _precondition_refusal(
             cap_bytes=cap_bytes,
             nothing_written=nothing_written,
         ),
+        disposition="partial" if nothing_written is None else "refused",
     )
 
 
@@ -2685,7 +2975,6 @@ def _require_write() -> str | None:
     """
     if current_permission.get() == "readwrite":
         return None
-    timing.record("error", _PERMISSION_DENIED_MARKER)
     uid = current_user_id.get()
     actor = _actor_columns()
     security_events.emit(
@@ -2700,9 +2989,9 @@ def _require_write() -> str | None:
         oauth_token_id=current_oauth_token_id.get(),
     )
     return (
-        "Permission denied: this credential has read-only access. Write "
+        _body_refusal("Permission denied: this credential has read-only access. Write "
         "permission is required — a 'readwrite' API key, or an OAuth token "
-        "carrying the 'readwrite' scope."
+        "carrying the 'readwrite' scope.", "permission_denied")
     )
 
 
@@ -2725,14 +3014,14 @@ def _leaf_state_error(target, path: str, *, missing: str | None = None) -> str |
     """
     info = target.lstat()
     if info is None:
-        return missing
+        return _body_refusal(missing, "not_found") if missing is not None else None
     if stat.S_ISLNK(info.st_mode):
         return (
-            f"{path} became a symbolic link after it was validated — mutating "
-            "tools act only on the named file. Nothing was changed."
+            _body_refusal(f"{path} became a symbolic link after it was validated — mutating "
+            "tools act only on the named file. Nothing was changed.", "unsafe_path")
         )
     if not stat.S_ISREG(info.st_mode):
-        return f"{path} is not a regular file. Nothing was changed."
+        return _body_refusal(f"{path} is not a regular file. Nothing was changed.", "unsafe_path")
     return None
 
 
@@ -2811,30 +3100,30 @@ def _verify_the_moved_inode(
         info = dst_target.lstat()
     except OSError as exc:
         return (
-            f"Move published but unverifiable: {from_path} was moved to "
+            _body_refusal(f"Move published but unverifiable: {from_path} was moved to "
             f"{to_rel} and the result could not be inspected ({exc}). Nothing "
-            "was reindexed; check both paths before retrying."
+            "was reindexed; check both paths before retrying.", "publication_uncertain", disposition="partial")
         )
     if info is None:
         return (
-            f"Move published but {to_rel} is already gone: something removed "
+            _body_refusal(f"Move published but {to_rel} is already gone: something removed "
             f"or replaced it immediately after {from_path} was moved there. "
-            "Nothing was reindexed; check both paths before retrying."
+            "Nothing was reindexed; check both paths before retrying.", "publication_uncertain", disposition="partial")
         )
 
     arrived = (info.st_dev, info.st_ino)
     if moved is not None and arrived != moved:
         return (
-            f"Move published but {to_rel} is not the file that was moved: "
+            _body_refusal(f"Move published but {to_rel} is not the file that was moved: "
             "something else took that name immediately afterwards. Nothing was "
             "reindexed and nothing was moved back — check both paths before "
-            "retrying."
+            "retrying.", "publication_uncertain", disposition="partial")
         )
     if moved is None:
         return (
-            f"Move published but unverifiable: {from_path} could not be "
+            _body_refusal(f"Move published but unverifiable: {from_path} could not be "
             f"identified before it was moved to {to_rel}. Nothing was "
-            "reindexed; check both paths before retrying."
+            "reindexed; check both paths before retrying.", "publication_uncertain", disposition="partial")
         )
     if stat.S_ISREG(info.st_mode):
         return None
@@ -2854,13 +3143,13 @@ def _verify_the_moved_inode(
         move_file_no_clobber(dst_target, src_target, permit=permit)
     except Exception as exc:
         return (
-            f"Move refused: {from_path} was replaced by {kind} after it was "
+            _body_refusal(f"Move refused: {from_path} was replaced by {kind} after it was "
             f"checked, and it could not be moved back ({exc}). It is now at "
-            f"{to_rel} — restore it from there. Nothing was reindexed."
+            f"{to_rel} — restore it from there. Nothing was reindexed.", "partial_completion", disposition="partial")
         )
     return (
-        f"Move refused: {from_path} was replaced by {kind} after it was "
-        "checked. It was moved back and nothing was reindexed."
+        _body_refusal(f"Move refused: {from_path} was replaced by {kind} after it was "
+        "checked. It was moved back and nothing was reindexed.", "concurrent_write")
     )
 
 
@@ -2872,7 +3161,7 @@ def _note_size_error_for(size: int) -> str | None:
     instead of paying for a second one inside the check.
     """
     if size > MAX_NOTE_BYTES:
-        return f"Content too large ({size} bytes, max {MAX_NOTE_BYTES})"
+        return _body_refusal(f"Content too large ({size} bytes, max {MAX_NOTE_BYTES})", "size_limit")
     return None
 
 
@@ -2901,11 +3190,11 @@ def _frontmatter_defect_error(tool: str, path: str, diagnosis) -> str:
     surface can rewrite a block that does not parse.
     """
     return (
-        f"{tool}: {path} has a malformed frontmatter block — "
+        _body_refusal(f"{tool}: {path} has a malformed frontmatter block — "
         f"{diagnosis.message}. Nothing was written. Read the note, then repair "
         "the whole file with `edit_note(path, content=<complete note text>, "
         "replace_frontmatter=True)`, which replaces the frontmatter block "
-        "along with the body."
+        "along with the body.", "content_unsafe")
     )
 
 
@@ -2965,7 +3254,7 @@ def _unmatched_fence_error(path: str, scan_text: str, diagnosis=None) -> str | N
         return None
     where = "; ".join(o.describe() for o in openers)
     return (
-        f"edit_note: {path} contains an indented fence opener that nothing "
+        _body_refusal(f"edit_note: {path} contains an indented fence opener that nothing "
         f"below it closes — {where}. Nothing was written. A fence indented by "
         "one to three spaces may be inside a list item, whose code block ends "
         "where the item does; this server does not parse container blocks, so "
@@ -2973,7 +3262,7 @@ def _unmatched_fence_error(path: str, scan_text: str, diagnosis=None) -> str | N
         "and a section write there would either split the block or replace "
         "real content. Close the fence (or unindent it to column zero), then "
         "reissue the section write. `read_note(path, section=...)` still "
-        "works, and a whole-note `edit_note` without `section=` is unaffected."
+        "works, and a whole-note `edit_note` without `section=` is unaffected.", "content_unsafe")
     )
 
 
@@ -3068,14 +3357,7 @@ def _move_precondition_error(
         "backlink sources a rewrite_links=True move would rewrite are not "
         "bound, because you never read them.)"
     )
-    prose, newline, line = err.rpartition("\n")
-    if not newline or not refusals.has_sentinel(err):
-        # Defensive: the renderer always appends the sentinel on its own final
-        # line, and if that ever stops being true the scope sentence still gets
-        # said rather than being silently dropped into the machine-readable
-        # half.
-        return f"{err}{scope}"
-    return f"{prose}{scope}\n{line}"
+    return err.with_prose(err.prose + scope)
 
 
 @_tracked("create_note", ["path", "expected_hash"], write_class=True)
@@ -3129,7 +3411,7 @@ async def create_note_impl(
     try:
         target = open_mutable(path, user_id=uid)
     except ValueError as e:
-        return str(e)
+        return _body_refusal(str(e), "validation_failed")
     with target:
         if err := _note_size_error(content):
             return err
@@ -3164,12 +3446,12 @@ async def create_note_impl(
             # symlink identically, so the bare "already exists" would hide a
             # leaf that turned into a link after validation.
             return _leaf_state_error(target, path) or (
-                f"Note already exists: {path}. Use edit_note to modify it."
+                _body_refusal(f"Note already exists: {path}. Use edit_note to modify it.", "already_exists")
             )
         except (ValueError, vault_fs.VaultFSError) as e:
-            return str(e)
+            return _body_refusal(str(e), "validation_failed")
         except OSError as e:
-            return f"Failed to write {path}: {e}"
+            return _body_refusal(f"Failed to write {path}: {e}", "io_failure")
 
 
 # Row-level excerpt bound for the graph tools. `link_text` is note text the
@@ -3229,7 +3511,7 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
         )
         target = (await session.execute(target_stmt)).scalar_one_or_none()
         if target is None:
-            return f"Note not found: {path}"
+            return _body_refusal(f"Note not found: {path}", "not_found")
 
         SourceMeta = NoteMetadata
         # The owner predicate rides the JOIN: a link row whose *source* is
@@ -3302,7 +3584,7 @@ async def get_links_impl(path: str, limit: int = 100) -> str:
         )
         source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
-            return f"Note not found: {path}"
+            return _body_refusal(f"Note not found: {path}", "not_found")
 
         TargetMeta = aliased(NoteMetadata)
         # The owner predicate is part of the outer join's ON clause, not a
@@ -3457,7 +3739,7 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
         )
         source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
-            return f"Note not found: {path}"
+            return _body_refusal(f"Note not found: {path}", "not_found")
 
         # BFS state.
         seen: dict[int, dict] = {source.id: {"distance": 0, "via": None}}
@@ -3528,10 +3810,13 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
         ids = [nid for nid in seen if nid != source.id]
         if not ids:
             return f"`{path}` has no resolved-link neighbors"
-        meta_stmt = select(NoteMetadata).where(
+        # Only the columns the listing renders (#280, D6).
+        meta_stmt = select(
+            NoteMetadata.id, NoteMetadata.file_path, NoteMetadata.title, NoteMetadata.tags
+        ).where(
             NoteMetadata.id.in_(ids), _note_owner_predicate(uid)
         )
-        meta_rows = (await session.execute(meta_stmt)).scalars().all()
+        meta_rows = (await session.execute(meta_stmt)).all()
         meta_by_id = {m.id: m for m in meta_rows}
         # Drop any ids that the user_id filter excluded (shouldn't happen
         # under normal operation but keeps the output consistent).
@@ -3582,11 +3867,16 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
     """
     from sqlalchemy import select
     from src.models.db import NoteEmbedding, NoteMetadata
+    from src.services import vector_index
 
     # Pull more than `limit` so we can dedupe by note. Same overfetch as
     # semantic_search so both vector paths share one recall contract.
     overfetch = max(limit * 5, 50)
-    distance = NoteEmbedding.embedding.cosine_distance(avg_embedding)
+    # As in `semantic_search` (#283, D19): ORDER BY the half-precision index
+    # expression, so the HNSW index picks the candidates; select, re-sort by
+    # and report the full-precision distance. Above 2000 dimensions there is
+    # no index and the two are one expression.
+    order, distance = vector_index.order_and_full_distance(avg_embedding)
     stmt = (
         select(
             NoteEmbedding.note_id,
@@ -3607,12 +3897,8 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
     # why the caller's zero-row exact fallback is unconditional — there is no
     # unfiltered form of this statement left (D1a).
     stmt = stmt.where(_note_owner_predicate(user_id))
-    # Current vectors only (migration 025). `find_related` answers "what else
-    # is like this note", present tense; a historical row would offer a note as
-    # a neighbour on the strength of a paragraph its author deleted, and the
-    # chunk it quotes back would be that paragraph.
     stmt = apply_embedding_validity(stmt)
-    return stmt.order_by(distance).limit(overfetch)
+    return stmt.order_by(order).limit(overfetch)
 
 
 @_tracked("find_related", ["path", "limit"])
@@ -3656,9 +3942,8 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
             # zero-result. `result_count` is still recorded so the key's type
             # is uniform across every row this tool writes — the analytics
             # page excludes the row on the marker, not on a missing key.
-            timing.record("error", _RELATED_SOURCE_NOT_FOUND_MARKER)
             timing.record_results(())
-            return f"Note not found: {path}"
+            return _body_refusal(f"Note not found: {path}", "related_source_not_found")
 
         # `IS DISTINCT FROM`, so a NULL `embedded_content_hash` is stale rather
         # than NULL-propagating into "fresh" — Python's `!=` against `None` is
@@ -3683,11 +3968,10 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
             # has not reached it. A fact about the indexer, not about the
             # vault's contents, so it carries its own marker and stays out of
             # the zero-result view.
-            timing.record("error", _RELATED_SOURCE_NOT_EMBEDDED_MARKER)
             timing.record_results(())
             return (
-                f"`{path}` has not been embedded yet — "
-                "the indexer is still catching up. Try again in a few minutes."
+                _body_refusal(f"`{path}` has not been embedded yet — "
+                "the indexer is still catching up. Try again in a few minutes.", "related_source_not_embedded")
             )
 
         # The query vector: the mean of this note's own chunk vectors. NumPy is
@@ -3728,8 +4012,11 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         timing.record("exact_fallback", exact_fallback)
         timing.add_ms("db_ms", time.monotonic() - vector_start)
 
-        # `relaxed_order` does not promise a globally sorted stream; re-sort
-        # before dedupe so the presented order is monotone in distance.
+        # `relaxed_order` does not promise a globally sorted stream, and the
+        # scan was ordered by the half-precision index expression (#283, D19).
+        # Re-sort by the selected full-precision `distance` **before** the
+        # dedupe, so the nearest chunk per note and the presented order are
+        # both full precision.
         rows = sorted(rows, key=lambda r: r.distance)
 
     if not rows:
@@ -3749,9 +4036,10 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
             empty.append(_stale_source_line(path))
         return "\n".join(empty)
 
-    # Dedupe by note_id, keeping the nearest chunk — ranked by the *same*
-    # cosine distance the database ordered by, never by a distance recomputed
-    # here. pgvector compares float32 vectors; NumPy would recompute in
+    # Dedupe by note_id, keeping the nearest chunk — ranked by the
+    # full-precision cosine distance the database selected (#283: the scan
+    # itself is ordered by the half-precision index expression), never by a
+    # distance recomputed here. pgvector compares float32 vectors; NumPy would recompute in
     # float64 from the round-tripped values and order near-ties differently,
     # so a recomputed ranking could invert two rows relative to the ORDER BY
     # that selected them (and relative to the recall baseline). `similarity`
@@ -3845,10 +4133,19 @@ async def find_orphans_impl(folder: str | None = None, limit: int = 50) -> str:
             NoteLink.target_note_id.isnot(None), edge_within_owned_set
         )
         connected = union(sources, targets).subquery()
-        stmt = select(NoteMetadata).where(NoteMetadata.id.notin_(select(connected.c.nid)))
+        # Only the columns the listing renders (#280, D6). NULL `modified_at`
+        # stays last; `file_path` breaks exact ties deterministically.
+        stmt = select(
+            NoteMetadata.file_path,
+            NoteMetadata.title,
+            NoteMetadata.tags,
+            NoteMetadata.modified_at,
+        ).where(NoteMetadata.id.notin_(select(connected.c.nid)))
         stmt = apply_note_filters(stmt, folder=folder, user_id=uid)
-        stmt = stmt.order_by(NoteMetadata.modified_at.desc().nullslast()).limit(limit)
-        notes = (await session.execute(stmt)).scalars().all()
+        stmt = stmt.order_by(
+            NoteMetadata.modified_at.desc().nullslast(), NoteMetadata.file_path.asc()
+        ).limit(limit)
+        notes = (await session.execute(stmt)).all()
 
     if not notes:
         scope = f" in `{folder}`" if folder else ""
@@ -3987,8 +4284,8 @@ async def edit_note_impl(
         operation = operation.lower()
         if operation not in {"append", "replace"}:
             return (
-                'edit_note: operation must be "append" or "replace" '
-                f'(got {operation!r}).'
+                _body_refusal('edit_note: operation must be "append" or "replace" '
+                f'(got {operation!r}).', "invalid_argument")
             )
         if operation == "append":
             append = True
@@ -4019,7 +4316,7 @@ async def edit_note_impl(
                 "is what makes a full replacement overwrite the frontmatter "
                 "block instead of preserving it."
             )
-        return message
+        return _body_refusal(message, "invalid_argument")
 
     uid = current_user_id.get()
     from src.services.vault import parse_frontmatter_diagnose, replace_section
@@ -4033,7 +4330,7 @@ async def edit_note_impl(
         # read and the write can redirect the write.
         target = open_mutable(path, user_id=uid)
     except ValueError as e:
-        return str(e)
+        return _body_refusal(str(e), "validation_failed")
     with target:
         if err := _leaf_state_error(
             target,
@@ -4066,11 +4363,11 @@ async def edit_note_impl(
                 over_cap=True,
             ):
                 return err
-            return f"Failed to read {path}: {e}"
+            return _body_refusal(f"Failed to read {path}: {e}", "size_limit")
         except Exception as e:
             # Includes OSError: an ELOOP from the `O_NOFOLLOW` read means the leaf
             # became a symlink after validation. That is a refusal, not a crash.
-            return f"Failed to read {path}: {e}"
+            return _body_refusal(f"Failed to read {path}: {e}", "io_failure")
 
         # Immediately after the read and before everything else this tool does:
         # mode dispatch, the size cap, the `dry_run` diff and every no-op or
@@ -4088,7 +4385,7 @@ async def edit_note_impl(
         try:
             existing = existing_bytes.decode("utf-8")
         except Exception as e:
-            return f"Failed to read {path}: {e}"
+            return _body_refusal(f"Failed to read {path}: {e}", "io_failure")
 
         new_content: str | None = None
         success_message: str = f"Updated note: {path}"
@@ -4117,26 +4414,26 @@ async def edit_note_impl(
                 return err
             new_body, err = replace_section(scan_text, section, content)
             if err is not None:
-                return err
+                return _body_refusal(err, "selector_unresolved")
             new_content = diagnosis.block + new_body
         elif find is not None:
             if find == "":
                 return (
-                    "edit_note: find must be a non-empty string. "
-                    "An empty find would match every position and corrupt the note."
+                    _body_refusal("edit_note: find must be a non-empty string. "
+                    "An empty find would match every position and corrupt the note.", "invalid_argument")
                 )
             count = existing.count(find)
             if count == 0:
                 preview = existing[:500]
                 return (
-                    f"Find text not found in {path}. "
-                    f"First 500 chars of note:\n---\n{preview}\n---"
+                    _body_refusal(f"Find text not found in {path}. "
+                    f"First 500 chars of note:\n---\n{preview}\n---", "match_not_found")
                 )
             if count > 1 and not replace_all:
                 return (
-                    f"Find text matches {count} locations in {path}. "
+                    _body_refusal(f"Find text matches {count} locations in {path}. "
                     "Provide more surrounding context to match a unique section, "
-                    "or set replace_all=True."
+                    "or set replace_all=True.", "match_ambiguous")
                 )
             if replace_all:
                 new_content = existing.replace(find, content)
@@ -4224,9 +4521,9 @@ async def edit_note_impl(
                 # and here is the new hash", this one means "the file moved
                 # during my call, so no hash from before it can be valid".
                 return _concurrent_write_refusal(str(e), path)
-            return str(e)
+            return _body_refusal(str(e), "validation_failed")
         except OSError as e:
-            return f"Failed to write {path}: {e}"
+            return _body_refusal(f"Failed to write {path}: {e}", "io_failure")
         git_vault.record_write(target.root, target.rel)
         return success_message + _published_hash_clause(
             new_content.encode("utf-8")
@@ -4646,7 +4943,7 @@ async def _stale_extraction_error(session, uid) -> str | None:
     if not stale:
         return None
     return (
-        "Move aborted: this vault's index is still being re-derived after a "
+        _body_refusal("Move aborted: this vault's index is still being re-derived after a "
         "note-parsing change, so the link graph is not yet a trustworthy list "
         "of the notes that link here — a link the previous parser read as code "
         "has no row yet, and rewriting would silently leave it pointing at the "
@@ -4654,7 +4951,7 @@ async def _stale_extraction_error(session, uid) -> str | None:
         "moved, rewritten or reindexed. The re-derivation runs automatically "
         "on the indexer's next pass (within about five minutes); retry after "
         "that, or move now with rewrite_links=False and update the links "
-        "yourself."
+        "yourself.", "index_not_ready")
     )
 
 
@@ -4780,7 +5077,7 @@ async def _move_note_locked(
     and never carries `nothing_written: true`: the move happened, and a caller
     told otherwise goes looking for a note that has already relocated.
     """
-    from sqlalchemy import select, update
+    from sqlalchemy import or_, select, update
     from src.models.db import NoteLink, NoteMetadata
     from src.services.links import build_vault_index
 
@@ -4798,9 +5095,9 @@ async def _move_note_locked(
             dst_target = open_mutable(to_path, user_id=uid)
             targets.append(dst_target)
         except ValueError as e:
-            return str(e)
+            return _body_refusal(str(e), "validation_failed")
         except OSError as e:
-            return f"Could not open {from_path} or {to_path}: {e}"
+            return _body_refusal(f"Could not open {from_path} or {to_path}: {e}", "io_failure")
         if err := _leaf_state_error(
             src_target,
             from_path,
@@ -4823,9 +5120,9 @@ async def _move_note_locked(
                     src_target, from_path, note_cap_bytes
                 )
             except OSError as e:
-                return f"Failed to read {from_path}: {e}"
+                return _body_refusal(f"Failed to read {from_path}: {e}", "io_failure")
             if incumbent is None and not over_cap:
-                return f"Source note not found: {from_path}"
+                return _body_refusal(f"Source note not found: {from_path}", "not_found")
             if err := _move_precondition_error(
                 from_path, incumbent, expected_hash, over_cap=over_cap
             ):
@@ -4927,9 +5224,9 @@ async def _move_note_locked(
                 shared_root_fd = os.dup(src_target.root_fd)
             except OSError as e:
                 return (
-                    "Move aborted: ran out of file descriptors before the link "
+                    _body_refusal("Move aborted: ran out of file descriptors before the link "
                     f"rewrites could be planned ({e}). Nothing was moved, "
-                    "rewritten or reindexed."
+                    "rewritten or reindexed.", "resource_limit")
                 )
             for original_src_path in rewrite_sources:
                 # A moved note may link to itself: it is still at its old path now,
@@ -5015,11 +5312,11 @@ async def _move_note_locked(
                         # mutation, which is still free at this point.
                         drop(read_target)
                         return (
-                            "Move aborted: ran out of file descriptors while "
+                            _body_refusal("Move aborted: ran out of file descriptors while "
                             f"planning the link rewrites ({e}). Nothing was "
                             "moved, rewritten or reindexed. Move without "
                             "rewrite_links and update links in batches, or "
-                            "raise the process's RLIMIT_NOFILE."
+                            "raise the process's RLIMIT_NOFILE.", "resource_limit")
                         )
                     # `move_rewrite_failed` rather than a bare
                     # `logger.warning`: a caller can drive this branch on
@@ -5047,8 +5344,8 @@ async def _move_note_locked(
                     # not run, so nothing has been mutated.
                     drop(read_target)
                     return (
-                        f"Move aborted: {e} Nothing was moved, rewritten or "
-                        "reindexed."
+                        _body_refusal(f"Move aborted: {e} Nothing was moved, rewritten or "
+                        "reindexed.", "unsafe_path")
                     )
                 except MoveRewriteCapExceeded as e:
                     # Not a per-source failure either: rewriting all but this
@@ -5059,11 +5356,11 @@ async def _move_note_locked(
                     # phase 2, while that is still free.
                     drop(read_target)
                     return (
-                        f"Move aborted: rewriting links in {e.source_path} would "
+                        _body_refusal(f"Move aborted: rewriting links in {e.source_path} would "
                         f"change {e.count} links, more than the per-note limit "
                         f"(MAX_LINKS_PER_NOTE={e.cap}). Nothing was moved, "
                         "rewritten or reindexed. Move without rewrite_links and "
-                        "update that note's links in batches instead."
+                        "update that note's links in batches instead.", "resource_limit")
                     )
                 except MoveRewriteOverlap as e:
                     # Same disposition, and for a stronger reason: this source
@@ -5094,12 +5391,12 @@ async def _move_note_locked(
                     )
                     drop(read_target)
                     return (
-                        f"Move aborted: {original_src_path} holds a link to "
+                        _body_refusal(f"Move aborted: {original_src_path} holds a link to "
                         f"{from_rel} nested inside another link to it, and "
                         "rewriting either would corrupt the other. Nothing was "
                         "moved, rewritten or reindexed. Move without "
                         "rewrite_links, or rewrite that note's nested link by "
-                        "hand first."
+                        "hand first.", "content_unsafe")
                     )
                 except Exception as e:
                     security_events.emit(
@@ -5121,20 +5418,20 @@ async def _move_note_locked(
                 new_size = len(new_content.encode("utf-8"))
                 if err := _note_size_error_for(new_size):
                     return (
-                        f"Move aborted: rewriting links in {original_src_path} would "
-                        f"exceed the note size limit ({err}). Nothing was moved, "
-                        "rewritten or reindexed."
+                        _body_refusal(f"Move aborted: rewriting links in {original_src_path} would "
+                        f"exceed the note size limit ({err.prose}). Nothing was moved, "
+                        "rewritten or reindexed.", "size_limit")
                     )
                 rewrite_bytes_held += len(original_bytes) + new_size
                 if rewrite_bytes_held > MAX_MOVE_REWRITE_BYTES:
                     return (
-                        f"Move aborted: rewriting links across "
+                        _body_refusal(f"Move aborted: rewriting links across "
                         f"{len(planned_rewrites) + 1} notes would need "
                         f"{rewrite_bytes_held} bytes in memory (limit "
                         f"{MAX_MOVE_REWRITE_BYTES} bytes, "
                         f"{MAX_MOVE_REWRITE_BYTES // (1024 * 1024)} MiB). Nothing "
                         "was moved, rewritten or reindexed. Move without "
-                        "rewrite_links and update links in batches instead."
+                        "rewrite_links and update links in batches instead.", "resource_limit")
                     )
                 # Descriptors, for the same reason as the bytes above: each
                 # planned rewrite pins one open parent fd from here until its
@@ -5148,11 +5445,11 @@ async def _move_note_locked(
                 fd_budget = max_move_rewrite_sources()
                 if len(planned_rewrites) + 1 > fd_budget:
                     return (
-                        f"Move aborted: rewriting links across more than "
+                        _body_refusal(f"Move aborted: rewriting links across more than "
                         f"{fd_budget} notes would hold more open file "
                         "descriptors than this process can spare. Nothing was "
                         "moved, rewritten or reindexed. Move without "
-                        "rewrite_links and update links in batches instead."
+                        "rewrite_links and update links in batches instead.", "resource_limit")
                     )
                 planned_rewrites.append(
                     (out_path, write_target, original_bytes, new_content, n)
@@ -5168,7 +5465,7 @@ async def _move_note_locked(
                 for src, openers in undecidable_sources
             )
             return (
-                "Move aborted: rewriting links would touch "
+                _body_refusal("Move aborted: rewriting links would touch "
                 f"{len(undecidable_sources)} note(s) containing an indented "
                 f"fence opener that nothing below them closes — {where}. "
                 "Nothing was moved, rewritten or reindexed. A fence indented "
@@ -5177,7 +5474,7 @@ async def _move_note_locked(
                 "container blocks, so it cannot tell whether a link below the "
                 "opener is code or content. Close the fences (or unindent "
                 "them to column zero), or move with rewrite_links=False and "
-                "update the links yourself."
+                "update the links yourself.", "content_unsafe")
             )
 
         # ── Phase 2: commit ─────────────────────────────────────────────────────
@@ -5209,15 +5506,15 @@ async def _move_note_locked(
         try:
             err, verify_error = await _confirmed_publication(uid, _commit_the_move)
         except FileExistsError:
-            return _leaf_state_error(dst_target, to_path) or (
-                f"Destination already exists: {to_path}"
+            return _leaf_state_error(dst_target, to_path) or _body_refusal(
+                f"Destination already exists: {to_path}", "already_exists"
             )
         except FileNotFoundError:
-            return f"Source note not found: {from_path}"
+            return _body_refusal(f"Source note not found: {from_path}", "not_found")
         except (ValueError, vault_fs.VaultFSError) as e:
-            return f"Move failed: {e}"
+            return _body_refusal(f"Move failed: {e}", "validation_failed")
         except OSError as e:
-            return f"Move failed: {e}"
+            return _body_refusal(f"Move failed: {e}", "io_failure")
         if err:
             return err
         if verify_error:
@@ -5340,6 +5637,18 @@ async def _move_note_locked(
                         file_path=to_rel,
                         title=title,
                         embedded_content_hash=None,
+                        # Re-derive progress (#311, D3): a move is not a
+                        # re-deriving pass's derivation of this row.
+                        derived_under=None,
+                        # The scan's stat shortcut (#282, D10): NULL makes the
+                        # next pass read and hash the moved file rather than
+                        # trust a stat recorded for the old path. Carrying it
+                        # would be sound (it names an inode state), but one
+                        # extra read per move buys not having to argue it.
+                        stat_size=None,
+                        stat_mtime_ns=None,
+                        stat_ctime_ns=None,
+                        stat_ino=None,
                     )
                 )
                 await session.execute(nm_update)
@@ -5350,6 +5659,30 @@ async def _move_note_locked(
                 # the legacy behavior is preserved.
                 user_note_ids = select(NoteMetadata.id).where(
                     _note_owner_predicate(uid)
+                )
+                # Re-derive progress (#311, D3). The `target_path` rewrite
+                # below changes these sources' extracted link state without
+                # changing their path, hash or extraction version, and the
+                # planned rewrites are about to change their files: neither may
+                # stay marked derived under a root, or a later re-derive could
+                # carry the mutated link state forward and certify it.
+                rewritten_sources = [planned[0] for planned in planned_rewrites]
+                await session.execute(
+                    update(NoteMetadata)
+                    .where(
+                        _note_owner_predicate(uid),
+                        NoteMetadata.derived_under.is_not(None),
+                        or_(
+                            NoteMetadata.id.in_(
+                                select(NoteLink.source_note_id).where(
+                                    NoteLink.target_path == from_rel,
+                                    NoteLink.source_note_id.in_(user_note_ids),
+                                )
+                            ),
+                            NoteMetadata.file_path.in_(rewritten_sources),
+                        ),
+                    )
+                    .values(derived_under=None)
                 )
                 link_update = (
                     update(NoteLink)
@@ -5374,6 +5707,7 @@ async def _move_note_locked(
         rewrites_done = 0
         files_modified = 0
         stopped: str | None = None
+        partial_marker: str | None = None
         # The moved note's own rewrite, tracked apart from the backlink
         # sources: only it can change what is at the destination, so only it
         # can change which hash this call may honestly report.
@@ -5400,6 +5734,7 @@ async def _move_note_locked(
                     ),
                 )
                 if err:
+                    partial_marker = err.marker
                     outcome = "reassigned"
             except VaultConfirmationUnavailable as exc:
                 # The assignment could **not be read at all** — a database
@@ -5423,7 +5758,7 @@ async def _move_note_locked(
                     tool=_current_tool_name.get(),
                     error_type=type(exc).__name__,
                 )
-                timing.record("error", _CONFIRMATION_UNAVAILABLE_MARKER)
+                partial_marker = _CONFIRMATION_UNAVAILABLE_MARKER
                 outcome = "unavailable"
             except UnconfirmedPublication:
                 # A publish helper refusing an unconfirmed target is a bug in
@@ -5511,8 +5846,14 @@ async def _move_note_locked(
                 "reported, because none this server could name would describe "
                 f"what is on disk. Re-read {to_rel} before writing to it.)"
             )
-            return _concurrent_write_refusal(
+            conflict = _concurrent_write_refusal(
                 " — ".join(parts), to_rel, nothing_written=None
+            )
+            # A later publication refusal historically wins usage attribution;
+            # the caller still needs the moved note's concurrent-write code.
+            return BodyOutcome(
+                conflict.prose, conflict.refusal,
+                marker=partial_marker or conflict.marker, disposition="partial",
             )
 
         published = (
@@ -5522,7 +5863,12 @@ async def _move_note_locked(
             parts.append(f"content_hash: {content_hash_for_bytes(published)}")
         else:
             parts.append(_hash_unavailable_clause(to_rel))
-        return " — ".join(parts) if len(parts) > 1 else parts[0]
+        message = " — ".join(parts) if len(parts) > 1 else parts[0]
+        if db_failed or failed_rewrite_sources or stopped:
+            return _body_refusal(
+                message, partial_marker or "partial_completion", disposition="partial"
+            )
+        return message
     finally:
         for opened in targets:
             opened.close()
@@ -5570,7 +5916,7 @@ async def delete_note_impl(
     try:
         target = open_mutable(path, user_id=uid)
     except ValueError as e:
-        return str(e)
+        return _body_refusal(str(e), "validation_failed")
     with target:
         if err := _leaf_state_error(
             target, path, missing=f"Note not found: {path}"
@@ -5588,12 +5934,12 @@ async def delete_note_impl(
             try:
                 incumbent, over_cap = _read_incumbent(target, path, cap_bytes)
             except OSError as e:
-                return f"Failed to read {path}: {e}"
+                return _body_refusal(f"Failed to read {path}: {e}", "io_failure")
             if incumbent is None and not over_cap:
                 # It was there for `_leaf_state_error` and is gone now. Today's
                 # answer for a delete of a note that does not exist, not a
                 # precondition refusal about bytes that no longer exist either.
-                return f"Note not found: {path}"
+                return _body_refusal(f"Note not found: {path}", "not_found")
             if err := _precondition_error(
                 "delete_note",
                 path,
@@ -5618,13 +5964,7 @@ async def delete_note_impl(
                 if err:
                     return err
             except OSError as e:
-                return f"Permanent delete failed: {e}"
-            # A deletion is a commit like any other: `git add -A -- <path>` on
-            # a path that no longer exists stages the removal, so the same
-            # helper covers it and there is no second code path to keep in
-            # step. Without it a deleted note would sit as an uncommitted
-            # removal until the sweep, and `git log -- <path>` would place the
-            # deletion minutes after it happened and attribute it to nobody.
+                return _body_refusal(f"Permanent delete failed: {e}", "io_failure")
             git_vault.record_write(target.root, target.rel)
             return f"Permanently deleted: {path}"
 
@@ -5656,26 +5996,19 @@ async def delete_note_impl(
             if err:
                 return err
         except _TrashUnusable as e:
-            return str(e)
+            return _body_refusal(str(e), "io_failure")
         except vault_fs.UnsupportedFilesystem as e:
-            return str(e)
+            return _body_refusal(str(e), "unsupported_filesystem")
         except FileNotFoundError:
-            return f"Note not found: {path}"
+            return _body_refusal(f"Note not found: {path}", "not_found")
         except vault_fs.UnsafePath as e:
-            return str(e)
+            return _body_refusal(str(e), "unsafe_path")
         except vault_fs.Conflict as e:
-            return f"{e}. Nothing was deleted."
+            return _body_refusal(f"{e}. Nothing was deleted.", "concurrent_write")
         except vault_fs.VaultFSError as e:
-            return str(e)
+            return _body_refusal(str(e), "io_failure")
         except OSError as e:
-            return f"Soft-delete failed: {e}"
-        # Only the source path. The `.trash/` destination is ignored by
-        # `deploy/vault.gitignore` on purpose — a trash directory is a
-        # recycle bin, not history, and committing it would keep every deleted
-        # note's bytes in the repository for ever under a timestamped name,
-        # which is the opposite of what a soft delete is for. So from git's
-        # point of view a soft delete is a deletion, and the bytes remain
-        # recoverable from both `.trash/` and the commit's parent.
+            return _body_refusal(f"Soft-delete failed: {e}", "io_failure")
         git_vault.record_write(target.root, target.rel)
         return f"Soft-deleted: {path} → {dest}"
 
@@ -5813,7 +6146,7 @@ async def set_frontmatter_impl(
         # read-modify-write (see `edit_note_impl`).
         target = open_mutable(path, user_id=uid)
     except ValueError as e:
-        return str(e)
+        return _body_refusal(str(e), "validation_failed")
     with target:
         if err := _leaf_state_error(
             target, path, missing=f"Note not found: {path}"
@@ -5837,11 +6170,11 @@ async def set_frontmatter_impl(
                 over_cap=True,
             ):
                 return err
-            return f"Failed to read {path}: {e}"
+            return _body_refusal(f"Failed to read {path}: {e}", "size_limit")
         except Exception as e:
             # OSError included — an ELOOP here means the leaf was swapped for a
             # link after validation; report it rather than raising.
-            return f"Failed to read {path}: {e}"
+            return _body_refusal(f"Failed to read {path}: {e}", "io_failure")
 
         # Immediately after the read: ahead of the defect diagnosis, the lossy
         # refusal and the empty-`updates` no-op.
@@ -5858,7 +6191,7 @@ async def set_frontmatter_impl(
         try:
             raw = raw_bytes.decode("utf-8")
         except Exception as e:
-            return f"Failed to read {path}: {e}"
+            return _body_refusal(f"Failed to read {path}: {e}", "io_failure")
 
         fm, body, diagnosis = parse_frontmatter_diagnose(raw)
         # D6: diagnosis precedes the no-op check. A caller passing neither
@@ -5879,11 +6212,11 @@ async def set_frontmatter_impl(
             # same reason: the repair is the caller's to make deliberately.
             keys = ", ".join(f"`{k}`" for k in sorted(diagnosis.lossy))
             return (
-                f"set_frontmatter: {path} has frontmatter this server cannot "
+                _body_refusal(f"set_frontmatter: {path} has frontmatter this server cannot "
                 f"represent, under {keys}, so rewriting the block from the "
                 "parsed mapping would silently delete it. Edit the raw block "
                 "with `edit_note(find=...)`, or replace it with "
-                "`edit_note(replace_frontmatter=True)`."
+                "`edit_note(replace_frontmatter=True)`.", "content_unsafe")
             )
 
         if not updates and not remove:
@@ -5947,9 +6280,9 @@ async def set_frontmatter_impl(
         except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
             if _is_in_call_conflict(e):
                 return _concurrent_write_refusal(str(e), path)
-            return str(e)
+            return _body_refusal(str(e), "validation_failed")
         except OSError as e:
-            return f"Failed to write {path}: {e}"
+            return _body_refusal(f"Failed to write {path}: {e}", "io_failure")
 
         git_vault.record_write(target.root, target.rel)
         summary: list[str] = []
@@ -5997,13 +6330,13 @@ def _capped_text(text: str, path: str, offset: int, cap: int) -> str:
     if not chunk and offset > 0:
         if offset == len(text):
             return (
-                f"read_file: offset {offset:,} is exactly the end of {path} "
+                _body_refusal(f"read_file: offset {offset:,} is exactly the end of {path} "
                 f"({len(text):,} chars) — the whole file has been read, there "
-                f"is nothing further."
+                f"is nothing further.", "read_window_unavailable")
             )
         return (
-            f"read_file: offset {offset:,} is past the end of {path} "
-            f"({len(text):,} chars)."
+            _body_refusal(f"read_file: offset {offset:,} is past the end of {path} "
+            f"({len(text):,} chars).", "read_window_unavailable")
         )
     shown_to = min(offset, len(text)) + len(chunk)
     notice = (
@@ -6032,24 +6365,24 @@ async def read_file_impl(
     base64 for a byte-exact frontmatter block, or hash_only for its file hash.
     """
     if encoding not in ("auto", "text", "base64"):
-        return f"Invalid encoding '{encoding}'. Use 'auto', 'text', or 'base64'."
+        return _body_refusal(f"Invalid encoding '{encoding}'. Use 'auto', 'text', or 'base64'.", "invalid_argument")
     if hash_only and (offset != 0 or limit is not None):
-        return "read_file: hash_only cannot be combined with offset or limit windows."
+        return _body_refusal("read_file: hash_only cannot be combined with offset or limit windows.", "invalid_argument")
     if offset < 0:
-        return f"read_file: offset must be >= 0 (got {offset})."
+        return _body_refusal(f"read_file: offset must be >= 0 (got {offset}).", "invalid_argument")
     cap = settings.max_read_response_chars
     if limit is not None:
         if limit < 1:
-            return f"read_file: limit must be >= 1 (got {limit})."
+            return _body_refusal(f"read_file: limit must be >= 1 (got {limit}).", "invalid_argument")
         cap = min(limit, cap)
 
     uid = current_user_id.get()
     try:
         data = read_bytes(path, user_id=uid, max_bytes=settings.max_file_read_bytes)
     except FileNotFoundError:
-        return f"File not found: {path}"
+        return _body_refusal(f"File not found: {path}", "not_found")
     except ValueError as e:
-        return str(e)
+        return _body_refusal(str(e), "validation_failed")
 
     if hash_only:
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
@@ -6065,8 +6398,8 @@ async def read_file_impl(
             return _capped_text(data.decode("utf-8"), path, offset, cap)
         except UnicodeDecodeError:
             return (
-                f"Cannot decode {path} as UTF-8 text (not valid UTF-8). "
-                'Use encoding="base64" for binary files.'
+                _body_refusal(f"Cannot decode {path} as UTF-8 text (not valid UTF-8). "
+                'Use encoding="base64" for binary files.', "invalid_argument")
             )
 
     if encoding == "base64":
@@ -6132,7 +6465,7 @@ async def write_file_impl(
     if err := _require_write():
         return err
     if encoding not in ("base64", "text"):
-        return f"Invalid encoding '{encoding}'. Use 'base64' or 'text'."
+        return _body_refusal(f"Invalid encoding '{encoding}'. Use 'base64' or 'text'.", "invalid_argument")
 
     uid = current_user_id.get()
     # Validate before decoding and before the size check, for the same reason
@@ -6141,7 +6474,7 @@ async def write_file_impl(
     try:
         target = open_mutable(path, user_id=uid)
     except ValueError as e:
-        return str(e)
+        return _body_refusal(str(e), "validation_failed")
 
     with target:
         # Absence is fine — this tool creates — but a leaf that became a link
@@ -6164,7 +6497,7 @@ async def write_file_impl(
             try:
                 incumbent, over_cap = _read_incumbent(target, path, read_cap)
             except OSError as exc:
-                return _leaf_state_error(target, path) or f"Failed to read {path}: {exc}"
+                return _leaf_state_error(target, path) or _body_refusal(f"Failed to read {path}: {exc}", "io_failure")
             if err := _precondition_error(
                 "write_file", path, incumbent, expected_hash,
                 no_incumbent=incumbent is None and not over_cap,
@@ -6182,8 +6515,8 @@ async def write_file_impl(
                 data = base64.b64decode(content, validate=True)
             except (binascii.Error, ValueError):
                 return (
-                    "Invalid base64 content: could not decode. "
-                    "No file was written."
+                    _body_refusal("Invalid base64 content: could not decode. "
+                    "No file was written.", "invalid_argument")
                 )
         else:
             data = content.encode("utf-8")
@@ -6198,8 +6531,8 @@ async def write_file_impl(
         cap, cap_name = _write_cap_for(target.rel)
         if len(data) > cap:
             return (
-                f"Content too large ({len(data):,} bytes, "
-                f"max {cap:,} — {cap_name}). No file was written."
+                _body_refusal(f"Content too large ({len(data):,} bytes, "
+                f"max {cap:,} — {cap_name}). No file was written.", "size_limit")
             )
 
         try:
@@ -6213,14 +6546,14 @@ async def write_file_impl(
                 return err
         except FileExistsError:
             return _leaf_state_error(target, path) or (
-                f"File already exists: {path}. Pass overwrite=True to replace it."
+                _body_refusal(f"File already exists: {path}. Pass overwrite=True to replace it.", "already_exists")
             )
         except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
             if _is_in_call_conflict(e):
                 return _concurrent_write_refusal(str(e), path)
-            return str(e)
+            return _body_refusal(str(e), "validation_failed")
         except OSError as e:
-            return f"Failed to write {path}: {e}"
+            return _body_refusal(f"Failed to write {path}: {e}", "io_failure")
         git_vault.record_write(target.root, target.rel)
         result = f"Wrote {len(data):,} bytes to {path}"
         if over_cap or len(data) > read_cap:
@@ -6246,9 +6579,9 @@ async def list_files_impl(
             folder, pattern=pattern, recursive=recursive, limit=limit, user_id=uid
         )
     except NotADirectoryError as e:
-        return str(e)
+        return _body_refusal(str(e), "invalid_path")
     except ValueError as e:
-        return str(e)
+        return _body_refusal(str(e), "validation_failed")
 
     where = folder or "."
     if not entries:
@@ -6404,14 +6737,14 @@ def _mint_preflight(
         return err
     base = settings.public_base_url
     if base is None:
-        return _NO_PUBLIC_ORIGIN
+        return _body_refusal(_NO_PUBLIC_ORIGIN, "transfer_unavailable")
     uid = current_user_id.get()
     try:
         root, rel = _vault_context(path, uid)
     except ValueError as e:
-        return str(e)
+        return _body_refusal(str(e), "validation_failed")
     except RuntimeError as e:  # cold vault-path cache in multi-user mode
-        return str(e)
+        return _body_refusal(str(e), "transfer_unavailable")
     if need_write:
         try:
             vault_fs.check_publication_support(root)
@@ -6428,9 +6761,9 @@ def _mint_preflight(
             # has streamed.
             vault_fs.check_destination_mount(root, rel, overwrite=overwrite)
         except vault_fs.UnsupportedFilesystem as e:
-            return str(e)
+            return _body_refusal(str(e), "unsupported_filesystem")
         except (OSError, vault_fs.VaultFSError) as e:
-            return f"Vault root is not usable: {e}"
+            return _body_refusal(f"Vault root is not usable: {e}", "io_failure")
     return uid, root, rel, base.rstrip("/")
 
 
@@ -6475,12 +6808,12 @@ async def request_upload_impl(
     try:
         fingerprint = _fingerprint_of(root, rel)
     except vault_fs.UnsafePath as e:
-        return str(e)
+        return _body_refusal(str(e), "unsafe_path")
     if fingerprint is not None and not overwrite:
         return (
-            f"File already exists: {rel}. Pass overwrite=True to replace it "
+            _body_refusal(f"File already exists: {rel}. Pass overwrite=True to replace it "
             "(the link will then refuse to publish if the file changes before "
-            "the upload). Nothing was minted."
+            "the upload). Nothing was minted.", "already_exists")
         )
 
     # The number the agent is told **must be the number the route enforces**.
@@ -6512,7 +6845,7 @@ async def request_upload_impl(
                 expires_in=expires_in,
             )
         except transfer.CredentialNotUsable as e:
-            return f"{e} Nothing was minted."
+            return _body_refusal(f"{e} Nothing was minted.", "credential_unusable")
 
     return (
         f"Upload link for `{rel}` (expires {_expiry_line(row)}):\n\n"
@@ -6555,9 +6888,9 @@ async def check_upload_impl(upload_id: str) -> str:
         # message deliberately does not echo the value back: it may be the
         # token, and the tool result is itself model context.
         return (
-            "not found: that is not an upload_id. `check_upload` takes the "
+            _body_refusal("not found: that is not an upload_id. `check_upload` takes the "
             "`upload_id` from `request_upload` (22 characters), not the upload "
-            "URL and not the token after the `#`."
+            "URL and not the token after the `#`.", "invalid_argument")
         )
     # The identity is the request's credential as `APIKeyMiddleware` resolved
     # it. `lookup_by_public_id` is what turns it into a *principal*: an API key
@@ -6596,7 +6929,7 @@ async def check_upload_impl(upload_id: str) -> str:
     if row is None:
         # Also the answer for another identity's upload_id: an agent must not
         # be able to probe for handles it did not mint.
-        return f"not found: no upload link with id {upload_id} was minted by this identity."
+        return _body_refusal(f"not found: no upload link with id {upload_id} was minted by this identity.", "not_found")
 
     # Precise status is allowed here and only here: this side is authenticated
     # and identity-scoped, which is exactly where the transfer design puts
@@ -6693,14 +7026,14 @@ async def request_download_impl(path: str, expires_in: int | None = None) -> str
     except vault_fs.UnsafePath as e:
         # Covers both a symlink and a directory: neither is a file we will
         # hand out, and the message says which.
-        return str(e)
+        return _body_refusal(str(e), "unsafe_path")
     if fingerprint is None:
-        return f"File not found: {rel}. Nothing was minted."
+        return _body_refusal(f"File not found: {rel}. Nothing was minted.", "not_found")
 
     try:
         head = _head_bytes(root, rel)
     except OSError as e:
-        return f"Could not read {rel}: {e}. Nothing was minted."
+        return _body_refusal(f"Could not read {rel}: {e}. Nothing was minted.", "io_failure")
     _kind, mime = classify_bytes(head, PurePosixPath(rel).name)
 
     async with async_session() as session:
@@ -6716,7 +7049,7 @@ async def request_download_impl(path: str, expires_in: int | None = None) -> str
                 expires_in=expires_in,
             )
         except transfer.CredentialNotUsable as e:
-            return f"{e} Nothing was minted."
+            return _body_refusal(f"{e} Nothing was minted.", "credential_unusable")
 
     return (
         f"Download link for `{rel}` (expires {_expiry_line(row)}):\n\n"
@@ -6757,7 +7090,17 @@ def _url_host(url) -> str:
     A URL is caller-supplied and can carry a credential in its query string, so
     only the host goes to `usage_logs` — enough to audit where the server was
     made to connect, not enough to replay it.
+
+    A value longer than `MAX_IMPORT_URL_CHARS` is never converted or parsed
+    (#322): it is the fixed placeholder `<over-long>`. `named_params()` runs
+    this transform on every row, the length refusal's included, and parsing a
+    near-limit argument here was the highest memory peak in the reproduction.
     """
+    try:
+        if len(url) > MAX_IMPORT_URL_CHARS:
+            return "<over-long>"
+    except TypeError:
+        pass  # no length: not a string; `str()` below decides
     try:
         return urlsplit(str(url)).hostname or "<no host>"
     except ValueError:
@@ -6769,6 +7112,7 @@ def _url_host(url) -> str:
     ["url", "path", "overwrite"],
     transforms={"url": _url_host},
     write_class=True,
+    arg_char_caps={"url": MAX_IMPORT_URL_CHARS},
 )
 async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> str:
     """Fetch a public URL straight into the vault, under the outbound policy."""
@@ -6780,11 +7124,11 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
     try:
         fingerprint = _fingerprint_of(root, rel)
     except vault_fs.UnsafePath as e:
-        return str(e)
+        return _body_refusal(str(e), "unsafe_path")
     if fingerprint is not None and not overwrite:
         return (
-            f"File already exists: {rel}. Pass overwrite=True to replace it. "
-            "Nothing was fetched."
+            _body_refusal(f"File already exists: {rel}. Pass overwrite=True to replace it. "
+            "Nothing was fetched.", "already_exists")
         )
 
     # The four fields `stream_to_vault` reads. Not a token row: an import is
@@ -6829,9 +7173,9 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
             )
             final_url = fetched.final_url
     except transfer.SSRFError as e:
-        return f"Refused to fetch that URL: {e}"
+        return _body_refusal(f"Refused to fetch that URL: {e}", "fetch_refused")
     except transfer.TooLarge as e:
-        return f"{e} ({cap_name}). Nothing was written."
+        return _body_refusal(f"{e} ({cap_name}). Nothing was written.", "size_limit")
     except transfer.QueueTimeout as e:
         # **Needs its own clause**: `QueueTimeout` is deliberately not a
         # `Timeout` subclass (the two are different verdicts about the same
@@ -6843,14 +7187,14 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
         # act on, and `_tracked` records the call as a server fault. Nothing
         # was staged and nothing was fetched; the same call may simply be
         # retried.
-        return f"{e}. Nothing was written."
+        return _body_refusal(f"{e}. Nothing was written.", "transfer_busy")
     except transfer.Timeout as e:
-        return f"{e}. Nothing was written."
+        return _body_refusal(f"{e}. Nothing was written.", "transfer_timeout")
     except transfer.PrePublishAborted:
         return (
-            f"Your credentials are no longer valid for writing to {rel} (the key "
+            _body_refusal(f"Your credentials are no longer valid for writing to {rel} (the key "
             "was revoked, downgraded, or repointed while the fetch was in "
-            "flight). Nothing was written."
+            "flight). Nothing was written.", "credential_unusable")
         )
     except transfer.PostPublishFailure as e:
         # The one outcome where "failed" would be a lie. The bytes are at
@@ -6864,22 +7208,22 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
         # finish" must not become "and the history says nothing happened".
         git_vault.record_write(root, rel)
         return (
-            f"Imported the file to {rel}, but the server could not finish "
+            _body_refusal(f"Imported the file to {rel}, but the server could not finish "
             f"recording the import: {e}\n"
             "The file IS in place. Do not retry blindly — check it with "
-            "`read_file` or `list_files` first."
+            "`read_file` or `list_files` first.", "partial_completion", disposition="partial")
         )
     except vault_fs.Conflict as e:
-        return f"{e}. Nothing was written."
+        return _body_refusal(f"{e}. Nothing was written.", "concurrent_write")
     except vault_fs.UnsafePath as e:
-        return f"{e}. Nothing was written."
+        return _body_refusal(f"{e}. Nothing was written.", "unsafe_path")
     except vault_fs.UnsupportedFilesystem as e:
         # Not an OSError, so the clause below does not cover it. Reachable
         # from the publish itself and, since #95, from the staging directory
         # refusing to be made private.
-        return f"{e}. Nothing was written."
+        return _body_refusal(f"{e}. Nothing was written.", "unsupported_filesystem")
     except OSError as e:
-        return f"Could not write {rel}: {e}"
+        return _body_refusal(f"Could not write {rel}: {e}", "io_failure")
 
     # `import_from_url` is the eighth write-class tool and publishes vault
     # bytes through an authenticated MCP call like the other seven, so it
@@ -6923,7 +7267,7 @@ async def delete_file_impl(
     try:
         root, rel = _vault_context(path, uid)
     except (ValueError, RuntimeError) as e:
-        return str(e)
+        return _body_refusal(str(e), "validation_failed")
 
     # **Canonicalise first, then refuse.** The markdown guard has to run on the
     # component the filesystem will actually open, because the caller's string
@@ -6933,9 +7277,9 @@ async def delete_file_impl(
     # tool that does not know about the index or the backlink graph.
     if PurePosixPath(rel).name.lower().endswith(".md"):
         return (
-            f"{rel} is a markdown note. Use `delete_note` for notes — it is the "
+            _body_refusal(f"{rel} is a markdown note. Use `delete_note` for notes — it is the "
             "tool that knows about the index and about backlinks. `delete_file` "
-            "handles everything else."
+            "handles everything else.", "invalid_argument")
         )
 
     # #88, before `check_trash_support` creates anything and before either
@@ -7010,21 +7354,21 @@ async def delete_file_impl(
         if err:
             return err
     except _TrashUnusable as e:
-        return str(e)
+        return _body_refusal(str(e), "io_failure")
     except vault_fs.UnsupportedFilesystem as e:
-        return str(e)
+        return _body_refusal(str(e), "unsupported_filesystem")
     except FileNotFoundError:
-        return f"File not found: {rel}"
+        return _body_refusal(f"File not found: {rel}", "not_found")
     except vault_fs.UnsafePath as e:
         # A symlink or a directory. Neither is something to delete on the
         # strength of a path an agent chose.
-        return str(e)
+        return _body_refusal(str(e), "unsafe_path")
     except vault_fs.Conflict as e:
-        return f"{e}. Nothing was deleted."
+        return _body_refusal(f"{e}. Nothing was deleted.", "concurrent_write")
     except vault_fs.VaultFSError as e:
-        return str(e)
+        return _body_refusal(str(e), "validation_failed")
     except OSError as e:
-        return f"Failed to delete {rel}: {e}"
+        return _body_refusal(f"Failed to delete {rel}: {e}", "io_failure")
     if precondition_refusal is not None:
         # The delete did not happen: `_delete` returns before any destructive
         # step when the precondition fails. Nothing to record — and the check

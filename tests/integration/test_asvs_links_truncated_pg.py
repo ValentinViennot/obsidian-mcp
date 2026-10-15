@@ -239,6 +239,7 @@ async def test_the_pass_stamps_the_current_extraction_version(sessionmaker, vaul
     # read it. What the test is actually about is that the pass *stamps* the
     # note with the current version, whatever that version happens to be.
     assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION
+    assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION == 4
 
 
 # ── get_links is bounded, and says what it is bounding ────────────────────

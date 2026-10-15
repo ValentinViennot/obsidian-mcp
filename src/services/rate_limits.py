@@ -17,7 +17,13 @@ properties that must survive every edit:
   make the control stricter, and nobody can *choose* to collide with a victim.
   Principals are authenticated, so their cardinality is bounded by the
   credentials that exist: a dict with a hard cap and an amortised sweep, past
-  which further principals share one overflow entry.
+  which further principals share one overflow entry. The panel login budget is
+  the third registry and the only **exactly** keyed one: its key space is the
+  `users` table, so it gets a plain dict swept on access, and merging two keys
+  there would be a cross-account denial rather than a bound. The key-creation
+  budget (#323) is the same shape twice over: an exact account dict, and an
+  address dict charged only on admitted creations, so both are bounded by what
+  was admitted in the window.
 * **An entry is evictable only when it is full and idle.** A fresh entry starts
   full, so evicting a *depleted* one would hand back free capacity — idling
   through the sweep would be a way to reset a spent bucket. An entry holding an
@@ -194,12 +200,24 @@ _sweep_queue: list[Principal] = []
 _address_salt: bytes = secrets.token_bytes(16)
 _address_table: list["_AddressSlot | None"] = []
 
+#: The panel login budget's counters, keyed **exactly** on `users.id`. Not the
+#: salted slot table above: see `check_login_failures`.
+_login_failures: dict[int, "_LoginWindow"] = {}
+
 
 @dataclass
 class _AddressSlot:
     window_start: float
     count: int
     warned: bool = False
+
+
+@dataclass
+class _LoginWindow:
+    """One account's failed-login counter, for one fixed window."""
+
+    window_start: float
+    count: int
 
 
 def reset_state_for_tests() -> None:
@@ -215,6 +233,8 @@ def reset_state_for_tests() -> None:
     _sweep_queue = []
     _address_salt = secrets.token_bytes(16)
     _address_table = []
+    _login_failures.clear()
+    reset_key_creation_for_tests()
 
 
 # ── Configuration ───────────────────────────────────────────────────────────
@@ -397,7 +417,9 @@ class PlannedRow:
 
     `weight` is `1 + suppressed`: the number of observed refusals this row
     stands for, which is exactly what must return to `pending` if it does not
-    land.
+    land. A row is therefore acknowledged, requeued, or — only when the
+    database rejected its data (#310) — dropped, with its weight reported by
+    one `usage_refusal_row_dropped` attempt.
     """
 
     #: The complete row, ready for `write_usage_row`.
@@ -531,7 +553,9 @@ async def write_planned_row(planned: PlannedRow) -> bool:
     Returns whether the row landed. A `False` is not an error the caller has to
     handle — the count is back in the coalescer and the next rollover or tick
     will carry it — which is what makes this safe to call from the request path
-    and from housekeeping alike.
+    and from housekeeping alike. The one exception is a row the database
+    rejected for its *data* (`UNSTORABLE`, #310): that row is dropped, not
+    requeued, and reported once by `usage_refusal_row_dropped`.
     """
     # Deferred import, not a cycle: `tools.py` imports this module at load
     # time, so the reverse edge can only exist inside a function body. The
@@ -539,21 +563,53 @@ async def write_planned_row(planned: PlannedRow) -> bool:
     # a row whose credential has been deleted — the 23503 recovery that clears
     # the foreign keys and keeps the denormalised actor columns (#77), which is
     # exactly the path a deferred flush needs.
-    from src.mcp_server.tools import write_usage_row
+    from src.mcp_server import tools
 
     try:
-        landed = await write_usage_row(planned.values)
+        outcome = await tools.write_usage_row_outcome(planned.values)
     except Exception:  # noqa: BLE001 - a failed row must not fail its caller
-        landed = False
+        outcome = tools.UsageWriteOutcome.FAILED
     except BaseException:
         # Cancellation must propagate, but the unconfirmed weight survives.
         requeue(planned)
         raise
-    if not landed:
-        requeue(planned)
-    else:
+    if outcome is tools.UsageWriteOutcome.LANDED:
         planned.entry.in_flight -= 1
-    return landed
+        return True
+    if outcome is tools.UsageWriteOutcome.UNSTORABLE:
+        # #310, design D6. The database refused the row's *data*, and the
+        # template it came from will not improve: requeueing it (with its
+        # original start, on the flush path) retried the same failing INSERT
+        # on every tick for as long as the process lived. So the row is
+        # released without requeue — no window re-created, nothing added to
+        # an open window's `pending` — and its weight is reported, best
+        # effort, by one emission attempt (subject to the suppressor; it names
+        # neither principal nor scope, so it is not exact accounting, L3).
+        planned.entry.in_flight -= 1
+        _report_dropped(planned)
+        return False
+    requeue(planned)
+    return False
+
+
+def _report_dropped(planned: PlannedRow) -> None:
+    """One `usage_refusal_row_dropped` attempt. Never raises."""
+    try:
+        from src.services import security_events
+
+        values = planned.values
+        params = values.get("params") or {}
+        marker = params.get("error") if isinstance(params, dict) else None
+        security_events.emit(
+            "usage_refusal_row_dropped",
+            subject=security_events.subject_for(user_id=values.get("user_id")),
+            tool=values.get("tool"),
+            reason=marker if isinstance(marker, str) else None,
+            count=planned.weight,
+            user_id=values.get("user_id"),
+        )
+    except Exception:  # noqa: BLE001 - bookkeeping never fails its caller
+        pass
 
 
 #: The principal a refusal is coalesced under when there is none. Unreachable
@@ -765,3 +821,226 @@ def record_auth_failure(address: str | None) -> None:
         table[index] = _AddressSlot(window_start=now, count=1)
         return
     slot.count += 1
+
+
+# ── The per-account panel login budget ──────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class LoginBudgetRefusal:
+    """What the login route needs to record an over-budget account.
+
+    It carries no `retry_after_seconds` and no `first` flag, unlike
+    `AuthBudgetRefusal`: the refusal this drives is an ordinary 401 login page,
+    not a 429, so there is nothing to quote in a `Retry-After`, and the
+    suppression subject is the client address, which the security-event
+    suppressor already bounds per subject.
+    """
+
+    limit: int
+    window_seconds: int
+
+
+def _sweep_login_failures(now: float, window: int) -> None:
+    """Drop every counter whose window has passed.
+
+    A full scan, deliberately. The key space is `users.id` — administrator-
+    controlled and small — so this is O(recently-failing accounts) and the map
+    provably cannot grow past that. The fixed-size salted table the `/mcp`
+    budget uses exists because addresses are free to mint; nothing here needs
+    it, and using it would be a defect (`check_login_failures`).
+    """
+    expired = [
+        user_id
+        for user_id, entry in _login_failures.items()
+        if now - entry.window_start >= window
+    ]
+    for user_id in expired:
+        del _login_failures[user_id]
+
+
+def check_login_failures(user_id: int) -> LoginBudgetRefusal | None:
+    """Is this **account** over its failed-login budget? `None` means carry on.
+
+    Called from `login_submit` after the username has resolved to a row and
+    **before** `verify_password` — a budget consulted after the comparison
+    bounds nothing, because the guess has already been answered. It is the
+    account-keyed half of the pair slowapi cannot express: `src/limiter.py`'s
+    `key_func` is synchronous, runs before the handler, and reading the form
+    body there would consume the stream the handler needs.
+
+    **Exactly keyed, and never on a hash.** The `/mcp` failed-auth table merges
+    colliding keys, which is a *bound* there (addresses are unbounded and
+    free to mint, so a merged slot only makes the control stricter) and would
+    be a cross-account denial here: ten failures against a colliding name would
+    refuse a different account's **correct password**, and an attacker
+    submitting random names could saturate every slot without knowing any
+    victim's. A dict keyed on the row id cannot do either.
+
+    The caller passes an id only for a username that resolved, so an unknown
+    name creates no counter and consumes no account allowance; those attempts
+    stay under the 5/min address limit, which is the control appropriate to a
+    name with no credential behind it.
+
+    The threshold is inclusive on the recorded count — with a limit of 10 the
+    11th attempt is the first refused — and a refused attempt does **not**
+    increment, because no password was compared. Both halves of that arithmetic
+    live here so they cannot drift.
+    """
+    limit = settings.panel_login_failure_limit
+    if limit is None:
+        return None
+    window = settings.panel_login_failure_window_seconds
+    now = time.monotonic()
+    _sweep_login_failures(now, window)
+    entry = _login_failures.get(user_id)
+    if entry is None or entry.count < limit:
+        return None
+    return LoginBudgetRefusal(limit=limit, window_seconds=window)
+
+
+def record_login_failure(user_id: int) -> None:
+    """Charge one failed sign-in to this account's counter.
+
+    Called only from the branches where a password was actually evaluated
+    against a real row — never for a username that resolved to nothing, which
+    has no account to protect, and never on success, which is what makes the
+    counter measure guessing rather than traffic.
+    """
+    if settings.panel_login_failure_limit is None:
+        return
+    window = settings.panel_login_failure_window_seconds
+    now = time.monotonic()
+    _sweep_login_failures(now, window)
+    entry = _login_failures.get(user_id)
+    if entry is None:
+        _login_failures[user_id] = _LoginWindow(window_start=now, count=1)
+        return
+    entry.count += 1
+
+
+# ── The key-creation budget (#323) ──────────────────────────────────────────
+#
+# Both key-creation routes — `POST /api/keys` and `POST /admin/keys/create` —
+# charge this one budget, so a caller alternating JSON and form requests draws
+# on one allowance rather than two. slowapi cannot express that: it namespaces
+# its storage by the decorated endpoint, so the same decorator on two routes is
+# two buckets, and `shared_limit` charges every request reaching the decorator,
+# including the invalid ones this budget deliberately does not count.
+
+#: An account key: `("user", users.id)`, or `("single-user",)` for the
+#: sentinel, whose `id` is None. Exact, never hashed — see `_login_failures`.
+AccountKey = tuple
+
+#: Two exact dicts, swept on access. The account dict holds at most one entry
+#: per account charged in the window; the address dict is charged only on an
+#: **admitted** creation, so it holds at most one entry per admitted creation in
+#: the window — an attacker cannot grow it without a session and spent account
+#: allowance, which is why it needs no salted fixed-size table.
+_key_creation_accounts: dict[AccountKey, "_LoginWindow"] = {}
+_key_creation_addresses: dict[str | None, "_LoginWindow"] = {}
+
+KEY_CREATION_REASON_ACCOUNT = "account_budget"
+KEY_CREATION_REASON_ADDRESS = "address_budget"
+
+
+@dataclass(frozen=True)
+class KeyCreationRefusal:
+    """Why a key creation was refused, for the 429/flash and the log record.
+
+    `reason` names the refusing counter for the log only — the response names
+    the window, not the counter. When both counters refuse, `reason` is the
+    account's and `retry_after_seconds` is the later of the two windows' ends,
+    because a creation needs both to admit.
+    """
+
+    reason: str
+    limit: int
+    window_seconds: int
+    retry_after_seconds: int
+
+
+def reset_key_creation_for_tests() -> None:
+    """Forget the key-creation budget. Tests only."""
+    _key_creation_accounts.clear()
+    _key_creation_addresses.clear()
+
+
+def _sweep_key_creation(now: float, window: int) -> None:
+    """Drop every counter whose window has passed, in both dicts.
+
+    A full scan, as `_sweep_login_failures` does: both key spaces are bounded
+    by what was charged in the last window (see the dicts above), so the scan
+    is O(that) and the dicts provably cannot grow past it.
+    """
+    for registry in (_key_creation_accounts, _key_creation_addresses):
+        expired = [
+            key for key, entry in registry.items()
+            if now - entry.window_start >= window
+        ]
+        for key in expired:
+            del registry[key]
+
+
+def try_charge_key_creation(
+    account_key: AccountKey, address: str | None
+) -> KeyCreationRefusal | None:
+    """Admit and charge one key creation, or refuse it. `None` means admitted.
+
+    Called by both create handlers **after** validation, the unlimited rule and
+    the active-key cap, so a refused or invalid request never spends allowance.
+
+    Synchronous on purpose, like every update in this module: both counters are
+    checked, then both are charged, with no `await` between, so on the single
+    event loop the operation is atomic and concurrent creates cannot overshoot.
+    If either counter refuses, **neither** is charged.
+
+    `address` is the trusted client address (`request.client.host` after the
+    app's `ProxyHeadersMiddleware`). A request with none is keyed `None` — one
+    shared bucket, a bound rather than a bypass. Either limit set to null
+    disables that counter; both null disables the budget.
+    """
+    account_limit = settings.key_creation_account_limit
+    address_limit = settings.key_creation_address_limit
+    if account_limit is None and address_limit is None:
+        return None
+    window = settings.key_creation_window_seconds
+    address = address or None
+    now = time.monotonic()
+    _sweep_key_creation(now, window)
+
+    refusals: list[tuple[str, int, float]] = []
+    for reason, limit, registry, key in (
+        (KEY_CREATION_REASON_ACCOUNT, account_limit, _key_creation_accounts, account_key),
+        (KEY_CREATION_REASON_ADDRESS, address_limit, _key_creation_addresses, address),
+    ):
+        if limit is None:
+            continue
+        entry = registry.get(key)
+        if entry is not None and entry.count >= limit:
+            refusals.append((reason, limit, entry.window_start + window - now))
+    if refusals:
+        reason, limit, _ = refusals[0]
+        remaining = max(r[2] for r in refusals)
+        return KeyCreationRefusal(
+            reason=reason,
+            limit=limit,
+            window_seconds=window,
+            # Ceil, but never past the window: the spec bounds `Retry-After`
+            # by the remaining window, and a window that ends in 0.2 s is
+            # "try again in one second", not zero.
+            retry_after_seconds=min(window, max(1, math.ceil(remaining))),
+        )
+
+    for limit, registry, key in (
+        (account_limit, _key_creation_accounts, account_key),
+        (address_limit, _key_creation_addresses, address),
+    ):
+        if limit is None:
+            continue
+        entry = registry.get(key)
+        if entry is None:
+            registry[key] = _LoginWindow(window_start=now, count=1)
+        else:
+            entry.count += 1
+    return None

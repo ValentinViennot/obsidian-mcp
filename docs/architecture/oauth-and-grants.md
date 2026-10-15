@@ -221,6 +221,291 @@ vanished from the page, so the operator saw a blank space that read as success.
   later of `expires_at` and `revoked_at`. Do not unify the two — see
   [control-panel.md](control-panel.md).
 
+## A replayed authorization code revokes its family (#325)
+
+RFC 6749 §4.1.2: if an authorization code is used more than once, the server
+should revoke every token previously issued from it. Before #325 the lookup
+carried `used == False` (and the caller's `client_id`) in its WHERE clause, so
+a spent code matched nothing and was refused as unknown; `oauth_codes`
+recorded no lineage; and the cleanup deleted every used code on the next tick.
+The one signal the RFC defines for a stolen code — the legitimate client's
+exchange failing because somebody else redeemed first — was thrown away, and
+the thief kept the family.
+
+- **Lineage: `oauth_codes.grant_id`** (migration 029), written in the same
+  transaction that sets `used = True` and inserts the tokens. NULL means
+  "unspent", or "spent before 029 / by a pre-029 process during a rollout".
+- **The lookup is by `code_hash` alone**, `FOR UPDATE`,
+  `populate_existing=True` — #182's two lessons applied to codes: the `used`
+  flag is *read* off the locked row, never inferred from an empty result, and
+  a caller-supplied `client_id` must not make a row look unknown. A caller
+  `client_id` that differs from the row's is refused
+  (`invalid_grant.client_id_mismatch`, the same constant body the unknown-code
+  refusal uses) and revokes nothing.
+- **Revalidate everything a first exchange validates, then decide.** The
+  order forks on the locked row's `used` flag:
+  - **spent:** client exists and authenticates → `redirect_uri` → PKCE →
+    **the replay branch**. Code expiry is never checked on this path: a late
+    replay is necessarily near or past the code's ten-minute life, and an
+    expiry refusal would let the stolen family live.
+  - **live:** client exists and authenticates → code expiry → `redirect_uri`
+    → PKCE → ownerless / cross-user / scope → mark used + write lineage →
+    mint. Exactly the pre-#325 order, so a live code — expired or not —
+    answers every request as it always did.
+
+  Everything up to PKCE is what a party must prove to *redeem* the code, so a
+  replay that triggers revocation is exactly a second party able to redeem it.
+  Revocation keyed on a code value alone would hand anyone who saw a code (a
+  proxy log, browser history, a referrer) a way to end somebody's grant; with
+  the verifier required, a party holding only the code cannot (L11).
+- **A spent code fails revalidation exactly like an unknown code** (Codex
+  review of #325). Spent codes are now retained for seven days and found by
+  hash alone, so the specific refusals a live code gets ("PKCE verification
+  failed", "redirect_uri mismatch", the `invalid_client` 401 for a failed
+  secret or a vanished client, a mismatched `client_id`) would tell a holder
+  of the bare code that it exists and was redeemed — something the pre-#325
+  `used == False` lookup never disclosed. Every one of those failures on a
+  spent code answers the unknown-code response (status, headers, body), and
+  the specific check survives only in the bounded `oauth_token_refused`
+  record as `invalid_grant.spent_code_<check>`
+  (`client_id_mismatch`, `unknown_client`, `authentication_failed`,
+  `redirect_uri_mismatch`, `pkce_verifier_invalid`,
+  `pkce_verification_failed`). A **live** code keeps its specific responses:
+  connectors debug against them, and they were already the answer for a live
+  code, so they disclose nothing new. Do not "simplify" the fork away in
+  either direction. Timing is outside this (L6).
+- **The replay branch** (`_replay_spent_code`) is #182's reuse branch line for
+  line: no lineage → refuse (`invalid_grant.code_reused`), nothing revoked or
+  committed; otherwise `lock_grant` then `revoke_grant_family`, commit only if
+  rows flipped. Lock order bootstrap → code row → grant → token rows; the
+  refresh path takes bootstrap → grant and never a code row, the panel the
+  grant only, so there is no cycle. The response is byte-identical (status,
+  headers, body) to the unknown-code refusal and every DB call on the branch
+  is guarded, rollbacks included. `oauth_code_replay_detected` (WARNING) only
+  when live tokens were revoked, after the commit;
+  `oauth_code_replay_revocation_failed` (ERROR, class name only, no
+  `exc_info`) on failure.
+- **Concurrent double exchange.** Both exchanges take the global bootstrap
+  key first, so they serialize: the second's locked re-read sees `used = True`
+  and the fresh `grant_id`, and if it presents the same verifier it is a
+  valid replay that revokes what the first just minted. Exactly one 200, one
+  400, zero live tokens, in either order — the RFC's behaviour, and the
+  intended cost (L4).
+- **Retention: seven days past the code's expiry, spent or not.** The cleanup
+  predicate is `expires_at < now - 7d` alone. A code can only be spent before
+  it expires, so every spent code and its lineage survive at least seven days
+  after spending — the token rule and the token window. The replay this
+  exists for is the legitimate client's own exchange (the thief never
+  replays: it would only kill what it stole), which lands within seconds or
+  minutes; seven days is three orders of magnitude of slack. The rows are
+  cheap and secret-free (one per consent, the code stored as a SHA-256). The
+  #194 client sweep is unaffected in practice: a client with a spent code has
+  a stamped `last_used_at`.
+
+## Grant families expire absolutely (#326)
+
+Access tokens live one hour and each refresh token 30 days, but every
+rotation mints a fresh 30-day refresh token — so before #326 a party that
+rotated at least monthly (the connector, or a thief holding the current
+refresh token) kept the grant for ever, and the consent page said none of it.
+
+- **`oauth_tokens.grant_issued_at`** (migration 029, NOT NULL) is set once at
+  the code exchange — one captured `now` on both rows — and copied verbatim by
+  every rotation from the refresh row re-read under the grant lock: the same
+  inheritance rule `grant_id` follows, so a family is uniform by construction.
+  Not a grants table: a backfill per `grant_id`, an FK, its own cleanup and a
+  new child table for the #194 sweep, for no gain.
+- **Store issuance, derive the deadline** (`grant_deadline` in
+  `src/oauth/grants.py`): `grant_issued_at + OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS`
+  against the *current* setting. Storing the deadline would freeze each family
+  to the policy it was minted under, so shortening the setting after an
+  incident would touch nothing. Both directions take effect immediately;
+  raising extends existing grants beyond what their consent page showed
+  (accepted, L1). A missing issuance time (only a row built in memory, never
+  flushed) fails closed.
+- **Clamp at mint, refuse at the deadline.** Both mint sites:
+  `access = min(now + 1h, deadline)`, `refresh = min(now + 30d, deadline)`,
+  `expires_in = floor(access - now)`, and under one second left is a refusal.
+  In `_handle_refresh` the deadline check sits **after** the reuse branch and
+  the client checks and **before** the per-token expiry. **Precedence:** a
+  rotated-away (revoked) refresh token is reuse first — family revoked, the
+  generic constant `invalid_grant` body, no description — whether or not the
+  deadline has passed, so a patient thief gains nothing by waiting and learns
+  nothing from the response. Only a **live** refresh token at or past the
+  deadline gets `invalid_grant.grant_lifetime_exceeded` ("grant lifetime
+  exceeded; re-authorize"), and that revokes nothing: a grant reaching its end
+  is not theft — #182's reasoning for an expired never-rotated token.
+- **The middleware** refuses an access token whose family is at or past the
+  deadline (401 `invalid_token`, `auth_failure` reason
+  `grant_lifetime_exceeded`), immediately after its `expires_at` check, off
+  the row it already loaded. Clamping guarantees this for every token minted
+  since; the check exists for tokens minted before a *shortening*, so a
+  shortened policy lands at the next request, not up to an hour later. Dead
+  **at** the deadline (`now >= deadline`).
+- **The panel** shows such a token `expired` (#76: never show live what the
+  middleware refuses).
+- **The transfer subsystem** re-validates the minting credential on its own,
+  so `credential_expires_at` returns `min(expires_at, grant deadline)` for an
+  `OAuthToken` and `_credential_ok` uses it — the mint window, redemption and
+  the locked pre-publication re-check stay one predicate. See
+  [file-transfer.md](file-transfer.md).
+- **The setting** `OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS`: default 90, range
+  1–365, **no disabled spelling** (a plain int, not a `NullableLimit`; empty,
+  `null`, `none`, `0` fail at boot). The client sweep's kill switch exists
+  because that sweep deletes things; nothing here deletes anything, and the
+  worst outcome of a wrong value is a re-authorization. A disabled spelling
+  *is* #326 — an ASVS L2 control one blank env line removes. The 365 ceiling
+  keeps "absolute" meaning something. The rollback lever is raising the value.
+- **Migration 029 starts every pre-existing family's clock at migration
+  time** (owner decision): nobody is logged out by the deploy, and every
+  existing connector re-authorizes at most 90 days after it (L2).
+- **Consent discloses the effective lifetimes** (`consent_lifetimes()`): the
+  access lifetime, the refresh lifetime "from its last renewal", and that
+  renewal stops the absolute period **after the application first receives
+  its tokens** — `grant_issued_at` is the code exchange, not the approval
+  click, so the page never promises a deadline the server does not enforce
+  (they are seconds apart, at most the code's ten minutes). Each value is the
+  lesser of the per-token lifetime and the cap, so a 7-day policy shows 7 days
+  everywhere. CSP-clean: a class in the nonce'd style block, no `style=`, no
+  handler.
+
+**Accepted limitations (#325, #326)** — recorded so they are not re-fixed
+when re-reported.
+
+- **L1 Raising the setting extends existing grants**, including beyond what
+  their consent page showed. Owner's policy lever; lowering is the direction
+  that matters and lands at the next request.
+- **L2 Pre-029 families get up to 90 days from the deploy**, whatever their
+  real age. Owner decision.
+- **L3 Codes spent before 029, or by a pre-029 process during the rollout,
+  carry no lineage**; their replay refuses and revokes nothing. Codes live ten
+  minutes, so the window closes within minutes of the rollout.
+- **L4 A client that retries a code exchange after losing the response loses
+  that grant** and must re-authorize. RFC 6749 §4.1.2; indistinguishable from
+  theft at the server. Owner-accepted.
+- **L5 Replay detection lasts seven days past the code's expiry**; a later
+  replay is an ordinary unknown-code refusal.
+- **L6 Timing.** The replay branch locks, reads and writes, and a spent code's
+  failed revalidation reads the client and hashes the verifier, so both are
+  slower than an unknown-code refusal; status, headers and body are what is
+  constant (#182's residual).
+- **L7 The alarm is written after the commit**; a crash in between keeps the
+  revocation and loses the record.
+- **L8 A request already in flight at the deadline completes** — the
+  middleware resolves the token once per request.
+- **L9 Rolling-deploy gap.** Old pods mint unclamped tokens (bounded by the old
+  30-day life, clamped at their next rotation by a new pod), rotations they
+  perform restart that family's clock at the insert time (the column's server
+  default, which exists only for this), and their cleanup still deletes used
+  codes. Bounded to the rollout.
+- **L10 Clock source.** Mint-time issuance and all comparisons use the
+  application clock; the backfill and the server default use the database's.
+  Seconds of skew against a 90-day window.
+- **L11 Code-only theft cannot trigger revocation**, by design: the PKCE
+  verifier is required, so a party holding only the code cannot end anyone's
+  grant.
+
+## Unused dynamic client registrations expire (#194)
+
+`/register` is unauthenticated dynamic client registration by RFC 7591 and
+`cleanup_expired_tokens` never touched a client row, so `oauth_clients` only
+grew. The sweep that bounds it lives in the same function, on the same
+five-minute tick, and deletes a registration only when **all three** of these
+hold — re-checked under a row lock before anything is removed.
+
+- **`last_used_at IS NULL`, a marker the OAuth routes stamp, and not a signal
+  derived from what was already there.** All three derivable candidates are
+  unsound, and the reasons are why the column exists rather than a note about
+  how it was chosen. `user_id` is the first authorizing user, and in
+  single-user mode the session user is `None`, so it stays NULL for *every*
+  client in the deployment `DEPLOYMENT.md` walks a new operator through — "no
+  owner" cannot mean "never used". Child rows cannot mean it either: an
+  `oauth_codes` row (spent or not, since #325 — before it a **used** code was
+  deleted the instant it was spent) and an `oauth_tokens` row are each deleted
+  seven days after they expire, so a client that was genuinely used, whose
+  grant was revoked and whose rows aged out, is indistinguishable from one
+  that never was. And `usage_logs.actor_ref`
+  survives credential deletion by design but records *tool calls*, not
+  issuance, so a client that authorized and never called a tool has no row
+  there — besides coupling OAuth retention to an analytics table whose own
+  retention may change.
+- **No `oauth_codes` and no `oauth_tokens` row, of any state.** Live, expired
+  and revoked all count. A revoked token the operator can still see in the
+  panel must never be cascaded away by this delete, which is #64's argument
+  applied one table up.
+- **`created_at` older than `OAUTH_CLIENT_UNUSED_EXPIRY_DAYS`** (30, `ge=1`).
+  A dynamically registered client authorizes within seconds, so any gap over a
+  few hours is already anomalous; thirty days is two orders of magnitude of
+  slack while still bounding the table at about a month of the 3/min
+  registration limiter's output. **The kill switch is `null`, not `0`** — the
+  house rule: a control that deletes a registration the moment it is made
+  reads to an operator as an outage rather than as a setting.
+
+**Migration 025's backfill is what makes the first guard mean anything.** It
+stamps a non-NULL marker on *every* row that existed when it ran — the newest
+of the client's surviving code and token `created_at` values, or, where
+neither survives, the migration's own transaction timestamp. So after 025 a
+NULL marker can only mean "registered after 025 and never used", and the sweep
+acts only on registrations whose entire history it can see. Leaving the
+ambiguous rows NULL was the first draft, justified by "a dynamically
+registered client re-registers transparently" — which is false in a reachable
+case: RFC 7591 permits credentials to be packaged into client software by a
+developer, and a confidential client configured by hand months ago, whose
+token rows have long since been purged, would have lost its registration *and
+its secret hash* on the first sweep, with no automatic recovery, because
+registering again mints a different `client_id` and secret. A marker already
+present is never overwritten, so the migration is safe to re-run.
+
+**The lock ordering, and what the loser of the race sees.** A single
+`DELETE ... WHERE NOT EXISTS (…)` looks equivalent and is not. Inserting an
+`oauth_codes` row takes a `FOR KEY SHARE` lock on the parent client row
+through the foreign key; the delete takes `FOR UPDATE`, so the two conflict
+and serialise — but under READ COMMITTED, when the delete unblocks PostgreSQL
+re-evaluates only the *target row's* own predicate and **not** the existence
+subquery. The delete proceeds and `ON DELETE CASCADE` removes the
+authorization code that was just issued. So the sweep:
+
+1. `SELECT client_id … FOR UPDATE SKIP LOCKED`, a bounded batch in `id` order;
+2. **re-reads the marker, the owner, the age and both child tables in a
+   separate statement inside that lock** — a separate statement is the point,
+   because it gets a fresh READ COMMITTED snapshot;
+3. deletes only what still qualifies.
+
+`/authorize`, the code exchange and the refresh each stamp the marker with an
+`UPDATE … RETURNING` on the same parent row, in the same transaction as the
+credential they issue, so the two paths contend for one row lock and one of
+them wins cleanly. If the sweep wins, the stamp matches zero rows and the
+handler returns **`invalid_client`** — an ordinary OAuth error, never a 500
+and never a half-written grant. `SKIP LOCKED` leaves a contended row for the
+next pass instead of stalling the maintenance tick behind one in-flight
+consent. Each pass logs one INFO line with the count when it deletes anything:
+a job that silently removes credentials cannot be audited.
+
+**Accepted limitations, recorded so they are not re-fixed when re-reported.**
+
+- **Never-used registrations created before 025 are never collected.** The
+  backfill stamps them rather than risk deleting a hand-configured
+  confidential client whose evidence was purged. The table is bounded going
+  forward, not retroactively; an operator can remove such rows in the panel.
+- **A client can be deleted between registering and first authorizing** if
+  that gap exceeds the configured age. The *concurrent* race is safe; a
+  30-day-delayed first authorization is not, and its response is a clean
+  `invalid_client`.
+- **`/register` still admits roughly 4,300 registrations per day per
+  address.** This sweep bounds the residue, not the arrival rate.
+- **A client registered *and* authorized inside `make deploy`'s
+  migrate-then-recreate gap can end up NULL-marked**, because the previous
+  image serves for those seconds without knowing the column. Declined as a
+  code or process change: a client actually in use re-stamps itself at its
+  next code exchange or refresh and an access token lives one hour, and before
+  that the no-child-row guard covers it for about 37 days (a refresh token row
+  survives 30 days and is purged seven days after it expires) — beyond the
+  30-day age. The only registration that can still be NULL when the sweep can
+  reach it is one created in a seconds-long window and then unused for over a
+  month, which is exactly the population the sweep exists to remove. The cost
+  if it happens is one re-registration; the lever for certainty during a
+  rollback is setting the age to `null`.
+
 ## The consent page preselect
 
 - **OAuth consent preselects "Read only" unconditionally — never bind `checked` to the requested scope.** On an HTML form the checked radio *is* the submitted value, so the preselect is the default grant, not a display detail. `/register` is unauthenticated and a DCR client that omits `scope` is registered `read readwrite offline_access`, so a requested-scope preselect lets one unchanged **Approve** click hand vault-wide write to any self-registered client (#63; #62 introduced exactly that and it was reverted). What #62 was right about is kept as *prose*: `authorize_get` passes `requested_write` (from the validated scope alone, ungated by the registered scope — display only) and `write_unavailable`, and the request box names the level asked for and says when the client cannot hold it. `_clamp_scope` in `authorize_post` is the enforcement boundary and is unrelated to any of this. The markup default is not enough on its own: Firefox restores a control's dynamic checked state across page loads in preference to it, so the form **and** every `name="scope"` radio carry `autocomplete="off"` — without them a user who once picked write gets that radio re-checked on a repeat visit to the same `/authorize` URL (clients reuse `state`/PKCE) and one Approve re-grants write after a revocation. The `.scope-option:has(:checked)` highlight lives in standalone rule blocks: a selector list is dropped wholesale when any part fails to parse, so grouping it would take the native-radio fallback down with it.

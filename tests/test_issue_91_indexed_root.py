@@ -235,6 +235,16 @@ class FakeSession:
 
         if isinstance(stmt, Select):
             rendered = str(stmt)
+            # #311: the re-derive tail's in-transaction invariant re-read and
+            # its completion re-resolution. This stub executes no SQL, so it
+            # cannot model which rows the tail marked; it answers "no row
+            # pending, no link to re-resolve", which leaves these fixtures
+            # about the skip rules. The invariant is exercised on real
+            # Postgres (tests/integration/test_issue_311_rederive_progress_pg.py).
+            if "derived_under" in rendered and "stat_size" not in rendered:
+                return _Result([])
+            if "note_links.target_path" in rendered:
+                return _Result([])
             if "indexed_vault_assignment" in rendered:
                 return _Result([self.provenance])
             # The locked re-read that binds a delete or a stamp to the
@@ -262,6 +272,26 @@ class FakeSession:
             # recognised before the vault-index branch below.
             if rendered.startswith("SELECT count("):
                 return _Result([self.link_count])
+            # The scan's snapshot and its locked re-read (#282, D9). Both name
+            # `extraction_version` and the four stat columns, and the locked
+            # re-read also names `notes_metadata.id` — so it is matched here,
+            # before the rebuild snapshot's branch below. Stats are NULL: these
+            # fixtures stand for an index whose stats were never recorded, so
+            # every file is read and hashed exactly as before the shortcut.
+            if "extraction_version" in rendered and "stat_size" in rendered:
+                return _Result([
+                    SimpleNamespace(
+                        id=self.note_ids.get(p, 0),
+                        file_path=p,
+                        content_hash=h,
+                        extraction_version=indexer.CURRENT_EXTRACTION_VERSION,
+                        stat_size=None,
+                        stat_mtime_ns=None,
+                        stat_ctime_ns=None,
+                        stat_ino=None,
+                    )
+                    for p, h in self.existing.items()
+                ])
             # `_rebuild_tsvectors_single_scope_for_tests`'s snapshot names id, owner, path *and* hash
             # since #127, so it has to be matched before the scan's
             # path+hash select — both mention `content_hash`.
@@ -682,9 +712,9 @@ def track_reads(monkeypatch, session):
     """Record every vault-file read on the session's timeline."""
     real = indexer.read_note_at
 
-    def wrapped(parent_fd, name):
+    def wrapped(parent_fd, name, rel=None):
         session.timeline.append(f"read:{name}")
-        return real(parent_fd, name)
+        return real(parent_fd, name, rel)
 
     monkeypatch.setattr(indexer, "read_note_at", wrapped)
 
@@ -1367,9 +1397,12 @@ async def test_a_complete_re_derive_stamps_all_three_and_the_next_pass_no_ops(
 
     await indexer.index_vault(user_id=7)
 
-    # Stamped after the pass's last write, and committed with it.
+    # Stamped after the pass's last write, and committed with it. The pass's
+    # commit is the *last* one: the scan's snapshot commits its own read-only
+    # transaction before the walk (#278, D9 C2).
     assert len(first.stamps) == 1
-    assert first.timeline.index("stamp") < first.timeline.index("commit")
+    last_commit = len(first.timeline) - 1 - first.timeline[::-1].index("commit")
+    assert first.timeline.index("stamp") < last_commit
     stamp = first.stamps[0]
     assert set(stamp) == {
         "indexed_vault_assignment",
@@ -1463,12 +1496,17 @@ async def test_the_stamp_is_whole_even_when_a_fact_is_unobservable(
 
 
 @pytest.mark.asyncio
-async def test_an_undecodable_file_withholds_the_stamp(monkeypatch, tmp_path, caplog):
-    """Real invalid UTF-8 bytes, not a mocked decoder.
+async def test_an_undecodable_file_deletes_the_foreign_row_and_stamps(
+    monkeypatch, tmp_path, caplog
+):
+    """Real invalid UTF-8 bytes, not a mocked decoder (#308, D7/D8).
 
     Vault A supplied `Same.md`; vault B holds a `Same.md` whose bytes cannot be
-    decoded. The path is discovered, the read raises, and the row and its links
-    survive untouched — so the pass must not certify B over them.
+    decoded. Before #308 the row and its links survived untouched and the
+    stamp was withheld on every pass for ever (a full-scope rewrite per tick).
+    Now the path is present but not indexable: A's row is deleted in the
+    pass's transaction, so nothing foreign survives at it, and the re-derive
+    records B.
     """
     vault = make_vault(tmp_path, "B", {"Fine.md": "fine\n"})
     (vault / "Same.md").write_bytes(b"\xff\xfe not utf-8 at all\n")
@@ -1480,52 +1518,131 @@ async def test_an_undecodable_file_withholds_the_stamp(monkeypatch, tmp_path, ca
     install(monkeypatch, session, vault)
 
     with caplog.at_level("WARNING"):
-        await indexer.index_vault(user_id=7)
+        result = await indexer.index_vault(user_id=7)
 
-    assert session.stamps == [], "an incomplete re-derive must not be recorded"
-    # The repairs it *could* do were still done.
+    assert len(session.stamps) == 1, "the foreign row is gone, so B is recorded"
+    assert result.rederive == indexer.REDERIVE_RECORDED
+    assert result.rederive_incomplete is False
+    assert result.not_indexable == 1
     assert [row["file_path"] for row in session.metadata_upserts()] == ["Fine.md"]
-    # Nothing was invented to replace A's row for the skipped path: it was
-    # discovered, so the ordinary prune leaves it alone.
-    for statement in session.metadata_deletes:
-        assert "Same.md" not in str(
-            statement.compile(compile_kwargs={"literal_binds": True})
-        )
-    # And the offending path is named, on every pass, so the file to fix is
-    # identified rather than left as an unexplained recurring cost.
-    assert "Same.md" in caplog.text
-    assert "Re-derive incomplete" in caplog.text
-
-    # The next pass re-derives again rather than keeping.
-    again = FakeSession(
-        provenance=(None, None, None),
-        existing={"Same.md": "hash-from-vault-A", "Fine.md": hash_of("fine\n")},
-        note_ids={"Fine.md": 2},
+    deleted = " ".join(
+        str(statement.compile(compile_kwargs={"literal_binds": True}))
+        for statement in session.metadata_deletes
     )
-    install(monkeypatch, again, vault)
-    await indexer.index_vault(user_id=7)
-    assert again.stamps == []
+    assert "Same.md" in deleted, "A's row at the undecodable path must go"
+    assert "Fine.md" not in deleted
+    # Named, so the file to fix is identified.
+    assert "Same.md" in caplog.text
+    assert "Re-derive incomplete" not in caplog.text
 
 
 @pytest.mark.asyncio
 async def test_a_file_that_disappears_during_the_scan_is_a_skip(monkeypatch, tmp_path):
+    """A read failure on a path with a locked row withholds the stamp (D8)."""
+    vault = make_vault(tmp_path, "vault", {"Gone.md": "x\n", "Kept.md": "y\n"})
+    session = FakeSession(
+        provenance=(None, None, None),
+        existing={"Gone.md": "hash-from-elsewhere"},
+        note_ids={},
+    )
+    install(monkeypatch, session, vault)
+
+    real = indexer.read_note_at
+
+    def vanish(parent_fd, name, rel=None):
+        if name == "Gone.md":
+            raise FileNotFoundError(errno.ENOENT, "vanished", name)
+        return real(parent_fd, name, rel)
+
+    monkeypatch.setattr(indexer, "read_note_at", vanish)
+
+    result = await indexer.index_vault(user_id=7)
+
+    assert session.stamps == []
+    assert result.rederive_incomplete is True
+    assert [row["file_path"] for row in session.metadata_upserts()] == ["Kept.md"]
+    # The unreadable path's row is kept (D7 does not apply to read failures).
+    for statement in session.metadata_deletes:
+        assert "Gone.md" not in str(
+            statement.compile(compile_kwargs={"literal_binds": True})
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_row_less_unreadable_file_does_not_withhold_the_stamp(
+    monkeypatch, tmp_path, caplog
+):
+    """D8: a read skip with no row behind it cannot certify a foreign row.
+
+    Before #308 this withheld the stamp, and a re-derive re-upserts every file
+    each tick until it records — one permanently unreadable, never-indexed
+    file meant a full-scope rewrite every tick for ever.
+    """
     vault = make_vault(tmp_path, "vault", {"Gone.md": "x\n", "Kept.md": "y\n"})
     session = FakeSession(provenance=(None, None, None), existing={}, note_ids={})
     install(monkeypatch, session, vault)
 
     real = indexer.read_note_at
 
-    def vanish(parent_fd, name):
+    def unreadable(parent_fd, name, rel=None):
         if name == "Gone.md":
-            raise FileNotFoundError(errno.ENOENT, "vanished", name)
-        return real(parent_fd, name)
+            raise PermissionError(errno.EACCES, "denied", name)
+        return real(parent_fd, name, rel)
 
-    monkeypatch.setattr(indexer, "read_note_at", vanish)
+    monkeypatch.setattr(indexer, "read_note_at", unreadable)
 
-    await indexer.index_vault(user_id=7)
+    with caplog.at_level("WARNING"):
+        result = await indexer.index_vault(user_id=7)
+
+    assert len(session.stamps) == 1
+    assert result.rederive == indexer.REDERIVE_RECORDED
+    assert "Gone.md" in caplog.text, "the skip is still logged"
+
+
+@pytest.mark.asyncio
+async def test_a_directory_walk_failure_withholds_the_stamp(monkeypatch, tmp_path):
+    """D8, narrowed by #311 D5: an unlistable directory withholds when a row
+    beneath it is not derived under the current root (here: never marked)."""
+    vault = make_vault(tmp_path, "vault", {"a.md": "a\n", "sub/b.md": "b\n"})
+    session = FakeSession(
+        provenance=(None, None, None),
+        existing={"sub/b.md": "0" * 64},
+        note_ids={"sub/b.md": 1},
+    )
+    install(monkeypatch, session, vault)
+    os.chmod(vault / "sub", 0)
+    try:
+        if os.access(vault / "sub", os.R_OK):  # pragma: no cover - running as root
+            pytest.skip("permissions are not enforced for this user")
+        result = await indexer.index_vault(user_id=7)
+    finally:
+        os.chmod(vault / "sub", 0o755)
 
     assert session.stamps == []
-    assert [row["file_path"] for row in session.metadata_upserts()] == ["Kept.md"]
+    assert result.rederive_incomplete is True
+
+
+@pytest.mark.asyncio
+async def test_a_directory_walk_failure_over_no_row_does_not_withhold(
+    monkeypatch, tmp_path
+):
+    """#311 D5: with no row at or beneath the unlisted directory there is no
+    row it could leave certified wrongly; #309's `walk_incomplete` still
+    reports the directory."""
+    vault = make_vault(tmp_path, "vault", {"a.md": "a\n", "sub/b.md": "b\n"})
+    session = FakeSession(provenance=(None, None, None), existing={}, note_ids={})
+    install(monkeypatch, session, vault)
+    os.chmod(vault / "sub", 0)
+    try:
+        if os.access(vault / "sub", os.R_OK):  # pragma: no cover - running as root
+            pytest.skip("permissions are not enforced for this user")
+        result = await indexer.index_vault(user_id=7)
+    finally:
+        os.chmod(vault / "sub", 0o755)
+
+    assert len(session.stamps) == 1
+    assert result.rederive_incomplete is False
+    assert result.walk_incomplete is True
 
 
 @pytest.mark.asyncio
@@ -2202,8 +2319,7 @@ async def test_one_unreadable_note_does_not_freeze_a_readable_notes_vectors(
     note's vectors at content it no longer has.
     """
     body = "changed body\n"
-    vault = make_vault(tmp_path, "vault", {"Readable.md": body})
-    (vault / "Broken.md").write_bytes(b"\xff\xfe not utf-8\n")
+    vault = make_vault(tmp_path, "vault", {"Readable.md": body, "Broken.md": "x\n"})
 
     scan = FakeSession(
         provenance=(None, None, None),
@@ -2211,6 +2327,17 @@ async def test_one_unreadable_note_does_not_freeze_a_readable_notes_vectors(
         note_ids={"Readable.md": 1},
     )
     install(monkeypatch, scan, vault)
+
+    # Unreadable, with a row behind it: the one read skip that still withholds
+    # (#308 D8). An undecodable file no longer does — its row is deleted (D7).
+    real = indexer.read_note_at
+
+    def unreadable(parent_fd, name, rel=None):
+        if name == "Broken.md":
+            raise PermissionError(errno.EACCES, "denied", name)
+        return real(parent_fd, name, rel)
+
+    monkeypatch.setattr(indexer, "read_note_at", unreadable)
 
     await indexer.index_vault(user_id=7)
 

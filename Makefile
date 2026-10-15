@@ -16,10 +16,24 @@ DATA_DIR ?= ./data
 # usually just `postgres`.
 # Override in Makefile.local to match the deployment.
 DB_CONTAINER ?= postgres
+# Where db-backup / db-restore (and docker/record-backup.sh) reach PostgreSQL,
+# through docker/db-exec.sh — one channel for the dump and its backups_log row:
+#   docker (default)  `docker exec $(DB_CONTAINER) …`
+#   cnpg              the primary of CloudNativePG cluster $(CNPG_CLUSTER) in
+#                     namespace $(CNPG_NAMESPACE), via `kubectl exec` into its
+#                     `postgres` container (local socket, peer auth, no password).
+# A Kubernetes deployment sets `DB_BACKEND := cnpg` (and KUBECONFIG, if not the
+# default) in Makefile.local.
+DB_BACKEND ?= docker
+CNPG_NAMESPACE ?= db
+CNPG_CLUSTER ?= pg
+KUBECTL ?= kubectl
+DB_EXEC = DB_BACKEND=$(DB_BACKEND) DB_CONTAINER=$(DB_CONTAINER) CNPG_NAMESPACE=$(CNPG_NAMESPACE) CNPG_CLUSTER=$(CNPG_CLUSTER) KUBECTL=$(KUBECTL) bash docker/db-exec.sh
 # The application container, as named in docker-compose.yml.
 CONTAINER ?= obsidian-mcp
 COMPOSE_FILE := $(DEPLOY_DIR)/docker-compose.yml
 ENV_FILE := $(DEPLOY_DIR)/.env
+POSTGRES_ENV_FILE := $(DEPLOY_DIR)/postgres.env
 COMPOSE := docker compose --project-directory $(DEPLOY_DIR) -f $(COMPOSE_FILE)
 
 GREEN := \033[0;32m
@@ -36,7 +50,7 @@ SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
 SCHEMA_TEST_PORT ?= 55438
 SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors backfill-history backfill-history-dry audit trivy test-schema test-integration
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors backfill-history backfill-history-dry audit trivy test-schema test-integration db-vacuum-notes concurrency-report
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -62,6 +76,7 @@ help:
 	@echo "  make db-init      - Create database, user, and extensions"
 	@echo "  make db-migrate   - Run Alembic migrations"
 	@echo "  make db-check     - Verify the schema matches the ORM models"
+	@echo "  make db-vacuum-notes - VACUUM (ANALYZE) notes_metadata now (027's fallback; autovacuum normally does it)"
 	@echo "  make test-schema  - Schema gate: migrations vs. models on a throwaway pgvector"
 	@echo "  make test-integration - Run tests/integration against a throwaway pgvector (they skip without one)"
 	@echo "  make db-backup    - Backup database"
@@ -73,6 +88,7 @@ help:
 	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS (no embeddings, no API calls)"
 	@echo "  make backfill-history-dry - Report what a history backfill would embed (writes nothing)"
 	@echo "  make backfill-history - Embed superseded note versions from the vault's git history"
+	@echo "  make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso] - Concurrency readiness verdict (#188; exit 0 only on PASS)"
 	@echo "  make status       - Show container and health status"
 	@echo "  make clean        - Remove containers and images"
 	@echo ""
@@ -94,12 +110,27 @@ init:
 		cp .env.example $(ENV_FILE); \
 		DB_PASS=$$(openssl rand -hex 16); \
 		SECRET=$$(openssl rand -hex 32); \
-		sed -i "s/CHANGE_ME/$$DB_PASS/" $(ENV_FILE); \
-		sed -i "s/SECRET_KEY=.*/SECRET_KEY=$$SECRET/" $(ENV_FILE); \
+		sed -i "s/^# DATABASE_URL=\(.*\)CHANGE_ME/DATABASE_URL=\1$$DB_PASS/" $(ENV_FILE); \
+		sed -i "s/^OBSIDIAN_DB_PASSWORD=.*/OBSIDIAN_DB_PASSWORD=$$DB_PASS/" $(ENV_FILE); \
+		sed -i "s/^SECRET_KEY=.*/SECRET_KEY=$$SECRET/" $(ENV_FILE); \
 		chmod 600 $(ENV_FILE); \
 		echo "$(GREEN)$(ENV_FILE) created with random secrets$(NC)"; \
 	else \
 		echo "$(YELLOW)$(ENV_FILE) already exists$(NC)"; \
+	fi
+	# The database SUPERUSER password for the bundled compose stacks (#324):
+	# its own file, loaded by the postgres service only, never by the app.
+	# Created on every path; a deployment against an external PostgreSQL never
+	# reads it (DEPLOYMENT.md, Step 2).
+	@if [ ! -f "$(POSTGRES_ENV_FILE)" ]; then \
+		echo "$(GREEN)Creating $(POSTGRES_ENV_FILE) from template...$(NC)"; \
+		(umask 077 && cp postgres.env.example $(POSTGRES_ENV_FILE)); \
+		ADMIN_PASS=$$(openssl rand -hex 32); \
+		sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$ADMIN_PASS/" $(POSTGRES_ENV_FILE); \
+		chmod 600 $(POSTGRES_ENV_FILE); \
+		echo "$(GREEN)$(POSTGRES_ENV_FILE) created with a random superuser password$(NC)"; \
+	else \
+		echo "$(YELLOW)$(POSTGRES_ENV_FILE) already exists$(NC)"; \
 	fi
 	@echo "$(GREEN)Setup complete. Next: make db-init && make deploy$(NC)"
 
@@ -180,6 +211,34 @@ db-check:
 	@echo "$(GREEN)Checking schema against the models...$(NC)"
 	@$(COMPOSE) exec obsidian-mcp alembic check
 
+# The deterministic fallback for migration 027 (#283, design D18). 027 sets
+# per-table autovacuum thresholds on notes_metadata but cannot VACUUM: VACUUM
+# refuses to run inside a transaction block, and alembic runs the whole chain
+# in one. Autovacuum normally visits the table within a minute of 027
+# committing; if `pg_stat_user_tables.last_autovacuum` stays NULL, run this.
+# It goes through the application container's own engine in an AUTOCOMMIT
+# session because the image does not guarantee `psql`.
+define VACUUM_NOTES_PY
+import asyncio
+from sqlalchemy import text
+from src.database import engine
+
+async def main():
+    async with engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        await conn.execute(text("SET statement_timeout = '10min'"))
+        await conn.execute(text("VACUUM (ANALYZE) notes_metadata"))
+    await engine.dispose()
+
+asyncio.run(main())
+endef
+export VACUUM_NOTES_PY
+
+db-vacuum-notes:
+	@echo "$(GREEN)VACUUM (ANALYZE) notes_metadata...$(NC)"
+	@printf '%s\n' "$$VACUUM_NOTES_PY" | $(COMPOSE) exec -T obsidian-mcp python -
+	@echo "$(GREEN)Done$(NC)"
+
 # The pre-deploy gate for any change that carries a migration. `db-check` only
 # runs `alembic check`, which cannot see a CHECK predicate; this stands up a
 # disposable Postgres, migrates throwaway databases through fresh / drifted /
@@ -257,6 +316,10 @@ test-schema:
 # refuses on a non-Linux host and names the two ways to actually run these —
 # a check that cannot pass is worse than one that declines, because the first
 # trains its operator to ignore the output.
+# `BODY_BUDGET_RSS_TESTS=1` opts in to the #322 peak-RSS measurements
+# (`tests/integration/test_body_budget_stack_pg.py`). Set here and **not** in
+# CI, by owner decision: a peak-RSS bound on a shared runner measures the
+# runner, not this server.
 test-integration:
 	@if [ "$$(uname -s)" != "Linux" ]; then \
 		echo "$(RED)tests/integration needs a Linux host with a docker CLI; this is $$(uname -s).$(NC)"; \
@@ -277,7 +340,7 @@ test-integration:
 		sleep 1; \
 	done; \
 	if [ "$$ready" -eq 1 ]; then \
-		OMCP_REQUIRE_SCHEMA_INTEGRATION=1 \
+		OMCP_REQUIRE_SCHEMA_INTEGRATION=1 BODY_BUDGET_RSS_TESTS=1 \
 		PGVECTOR_TEST_ADMIN_URL=postgresql+asyncpg://postgres:test@127.0.0.1:$(SCHEMA_TEST_PORT)/postgres \
 		$(PYTHON) -m pytest -q -rs tests/integration; \
 		status=$$?; \
@@ -323,10 +386,10 @@ db-backup:
 	@umask 077; TIMESTAMP=$$(date +%Y%m%d_%H%M%S); \
 	BACKUP_FILE="$(DATA_DIR)/backups/backup_$$TIMESTAMP.sql"; \
 	: "the database named here is mirrored as DB_NAME's default in docker/record-backup.sh; keep the two in step"; \
-	if ! docker exec $(DB_CONTAINER) pg_dump -U postgres obsidian_mcp > $$BACKUP_FILE; then \
+	if ! $(DB_EXEC) pg_dump -U postgres obsidian_mcp > $$BACKUP_FILE; then \
 		rm -f $$BACKUP_FILE; \
-		echo "$(RED)Backup FAILED: pg_dump against container '$(DB_CONTAINER)' returned non-zero$(NC)"; \
-		echo "$(YELLOW)Set DB_CONTAINER in Makefile.local if the database container is named differently.$(NC)"; \
+		echo "$(RED)Backup FAILED: pg_dump through DB_BACKEND=$(DB_BACKEND) returned non-zero$(NC)"; \
+		echo "$(YELLOW)Set DB_BACKEND / DB_CONTAINER (docker) or CNPG_NAMESPACE / CNPG_CLUSTER (cnpg) in Makefile.local to match the deployment.$(NC)"; \
 		exit 1; \
 	fi; \
 	if [ ! -s $$BACKUP_FILE ]; then \
@@ -354,19 +417,12 @@ db-backup:
 		fi; \
 	done; \
 	if [ $$PRUNED -gt 0 ]; then echo "$(YELLOW)Pruned $$PRUNED backup(s) older than $(BACKUP_RETAIN_DAYS) days (kept at least $(BACKUP_RETAIN_MIN))$(NC)"; fi; \
-	DB_CONTAINER=$(DB_CONTAINER) bash docker/record-backup.sh $$BACKUP_FILE.gz
+	DB_BACKEND=$(DB_BACKEND) DB_CONTAINER=$(DB_CONTAINER) CNPG_NAMESPACE=$(CNPG_NAMESPACE) CNPG_CLUSTER=$(CNPG_CLUSTER) KUBECTL=$(KUBECTL) bash docker/record-backup.sh $$BACKUP_FILE.gz
 
 db-restore:
 	@if [ -z "$(FILE)" ]; then echo "$(RED)Usage: make db-restore FILE=<path>$(NC)"; exit 1; fi
-	@echo "$(YELLOW)WARNING: This will replace the obsidian_mcp database!$(NC)"
-	@echo "Press Ctrl+C to cancel, waiting 5s..."
-	@sleep 5
-	@if echo "$(FILE)" | grep -q ".gz$$"; then \
-		gunzip -c $(FILE) | docker exec -i $(DB_CONTAINER) psql -U postgres obsidian_mcp; \
-	else \
-		docker exec -i $(DB_CONTAINER) psql -U postgres obsidian_mcp < $(FILE); \
-	fi
-	@echo "$(GREEN)Restored from $(FILE)$(NC)"
+	@: "docker/db-restore.sh verifies the WHOLE file (exists, gzip -t, pg_dump end marker) before sending anything, then restores with ON_ERROR_STOP=1 --single-transaction"
+	@DB_BACKEND=$(DB_BACKEND) DB_CONTAINER=$(DB_CONTAINER) CNPG_NAMESPACE=$(CNPG_NAMESPACE) CNPG_CLUSTER=$(CNPG_CLUSTER) KUBECTL=$(KUBECTL) bash docker/db-restore.sh "$(FILE)"
 
 # There is no headless trigger. The only on-demand reindex is
 # `POST /admin/settings/reindex` (src/control_panel/routes.py), which sits on
@@ -446,6 +502,19 @@ check-no-backups-mount:
 		echo "$(RED)INVARIANT VIOLATED: $(CONTAINER) has a mount at /app/backups — the container must not see the backups directory (#186).$(NC)"; \
 		exit 1; \
 	fi
+
+# The readiness verdict for the next concurrency mode (#188, design D6): the
+# same evaluator as the /admin/performance verdict, run inside the live
+# container so it reads the configured epoch and the production database.
+# The script exits 0 only when every criterion is PASS (1 FAIL, 2
+# INSUFFICIENT_DATA, 64 usage); make reports any non-zero as its own 2.
+concurrency-report:
+	@if [ "$(TARGET)" != "queue" ] && [ "$(TARGET)" != "enforce" ]; then \
+		echo "$(RED)Usage: make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso-8601]$(NC)"; \
+		exit 64; \
+	fi
+	docker exec $(CONTAINER) python -m scripts.concurrency_report --target $(TARGET) \
+		$(if $(DAYS),--days $(DAYS)) $(if $(END),--end $(END))
 
 status:
 	@echo "$(GREEN)Obsidian MCP Status:$(NC)"

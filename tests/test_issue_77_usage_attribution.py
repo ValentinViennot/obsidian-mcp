@@ -63,6 +63,11 @@ class _CapturingSession:
     def add(self, obj):
         self.added.append(obj)
 
+    async def execute(self, stmt, *_a, **_kw):
+        # `_insert_usage`'s `SET LOCAL synchronous_commit = off`
+        # (performance-2026-09 D2); nothing else is executed here.
+        return None
+
     async def commit(self):
         self.committed = True
 
@@ -175,14 +180,21 @@ class _MiddlewareSession:
         sql = str(stmt)
         if sql.startswith("UPDATE"):
             return _EmptyResult()
+        # The user's `is_active`/`vault_path` ride the credential statement
+        # (performance-2026-09 D3).
         if "FROM api_keys" in sql:
-            return _RowsResult([self.api_key] if self.api_key else [])
+            return _RowsResult(
+                [(self.api_key, True, "/vaults/x")] if self.api_key else []
+            )
         if "FROM oauth_tokens" in sql:
-            # `(token, client_owner, client_name)` — one statement, joined.
+            # `(token, client_owner, client_name, is_active, vault_path)` —
+            # one statement, joined.
             if self.oauth_token is None:
                 return _RowsResult([])
             owner, name = self.client_row if self.client_row else (None, None)
-            return _RowsResult([(self.oauth_token, owner, name)])
+            return _RowsResult(
+                [(self.oauth_token, owner, name, True, "/vaults/x")]
+            )
         if "vault_path" in sql:
             return _RowsResult([])
         return _ScalarResult(True)
@@ -254,6 +266,7 @@ def test_middleware_binds_the_oauth_client_name_and_id():
     from datetime import datetime, timedelta, timezone
 
     token = OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=11,
         token_hash="y",
         token_type="access",
@@ -451,7 +464,7 @@ def test_the_delete_confirm_states_the_real_blast_radius():
         csrf_token="t",
         flash_error=None,
     )
-    confirms = [line for line in rendered.splitlines() if "/delete" in line or "confirm(" in line]
+    confirms = [line for line in rendered.splitlines() if "/delete" in line or "data-confirm" in line]
     blob = "\n".join(confirms)
     assert "revoke all its tokens?" not in blob
     assert "tokens are deleted" in blob
@@ -544,6 +557,10 @@ class _FailingSession:
 
     def add(self, obj):
         self.added.append(obj)
+
+    async def execute(self, stmt, *_a, **_kw):
+        # `_insert_usage`'s `SET LOCAL synchronous_commit = off`.
+        return None
 
     async def rollback(self):
         self.rolled_back += 1
@@ -797,6 +814,7 @@ def _oauth_token_row(user_id=None):
     from datetime import datetime, timedelta, timezone
 
     return OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=11, token_hash="y", token_type="access", client_id="client-abc",
         scope="read", user_id=user_id, grant_id="g1",
         expires_at=datetime.now(timezone.utc) + timedelta(hours=1), revoked=False,

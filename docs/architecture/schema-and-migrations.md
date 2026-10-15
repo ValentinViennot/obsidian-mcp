@@ -2,6 +2,12 @@
 
 > Deep rationale extracted from `CLAUDE.md`. Read before writing or reviewing a migration.
 
+> Fork numbering after the October 2026 synchronization: existing OIDC `025`
+> and temporal `026` remain unchanged. Incoming upstream `025`–`030` are fork
+> `031`–`036`, respectively. The upstream rationale below retains its historical
+> revision references; use the [compatibility map](upstream-sync-20261015.md)
+> when locating current migration files. The single current Alembic head is `036`.
+
 ## Schema drift is not only what `alembic check` sees
 
 `alembic check` autogenerates against the live database and reports what it
@@ -285,7 +291,6 @@ would leave the validator finding no row for any cookie, i.e. every user locked
 out of the panel. `lock_timeout` / `statement_timeout` are set and `RESET` for
 013's reason.
 
-<<<<<<< HEAD
 ## 025: `users.oidc_subject`, and why the link is not the email
 
 Migration 025 adds one nullable column, `users.oidc_subject`, and one **partial
@@ -341,7 +346,6 @@ application never reads would have the login callback write a federated
 identity somewhere nothing looks and fail to find it again on the next request.
 `ADD COLUMN` of a nullable column with no default is metadata-only;
 `CREATE INDEX` takes a brief `SHARE` lock on a table with a handful of rows.
-=======
 ## 025: `valid_from` / `valid_to`, and why both are nullable
 
 Embeddings only ever covered HEAD, so anything the author rewrote or deleted
@@ -387,7 +391,490 @@ embedding table is too large for a plain build inside the 60 s
 `statement_timeout` should build the index by hand, CONCURRENTLY, and stamp it
 with 025's comment marker before migrating — the reconciler adopts a marked
 index and refuses an unmarked one, for 013's reason.
->>>>>>> origin/feat/temporal-embeddings
+## 026: `notes_metadata.stat_*`, and why the CHECK is the point (#282)
+
+The index pass skips reading a note when the file's current
+`(size, mtime_ns, ctime_ns, inode)` equals the tuple recorded for the bytes
+that produced the row's `content_hash` (the stat shortcut, see
+[indexing and embeddings](indexing-and-embeddings.md#the-stat-shortcut-282-d10d11)).
+026 adds the four columns — `stat_size`, `stat_mtime_ns`, `stat_ctime_ns`,
+`stat_ino`, all `BIGINT NULL`, no default, no backfill — and the CHECK
+`ck_notes_metadata_stat_all_or_none`.
+
+- **Not `file_size` / `modified_at`.** `modified_at` is `timestamptz`, i.e.
+  microseconds, which rounds away exactly the precision the racy rule reasons
+  about, and both keep a display meaning a comparison key must not be coupled
+  to.
+- **The inode is stored signed** (`ino − 2**64` when `ino ≥ 2**63`): `BIGINT`
+  is signed, and some filesystems issue inode numbers above `2**63`.
+- **NULL is load-bearing**: it means "read and hash this file on the next
+  pass". It is what every pre-existing row reads after 026 (so the first pass
+  after deploy records stats through the unchanged-hash refresh, ~4 k UPDATEs
+  once), what a racy stat is recorded as, and what `move_note` writes. A
+  backfill would have to invent a stat for bytes the migration never read.
+- **The CHECK keeps a half-recorded tuple out**: neither a stat nor its
+  absence. Alembic does not compare CHECK predicates, so the model declares it
+  (last in `NoteMetadata.__table_args__`) and the schema gate asserts it
+  through `pg_constraint` **by definition**, never by name — 013's rule, since
+  a `CHECK (true)` under the right name enforces nothing. The canonical
+  rendering is measured off a scratch TEMP table at migration time (013/019/
+  023's device) and pinned in the gate.
+- **Reconcile, don't adopt.** The stamp-back re-run meets its own columns, so
+  each column is verified — `bigint`, nullable, no default, 026's comment
+  marker — and a same-named column of any other shape is refused by name (an
+  `integer` `stat_ino` would truncate inode numbers into false matches, i.e. a
+  note whose edits are never read). A CHECK carrying 026's name with another
+  definition, more than one CHECK with 026's definition, a `NOT VALID` one, or
+  one without 026's constraint marker is refused likewise.
+- **`downgrade()` drops only marked objects**, each decided on its own marker
+  (023's per-object skip, printed to stdout). Dropping them loses every
+  recorded stat, which is safe: the previous build neither reads nor writes
+  them, and a re-upgrade leaves every row NULL.
+
+`search_path` is pinned and asserted, and `lock_timeout` / `statement_timeout`
+set and `RESET`, for 024's and 025's reasons. The gate's head literal is
+`026`; its 026 cases cover the fresh shape, the chain from 025, no backfill,
+CHECK enforcement, stamp-back idempotence with row data preserved, the
+impostor column and CHECK refusals, and both downgrade directions.
+
+## 027: `notes_metadata` reloptions, the `halfvec` index, and an `include_object` hook (#283)
+
+027 does two things, both invisible to `alembic check`
+(rationale in [search](search.md#the-halfvec-index-half-precision-picks-candidates-full-precision-ranks-them-283)):
+
+- sets `autovacuum_vacuum_scale_factor = 0.02` and
+  `autovacuum_vacuum_insert_scale_factor = 0.02` on `notes_metadata` — **no
+  VACUUM** in the migration, because VACUUM cannot run in the one transaction
+  alembic runs the chain in (`make db-vacuum-notes` is the fallback);
+- when `EMBEDDING_DIMENSIONS` ≤ 2000, builds
+  `ix_note_embeddings_embedding_halfvec_hnsw` over
+  `(embedding::halfvec(D)) halfvec_cosine_ops` from
+  `src/services/vector_index.py`, then drops 008's
+  `ix_note_embeddings_embedding_hnsw`. New first, old second, so a failed build
+  leaves the database as it was. Above 2000 neither exists.
+
+**Why the index is excluded from autogenerate, and exactly it.** It is not on
+the model. Declaring it would put an operator class inside an index
+expression, and Alembic 1.19 on SQLAlchemy 2 *does* compare expression indexes
+on PostgreSQL (`_skip_functional_indexes` runs only when `not sqla_2`): it
+strips `::type` casts by regex and then either reports spurious drift or skips
+with a warning. Left undeclared and uncompared, the reflected index would read
+as a drop and `alembic check` would be dirty for ever. So `alembic/env.py`
+passes `include_object` to **both** `context.configure` calls, and it returns
+false for one object only: `type_ == "index"` and `name ==
+vector_index.INDEX_NAME`. Every other index — the legacy name included — is
+compared as before. `tests/test_perf_vector_index.py` evaluates the hook
+against every name the metadata carries, under every object type, and pins
+that exactly one is excluded. Widening the exclusion is how real drift gets
+hidden; the test exists so it cannot happen quietly. 008's index was removed
+from `NoteEmbedding.__table_args__` in the same change that drops it — which
+also ends a latent dirty check on deployments above 2000 dimensions, where the
+model declared an index the database never had.
+
+**The catalogue is the check.** Because Alembic sees neither half, the schema
+gate asserts them directly: `pg_class.reloptions` for both scale factors; for
+the index, `pg_get_indexdef` (the `((embedding)::halfvec(D))` expression at the
+configured dimension, `m='16'`, `ef_construction='64'`), `indisvalid`, and the
+operator class through `pg_opclass` (`halfvec_cosine_ops`), plus the legacy
+index's absence. It is 019/021/024's rule for indexes: a name is not evidence.
+
+**Reconcile, don't adopt.** A stamp-back re-run finds the index already built.
+It is accepted only if it is valid and its `pg_get_indexdef` equals, text for
+text, what `create_index_sql(D)` produces on a scratch TEMP table of the same
+column type — measured on the running server, not guessed (026's device). The
+gate asserts the OID is unchanged, i.e. reconciled rather than rebuilt. Any
+other index under that name — `vector_cosine_ops`, another dimension, other
+build parameters — is refused and named, because the queries' ORDER BY would
+match nothing and search would silently become a sequential scan. The probe runs on
+every upgrade at *D* ≤ 2000, so the migration role needs the database's TEMP
+privilege (PUBLIC has it by default); a role without it fails 027
+transactionally *after* the index build, and the whole migration rolls back.
+
+**Build cost and timeouts.** The build is non-concurrent under `SET LOCAL
+maintenance_work_mem = '512MB'` and a 15-minute `statement_timeout`, with a
+10 s `lock_timeout` so a migration queued behind a live pass fails fast.
+~17.5 k × 1024 builds in tens of seconds, during which writes to
+`note_embeddings` wait — acceptable in the deploy's migrate step. `search_path`
+is pinned and asserted, and everything set is `RESET` at the end.
+
+**`downgrade()`** resets both reloptions, recreates 008's index
+(`IF NOT EXISTS`) when *D* ≤ 2000, and drops the half-precision one.
+
+The gate's head literal is `027`, with `026` in the chain. Its 027 cases: the
+fresh shape at 1024 (the spec's scenario) and at the gate's own 64, no index
+above 2000, the chain from 026 replacing the legacy index, stamp-back
+idempotence without a rebuild, three impostor refusals, and downgrade at both
+sides of the 2000 limit. Each asks `alembic check` too.
+
+## 028: `concurrency_counters` and `concurrency_runs`, and why a flip needs a table (#188)
+
+The concurrency rollout (shadow → queue → enforce, see
+[rate limits](rate-limits.md#durable-evidence-provenance-event-time-counters-and-a-run-watermark))
+is certified by a readiness evaluator, and some of what it must know never
+reaches a usage row: a request refused or overrun at the transport stage, a
+writer overrun, a pool checkout timeout in the panel or `/token`. #261 forbids
+an ownerless usage row per pressured request (an unauthenticated flood would
+become writes), the security-event log rotates and cannot be windowed, and
+since-boot in-process counters die with the process. So 028 creates two tables
+— owner-approved 2026-09-23 — and **writes no row**: there is nothing to
+backfill from.
+
+- **`concurrency_counters`**: primary key `(bucket_start timestamptz, epoch
+  text, mode text, metric text)`, `count bigint NOT NULL DEFAULT 0`,
+  `max_value integer NULL`, and `ix_concurrency_counters_bucket_start` for the
+  window scan and the prune. `bucket_start` is the **event-time** minute — the
+  minute the request completed or the checkout timed out, never the flush
+  time; flush-time buckets moved incidents across window boundaries (SR2-4).
+  `max_value` is NULL except for the two gauges (`pool_high_water`,
+  `transport_wait_max_ms`). The primary key is what the flush's
+  `ON CONFLICT DO UPDATE` (count added, max taken as the greater) conflicts on;
+  without it two rows could claim one bucket.
+- **`concurrency_runs`**: one row per process run — `run_id uuid` primary
+  key, `epoch`, `mode`, `started_at`, `completed_through` (the
+  completed-interval watermark), `clean_shutdown bool NOT NULL DEFAULT false`,
+  `lossy bool NOT NULL DEFAULT false`, and `ix_concurrency_runs_started_at`.
+  The table exists because heartbeat spacing alone could not tell a clean
+  recreate from a hard kill with a quick restart (SR2-3): a gap is covered only
+  after a run whose `clean_shutdown` is true.
+- **The closed sets live in the database.** `ck_concurrency_counters_metric`
+  (the ten metrics), `ck_concurrency_counters_mode` and
+  `ck_concurrency_runs_mode` (`off | shadow | queue | enforce`). A typo'd
+  `pool_checkout_timout` would make a real pool timeout invisible to the
+  criterion that blocks the flip on it — a false PASS — so, as 023's closed
+  key set, adding a metric is a migration. The sets are **pinned in the
+  migration**, not imported (a migration must keep describing the schema it
+  created, 019/023's rule), mirrored in `src/models/db.py`
+  (`CONCURRENCY_METRICS`, `CONCURRENCY_MODES`), and the schema gate asserts the
+  migration, the models, `concurrency.METRICS` and the mode literal all agree.
+- **Marker-owned, and refuse rather than adopt** (023/024's shape). Each table
+  carries a `COMMENT ON TABLE` marker mirrored on the model, so `alembic check`
+  compares it; each CHECK carries a constraint-comment marker. A pre-existing
+  table of either name is verified against the **complete** shape — columns
+  and nullability, primary key, the three server defaults, the CHECK set **by
+  definition** (measured off a scratch TEMP table, 013's device, since
+  autogenerate does not compare CHECK predicates), and the exact index set —
+  and, on any disagreement, `upgrade()` refuses **as a whole before creating
+  anything**, naming what disagreed. Adopting a shape nothing verified would
+  let it certify a false PASS. A stamp-back re-run meets its own shape and
+  keeps the rows it finds.
+- **`downgrade()`** decides each table on its own marker, drops only a marked
+  one, and prints what it leaves.
+- `search_path` is pinned to `public` and asserted (the flush and the
+  evaluator read unqualified names), with `lock_timeout` 10 s /
+  `statement_timeout` 60 s set and `RESET`, for 021's, 024's and 025's
+  reasons. The CHECK probe needs the TEMP privilege, as 013's does.
+
+**Writes and retention.** `src/services/concurrency_counters.py` owns every
+write: `register_run()` at lifespan start inserts the run with
+`completed_through = started_at`; `flush()` every 60 s is **one transaction** —
+drain, one multi-row upsert, run-row update to `completed_through =
+floor_minute(t)` (exactly `t` and `clean_shutdown = true` at shutdown) — and it
+commits **synchronously**. It is one statement a minute whatever the traffic,
+and it stays off #279's `synchronous_commit` allow-list: a watermark that could
+be lost in a crash would claim coverage for buckets that are not there. Pruning
+deletes counters with `bucket_start` and runs with `completed_through` older
+than **35 days** (never the current run), at most hourly and in its own
+transaction, so a failed prune never rolls back a flush. The readiness report's
+`DAYS` is capped at 35 for that reason.
+
+The gate's head literal is `028`, with `027` in the chain. Its 028 cases: the
+closed sets agree with the application, the fresh shape typed, marked and
+enforced, a metric or mode outside the set rejected, the chain from 027 with no
+rows written, stamp-back acceptance keeping rows, creation in `public` under a
+redirected `search_path`, the impostor-shape refusals, and downgrade.
+
+## 029: `oauth_codes.grant_id` and `oauth_tokens.grant_issued_at` (#325, #326)
+
+Two columns, owned as one marked unit (each carries 029's `COMMENT` marker,
+mirrored byte-identically in `src/models/db.py` so `alembic check` compares
+it). The *why* of both lives in [oauth-and-grants.md](oauth-and-grants.md);
+what is here is the schema side.
+
+- **`oauth_codes.grant_id varchar(64) NULL`**, no default, no index (codes are
+  looked up by the unique `code_hash`), no FK (there is no grants table), **no
+  backfill**: a code spent before 029 has no recoverable lineage, and NULL is
+  what says so.
+- **`oauth_tokens.grant_issued_at timestamptz NOT NULL DEFAULT now()`**. Every
+  pre-existing row is stamped with **the migration transaction's timestamp —
+  one value for all rows** (owner decision: no connector is logged out by the
+  deploy, and every family stays uniform). It is added nullable, stamped
+  `WHERE grant_issued_at IS NULL`, then defaulted and constrained, rather than
+  leaning on `ADD COLUMN … DEFAULT now()`'s fast-default evaluation, so the
+  backfill reads as what it is and a value already present is never
+  overwritten (the stamp-back re-run changes nothing).
+- **Why a server default, when 025 refused one.** 025's default would have
+  been a lie the sweep acts on. Here the risk runs the other way: during a
+  rolling deploy the previous image serves on the migrated schema and inserts
+  tokens without the column, and without a default that is a NOT NULL
+  violation — a 500 on every token exchange for the rollout. With one, an
+  old-image row gets its insert time (bounded, L9). The default's own hazard
+  — a future mint site that forgets to copy the value silently restarts its
+  family's clock, i.e. #326 again — is closed by an **AST guard**
+  (`tests/test_oauth_grant_lifetime.py`) requiring every `OAuthToken(`
+  construction under `src/` to pass `grant_issued_at=` explicitly, the same
+  device that pins the async-commit allow-list. Application code must never
+  rely on the default.
+- **Autogenerate does not compare server defaults**, so the gate verifies
+  `now()` through the catalogue (`pg_get_expr`) or nowhere, and the migration
+  itself refuses a same-named column without it.
+- **Reconcile or refuse, both columns before either is touched**: a marked
+  column of the exact shape is reconciled; anything else (wrong type, a
+  nullable `grant_issued_at`, one without the default, a NOT NULL `grant_id`,
+  a missing marker) is refused naming the column and the disagreement, and
+  nothing changes. `downgrade()` checks both markers before dropping either.
+  `lock_timeout` / `statement_timeout` set and `RESET`; `search_path` pinned
+  to `public` and `RESET`; `oauth_codes` before `oauth_tokens`, the
+  application's own lock direction.
+
+The gate's head literal is `029`, with `028` in the chain. Its 029 cases: the
+fresh shape (types, nullability, default, markers) with `alembic check` clean,
+the chain from 028, the one-timestamp backfill over pre-existing tokens (and no
+lineage invented for spent codes), stamp-back changing no value, the
+impostor-shape refusals (atomic across both columns), and downgrade of marked
+and unmarked columns. `tests/integration/test_oauth_grant_lifetime_pg.py`
+additionally upgrades a 028 database holding a live family and refreshes it
+immediately after.
+
+## 030: `notes_metadata.derived_under` (#311)
+
+Per-row re-derive progress: a SHA-256 hex digest of the root facts a
+re-deriving pass observed, bound to the row's path, hash and extraction
+version (see [indexing and embeddings](indexing-and-embeddings.md#re-derive-progress-311)).
+`varchar(64) NULL`, no default, no index, 030's comment marker declared in the
+ORM so `alembic check` compares it.
+
+- **No backfill: every existing row reads NULL.** A backfill from the recorded
+  provenance would assert a derivation the migration never observed (016's
+  rule) and could never match anyway: a re-derive happens only when the
+  observed facts differ from the recorded ones, so a digest of the recorded
+  facts never equals what a re-derive expects. A scope in re-derive at deploy
+  time pays one more full re-derive, then progresses.
+- **Reconcile, don't adopt** (026's shape). On the stamp-back re-run a
+  same-named column must be `character varying(64)`, nullable, without a
+  default and carrying the marker; anything else is refused by name, because a
+  marker column of unknown provenance is a row the pass may treat as already
+  derived.
+- **`downgrade()` drops only a marked column** and prints a skip otherwise.
+  Safe: the previous build neither reads nor writes it, and a re-upgrade
+  leaves every row NULL.
+
+`search_path` pinned and asserted, `lock_timeout` / `statement_timeout` set
+and `RESET`. The gate's head literal is `030`; its cases cover the fresh
+shape, the chain from 029, no backfill, stamp-back with a recorded marker
+kept, four impostor-column refusals, and both downgrade directions.
+
+## Database transport (#184)
+
+Before this change the engine passed no `ssl` argument and `DATABASE_URL`
+carried none, so asyncpg's default `sslmode=prefer` applied: it tries TLS, and
+against a server with `ssl=off` it is told no and **silently** reconnects in
+cleartext. Every note body, every credential-hash lookup and every usage row
+crossed a shared bridge network in the clear, and nothing said so. The code is
+`src/services/transport_security.py`; the validator is
+`Settings._validate_database_transport`.
+
+**One setting.** `DATABASE_SSL_MODE`, libpq's vocabulary, stripped and
+case-folded, default `prefer`:
+
+| Mode | `connect_args["ssl"]` | Semantics |
+| --- | --- | --- |
+| `disable` | `False` | plaintext |
+| `prefer` (default) | `"prefer"` | asyncpg's advisory TLS with plaintext fallback — exactly the pre-change behaviour |
+| `require` | `SSLContext`, `CERT_NONE`, no hostname check, TLS ≥ 1.2 | encrypted, **unauthenticated**, no fallback |
+| `verify-ca` | `SSLContext`, `CERT_REQUIRED`, `DATABASE_SSL_CA_FILE` only | chain verified, hostname not checked |
+| `verify-full` | as `verify-ca`, plus `check_hostname` | chain and hostname (the host in `DATABASE_URL`) verified |
+
+`allow` is not offered — it tries plaintext first. `prefer` is the default
+because any stricter one is an outage on a server without TLS; the downgrade
+it permits is made **visible**, not prevented (below).
+
+**Why a context and not asyncpg's mode strings.** With a *string* mode of
+`require` or above, asyncpg consults `sslrootcert`, `$PGSSLROOTCERT` and
+`~/.postgresql/root.crt`, and — libpq-style — `require` **silently upgrades
+to verification** when such a file exists. With an `ssl.SSLContext`, asyncpg
+sets its internal mode to non-advisory and wraps the connection with that
+context: no plaintext retry, no environment variable, no home-directory file.
+The context's own `verify_mode` / `check_hostname` are the whole policy.
+`verify-*` requires `DATABASE_SSL_CA_FILE`; there is no system-store fallback
+(point the setting at the image's bundle explicitly for a publicly-trusted
+certificate). The one deliberate difference from libpq: a CA file with
+`require` is **refused**, not treated as `verify-ca`.
+
+**Conflicting inputs are refused, never reconciled.** SQLAlchemy passes every
+`DATABASE_URL` query key to `asyncpg.connect()` as a keyword and then lets
+`connect_args` override it, so `?ssl=disable` plus a strict context silently
+becomes the context — and the reverse order is one refactor away. So at
+settings construction, in every mode: a TLS key in the URL's query (`ssl`,
+`sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `sslcrl`, `sslpassword`,
+`sslnegotiation`, `direct_tls`, case-insensitive) and any `PGSSL*`
+environment variable are refused, naming `DATABASE_SSL_MODE`. So are a CA with
+a non-verifying mode, a verifying mode without a CA, half a client
+certificate pair, a client pair under `disable`/`prefer`, and any named file
+that is missing, not a regular file, unreadable or not loadable. Messages never
+echo the URL or its password.
+
+**Two connection creators, one helper.** `src/database.py`'s engine (shared by
+the app, `src/mcp_stdio.py` and both maintenance scripts) and
+`alembic/env.py`'s migration engine both take `database_ssl_connect_args()`.
+Alembic validates the URL it actually resolves (`DATABASE_URL`, else
+`alembic.ini`) with the same `validate_database_url_transport` **before** it
+builds its engine. Offline mode (`alembic upgrade --sql`) opens no
+connection. `db-init`, `db-backup`/`restore` and `record-backup.sh` run
+`psql`/`pg_dump` inside the database container over its local socket and are
+unaffected.
+
+**Unix sockets under a strict mode (D3a).** A socket never carries TLS, and
+asyncpg ignores the context for one — so a strict mode reached through a
+socket would open a plaintext session in exactly the processes that run no
+startup assertion. Under `require`/`verify-*`, before any connection:
+
+- any socket-shaped host token in the URL is refused — the netloc host
+  (also after percent-decoding; SQLAlchemy 2.0 passes `%2Frun%2F…` through
+  undecoded, so it is refused as fail-closed), and every `?host=` value, split
+  on repeats and commas, beginning with `/` or `@`. A **mixed** multi-host
+  list is refused although one entry is TCP: asyncpg would try the socket too;
+- the **effective** host list — what the asyncpg dialect's own
+  `create_connect_args` produces, so SQLAlchemy's netloc/query precedence and
+  `host=h:p` splitting are the real ones — is refused when it is empty or
+  contains an empty host (`?host=:5432` becomes `host=''` even beside a TCP
+  netloc), because asyncpg then falls back to `$PGHOST` and to its implicit
+  default, which starts with the socket directories; or when any entry is a
+  socket path;
+- a `service`/`servicefile` query key, and `PGHOST`, `PGHOSTADDR`, `PGSERVICE`
+  or `PGSERVICEFILE` in the environment, are refused: each can supply a host
+  this check cannot see.
+
+Under `disable`/`prefer` a socket is local and stays permitted.
+
+**Every new strict connection is checked (D3b).** Under a strict mode both
+engines carry a pool `connect` listener that runs `SELECT ssl FROM pg_stat_ssl
+WHERE pid = pg_backend_pid()` on each **new** connection (never per checkout)
+and discards it with `DatabaseTransportError` when it is not encrypted. D3a
+should make that unreachable, so it raises rather than exits.
+
+**The startup assertion (D4).** `check_database_transport()` is the lifespan's
+first database contact, before `_check_embedding_dim`, so a transport failure
+is reported as itself. It reads `pg_stat_ssl` for its own backend (readable by
+an unprivileged role). Under a strict mode, an unencrypted session, a missing
+row, or a connection that could not be established (the server refused TLS or
+the certificate did not verify) logs CRITICAL — the error's class only, never
+its text, which can carry the DSN — and exits. Under `prefer`/`disable` a
+plaintext session emits one `internal_transport_plaintext` security event
+(`reason=database`, `outcome=<mode>`). Either way one line is logged:
+`Database transport: mode=… encrypted=… tls_version=… server_verified=…`, where
+`server_verified` comes from the mode (`verify-*` only), never from the
+session. Sandbox mode skips it with the other database checks.
+
+**Accepted limitations.**
+1. `prefer` still downgrades: the default is a *reported* downgrade, not a
+   prevented one. Prevention is `require` or above, which needs server TLS.
+2. `require` is encrypted but unauthenticated; an active interposer can
+   terminate it with any certificate. `verify-full` is the target.
+3. Under `prefer` the startup probe inspects one connection; a later pooled
+   one could land differently if the server's TLS setting changes while the
+   app runs. Strict modes check every new connection.
+4. No `prefer` warning outside the FastAPI lifespan: alembic, `mcp_stdio` and
+   the maintenance scripts enforce strict modes but do not warn under `prefer`.
+6. `verify-full` checks the name in `DATABASE_URL`'s host, so a Docker service
+   name must appear in the server certificate's SAN — an issuance requirement.
+
+## Database roles: the app is never the superuser (#324)
+
+Before #324 the two bundled compose stacks set `POSTGRES_USER=obsidian_mcp`,
+which the PostgreSQL image makes the **bootstrap cluster superuser** (OID
+10), and the app connected as it: a compromised app could read every
+database, run `COPY … PROGRAM` inside the postgres container and alter
+roles. Every bundle now has the role model the Kubernetes bundle always had.
+
+| | Role | Attributes | Owns |
+| --- | --- | --- | --- |
+| Bootstrap | `postgres` | superuser | the cluster, the `vector` extension and its member objects |
+| Runtime and migrations | `obsidian_mcp` | `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS` | database `obsidian_mcp` and every object the migrations create |
+
+Load-bearing rules:
+
+- **Migrations need only ownership and `TEMP`.** The migration role must own
+  the database (which gives it `CREATE` on `public` through
+  `pg_database_owner`) and hold `TEMP` (PUBLIC has it by default; 013, 019,
+  023 and 027 use temp tables). `vector` is installed by the superuser in
+  the privileged init phase, so 001's `CREATE EXTENSION IF NOT EXISTS
+  vector` is a no-op. **A migration must not need anything else** — no
+  `CREATE EXTENSION` of a new extension, no `ALTER SYSTEM`, no role DDL, no
+  other database. `tests/integration/test_nonsuperuser_migrations_pg.py`
+  runs `upgrade head` and `check` as a fresh `NOSUPERUSER` owner in CI; a
+  migration that needs more fails there. A new extension goes into the
+  init scripts (`docker/db-init-compose.sh` and
+  `deploy/kubernetes/postgres/configmap-initdb.yaml`) and a documented
+  manual step for existing installs.
+- **The server refuses a superuser session.** The lifespan reads `rolsuper`
+  for `current_user` right after the transport assertion
+  (`src/services/database_role.py`, skipped in sandbox mode) and exits with
+  a CRITICAL line unless `DATABASE_ALLOW_SUPERUSER=true`, which logs a
+  WARNING instead. It applies to every deployment, by owner decision: the
+  property is the ASVS requirement, and the server is the only component
+  that sees the real session. Alembic does not check (it is an operator's
+  one-shot, and the test harnesses and `make test-schema` legitimately
+  migrate as `postgres`); on an authentication failure (`28P01` / `28000`
+  anywhere in the wrapped exception chain) `alembic/env.py` prints one line
+  pointing at the upgrade script.
+- **The admin password never reaches the app container.** It lives in
+  `postgres.env`, loaded only by the postgres service; the app service sets
+  `POSTGRES_PASSWORD: ""` in `environment:` so a value left in `.env` by
+  the old instructions is overridden (`environment` beats `env_file`). The
+  compose file builds `DATABASE_URL` from `OBSIDIAN_DB_PASSWORD`, so there
+  is one statement of the runtime password.
+- **Validation happens before `initdb`.** A failing init script leaves
+  `PG_VERSION` behind and the image never runs init again, so weak
+  passwords are refused by `docker/postgres-entrypoint.sh` before the image
+  entrypoint runs. The init script writes `started`, then `complete`, to
+  `$PGDATA/obsidian-mcp-init.state`; a volume left at `started` is refused
+  with recovery instructions. A volume with **no** marker is a pre-#324 one
+  and is allowed, because it must start for the conversion.
+- **Existing clusters are converted by hand, once.**
+  `docker/upgrade-split-db-roles.sql` renames OID 10 to `postgres` from a
+  temporary superuser's session (a session cannot rename its own role, and
+  OID 10 cannot lose `SUPERUSER`), creates the new `obsidian_mcp`, and moves
+  ownership catalog by catalog — `REASSIGN OWNED` refuses the bootstrap
+  role, whose objects have no `pg_shdepend` rows. "User object" means
+  `oid >= 16384` outside the extension closure (`deptype 'e'`, plus
+  recursively `deptype 'i'`, which catches an extension type's array type).
+  Default privileges (`pg_default_acl`) move too, as a diff against
+  `acldefault`. All of it is one transaction ending in a self-check that
+  names any object still owned by OID 10 and rolls back. Note: on PG 16
+  `ALTER TYPE … OWNER` on a range does **not** move its multirange, so
+  multiranges are moved explicitly. The real-container test
+  (`tests/integration/test_upgrade_split_db_roles_pg.py`) seeds every
+  category and asserts through the catalogs.
+
+  Two things the script does that look optional and are not (Codex review
+  of #324). **After the commit it terminates every other OID-10 client
+  backend and fails unless none is left:** a session that logged in as the
+  old `obsidian_mcp` is still OID 10 afterwards, i.e. still a superuser
+  under the new name, for as long as it stays connected. The procedure also
+  stops the app first and restarts postgres before the app comes back.
+  **"Already split" runs the full self-check:** role names plus `rolsuper`
+  also match a half-converted cluster (database owned by `postgres`, a
+  `CREATEDB` runtime role, objects left with OID 10), which must be refused
+  with what is wrong, not reported as done. The check also refuses a
+  runtime role that is a member, directly or through another role, of any
+  role with `SUPERUSER`/`CREATEDB`/`CREATEROLE`/`REPLICATION`/`BYPASSRLS`
+  (`GRANT postgres TO obsidian_mcp` passes a `rolsuper` test but allows
+  `SET ROLE postgres`), and any extension not owned by OID 10. Every session that sends a
+  password sets `log_statement = none` and `log_min_error_statement =
+  panic` first, because the default `error` level logs a failing
+  `ALTER ROLE … PASSWORD` with its password.
+
+**Accepted limitations** (full list in the change's design): password
+strength is length, charset and a placeholder list, not entropy; the
+superuser check is point-in-time at startup; the runtime role owns its
+tables and could drop them (there is no separate migrator role, as in
+Kubernetes); `postgres` can still log in over `mcp_internal` with the admin
+password; the upgrade script relies on local-socket `trust`; nothing proves
+an upgraded install's new runtime password differs from the old superuser
+password; a failure in the image's own init before our script runs leaves
+no marker and is not detected by the wrapper; the server's startup refusal
+checks the session role's own `rolsuper`, not membership in a privileged
+role (the upgrade script's self-check does catch that shape; L14).
 
 ## Backups are protected data, not just a rollback tool
 
@@ -416,9 +903,10 @@ contradiction of the "container cannot see backups" invariant that
   is the enforcement of the invariant `control-panel.md` states; do not add
   the mount back "for convenience" — `docker/record-backup.sh` exists
   precisely so the container never needs it.
-- **`.env` is `0600`.** It carries `DATABASE_URL` (with the password) and
-  `SECRET_KEY`; `make init` sets the mode, and a second local account on the
-  host is the reason this matters.
+- **`.env` and `postgres.env` are `0600`.** `.env` carries `DATABASE_URL`
+  or `OBSIDIAN_DB_PASSWORD` and `SECRET_KEY`; `postgres.env` carries the
+  bundled stacks' superuser password. `make init` sets both modes, and a
+  second local account on the host is the reason this matters.
 
 Encryption at rest for the dumps is not implemented; if it is added, keep a
 restore-tested copy with separately managed keys before switching it on, or

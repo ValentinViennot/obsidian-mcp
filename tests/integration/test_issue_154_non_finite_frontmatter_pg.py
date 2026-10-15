@@ -164,26 +164,28 @@ def _legacy_sanitize(v):
     return str(v)
 
 
-async def test_the_pre_fix_sanitiser_takes_the_whole_pass_down(
+async def test_the_pre_fix_sanitiser_now_costs_only_the_one_note(
     sessionmaker, vault, monkeypatch
 ):
     """The end-to-end failure, reproduced by restoring the old sanitiser.
 
     One note carrying `x: .nan`, one ordinary note beside it. With the pre-fix
-    pass-through in place the pass raises out of the batch upsert and **neither**
-    note's row exists afterwards — the ordinary note is collateral, which is
-    what makes this an owner-wide outage rather than one bad note.
+    pass-through in place the batch upsert raises a genuine `jsonb` 22P02.
+    Before #308 the pass raised and **neither** note's row existed afterwards
+    — the ordinary note was collateral, an owner-wide outage rather than one
+    bad note. #308's quarantine (D3) bounds exactly that class: the per-row
+    replay attributes the failure, the bad note is quarantined and absent, and
+    the ordinary note commits.
     """
     monkeypatch.setattr(indexer, "_sanitize_frontmatter", _legacy_sanitize)
     write(vault, "legacy_nan.md", "---\nx: .nan\n---\nbody\n")
     write(vault, "legacy_plain.md", "---\nx: 1\n---\nbody\n")
 
-    with pytest.raises(Exception) as caught:
-        await indexer.index_vault(user_id=None)
-    assert "NaN" in str(caught.value) or "json" in str(caught.value).lower()
+    result = await indexer.index_vault(user_id=None)
+    assert result.quarantined == ("legacy_nan.md",)
 
     assert await row_for(sessionmaker, "legacy_nan.md") is None
-    assert await row_for(sessionmaker, "legacy_plain.md") is None
+    assert await row_for(sessionmaker, "legacy_plain.md") is not None
 
 
 # ══════════════════════════════════════════════════════════════════════════

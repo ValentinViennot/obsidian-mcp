@@ -28,7 +28,7 @@ class ExtractedLink:
     target: str  # target string with alias and anchor stripped
     link_text: str  # full original text (e.g. "[[Foo|Bar]]")
     kind: str  # "link" | "embed" | "markdown"
-    position: int  # byte offset in the (un-stripped) source
+    position: int  # code-point offset in the (un-stripped) source
     # The two Obsidian-specific parts of a wikilink, kept as parsed rather than
     # re-derived by a second consumer splitting `link_text` on `#` and `|` —
     # which is exactly the kind of second grammar this module exists to
@@ -819,8 +819,20 @@ def extract_links_bounded(
     overflowed = False
 
     for m in _WIKILINK_RE.finditer(masked):
+        # Compare the raw deciding span BEFORE strip/cap accounting (#218).
+        # Masking `x` in [[`x`Old]] must not invent a link to Old; changes
+        # confined to the alias or anchor do not decide the target.
+        start, end = m.span("target")
+        if content[start:end] != masked[start:end]:
+            continue
         target = m.group("target").strip()
         if not target:
+            continue
+        # A NUL anywhere in the link — target, anchor or alias — makes it not
+        # a link (#308, D2). Removing it would name a different note, and
+        # keeping it cannot be stored. After the indexer's decode-point removal
+        # a body has none; the rule is stated here so it holds for any input.
+        if "\x00" in m.group(0):
             continue
         if max_links is not None and len(wiki) >= max_links:
             overflowed = True
@@ -841,6 +853,12 @@ def extract_links_bounded(
         ))
 
     for link in scan_md_links(masked):
+        # href_start excludes angle brackets and uses the same code-point
+        # offsets as the original string. Labels and anchors stay outside
+        # this comparison; rejected candidates cannot cause truncation.
+        end = link.href_start + len(link.href)
+        if content[link.href_start:end] != link.href:
+            continue
         href = link.href.strip()
         if not href:
             continue
@@ -852,6 +870,17 @@ def extract_links_bounded(
             decoded = urllib.parse.unquote(href)
         except Exception:
             decoded = href
+        # A percent-encoded NUL (`[x](bad%00target.md)`) decodes to U+0000
+        # from NUL-free text. Dropping the character would *invent* a link to
+        # `badtarget.md`, a different file, so the whole link is dropped, as an
+        # empty href is (#308, D2) — and likewise for a raw NUL in the label.
+        # The anchor is never decoded or stored apart from `link_text`, which
+        # keeps its `%00` as three characters, so it is left alone: dropping
+        # `[x](a.md#%00)` would change rows that are storable today, which is
+        # an extraction-version bump this change deliberately does not make.
+        # Neither dropped form could ever have been stored, so no row changes.
+        if "\x00" in decoded or "\x00" in link.text:
+            continue
         # Strip a trailing `.md` for resolver consistency — resolver tries
         # both with and without the extension.
         target = decoded[:-3] if decoded.endswith(".md") else decoded

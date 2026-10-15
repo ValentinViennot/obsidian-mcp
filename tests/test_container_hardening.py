@@ -382,7 +382,8 @@ def test_the_cmd_still_pins_one_worker(dockerfile: str) -> None:
     cmd = re.search(r"^CMD\s+(.+)$", dockerfile, re.M)
     assert cmd is not None
     assert '"--workers", "1"' in cmd.group(1), cmd.group(1)
-    assert '"--forwarded-allow-ips"' in cmd.group(1), cmd.group(1)
+    assert '"--no-proxy-headers"' in cmd.group(1), cmd.group(1)
+    assert '"--forwarded-allow-ips"' not in cmd.group(1), cmd.group(1)
     assert '"*"' not in cmd.group(1), (
         "--forwarded-allow-ips=* lets any client spoof its forwarded IP"
     )

@@ -1,5 +1,22 @@
 {% extends "base.html" %}
 {% block title %}API Keys — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+    /* #289: converted from inline style attributes. */
+    .keys-new-key-label { font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 10px; opacity: 0.75; }
+    .keys-new-key { flex: 1; background: var(--code-bg); padding: 10px 14px; border-radius: 5px; font-size: 12px; word-break: break-all; color: var(--key-text); }
+    .keys-field-help { font-size: 11px; color: var(--text-3); margin-top: 6px; line-height: 1.5; }
+    .keys-check-hint { color: var(--text-3); font-size: 12px; display: block; margin-top: 2px; }
+    /* Cell classes are scoped to beat `.data-table td` and
+       `.data-table tbody tr:hover td` (0,2,3), which the inline style used
+       to beat: equal specificity, later in the cascade. */
+    .data-table tbody tr td.keys-td-name { color: var(--text); font-weight: 500; }
+    .data-table tbody tr td.keys-td-owner { font-size: 12px; color: var(--text-2); }
+    .data-table tbody tr td.keys-td-prefix { color: var(--text-2); }
+    .data-table tbody tr td.keys-td-meta { font-size: 11px; color: var(--text-2); }
+    .data-table tbody tr td.keys-td-empty { text-align: center; padding: 32px; color: var(--text-3); }
+</style>
+{% endblock %}
 {% block content %}
 
 <div class="page-top">
@@ -7,14 +24,14 @@
     <div class="page-actions">
         {% set revoked_count = keys | selectattr('is_active', 'equalto', false) | list | length %}
         {% if revoked_count > 0 %}
-        <form method="POST" action="/admin/keys/delete-revoked" style="display:inline;">
+        <form method="POST" action="/admin/keys/delete-revoked" class="u-display-inline">
             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-            <button type="submit" class="btn btn-danger" onclick="return confirm('Permanently delete all {{ revoked_count }} revoked key{{ 's' if revoked_count != 1 }}?')">
+            <button type="button" class="btn btn-danger" data-confirm="Permanently delete all {{ revoked_count }} revoked key{{ 's' if revoked_count != 1 }}?">
                 Delete Revoked ({{ revoked_count }})
             </button>
         </form>
         {% endif %}
-        <button onclick="document.getElementById('create-modal').classList.add('open')" class="btn btn-primary">
+        <button type="button" data-modal-open="create-modal" class="btn btn-primary">
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
                 <line x1="6" y1="1" x2="6" y2="11"/><line x1="1" y1="6" x2="11" y2="6"/>
             </svg>
@@ -31,10 +48,10 @@
 
     {% if new_key %}
     <div class="alert alert-success anim-1">
-        <div style="font-size:11px;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px;opacity:0.75;">New key created — copy now, won't be shown again</div>
-        <div style="display:flex;align-items:center;gap:10px;">
-            <code id="new-key-val" class="mono" style="flex:1;background:var(--code-bg);padding:10px 14px;border-radius:5px;font-size:12px;word-break:break-all;color:var(--key-text);">{{ new_key }}</code>
-            <button onclick="navigator.clipboard.writeText(document.getElementById('new-key-val').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000);})" class="btn btn-ghost" style="flex-shrink:0;">Copy</button>
+        <div class="keys-new-key-label">New key created — copy now, won't be shown again</div>
+        <div class="u-display-flex u-align-items-center u-gap-10px">
+            <code id="new-key-val" class="mono keys-new-key">{{ new_key }}</code>
+            <button type="button" data-copy-from="new-key-val" class="btn btn-ghost u-flex-shrink-0">Copy</button>
         </div>
     </div>
     {% endif %}
@@ -58,13 +75,13 @@
             <tbody>
                 {% for key in keys %}
                 <tr>
-                    <td style="color:var(--text);font-weight:500;">{{ key.name }}</td>
+                    <td class="keys-td-name">{{ key.name }}</td>
                     {% if multi_user_mode %}
-                    <td style="font-size:12px;color:var(--text-2);">
-                        {% if key.owner_username %}{{ key.owner_username }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}
+                    <td class="keys-td-owner">
+                        {% if key.owner_username %}{{ key.owner_username }}{% else %}<span class="u-color-text-3">—</span>{% endif %}
                     </td>
                     {% endif %}
-                    <td class="mono" style="color:var(--text-2);">{{ key.key_prefix }}···</td>
+                    <td class="mono keys-td-prefix">{{ key.key_prefix }}···</td>
                     <td>
                         {% if key.permission == 'readwrite' %}
                         <span class="badge badge-yellow">readwrite</span>
@@ -72,22 +89,21 @@
                         <span class="badge badge-blue">read</span>
                         {% endif %}
                     </td>
-                    <td style="white-space:nowrap;">
+                    <td class="u-white-space-nowrap">
                         {% if key.daily_request_limit %}
                         {# Consumption is admissions since the limit was set, not
                            requests since midnight — the counter row is deleted
                            when a limit is enabled. The header spells that out;
                            here the day is named so "today" is never the
                            reader's local one. #}
-                        <span class="mono" style="font-size:12px;color:var(--primary-text);"
+                        <span class="mono u-font-size-12px u-color-primary-text"
                               title="{{ key.quota_used }} of {{ key.daily_request_limit }} calls admitted on the UTC day {{ quota_day }}, counted since the limit was set. Refused calls do not count. Resets at the next UTC midnight.">{{ key.quota_used }} / {{ key.daily_request_limit }}</span>
                         {% else %}
-                        <span style="font-size:12px;color:var(--text-3);">Unlimited</span>
+                        <span class="u-font-size-12px u-color-text-3">Unlimited</span>
                         {% endif %}
                         <button type="button"
-                                class="btn btn-link"
-                                style="font-size:11px;"
-                                onclick="omcpEditLimit({{ key.id }}, '{{ key.daily_request_limit if key.daily_request_limit else '' }}')">Edit</button>
+                                class="btn btn-link u-font-size-11px"
+                                data-limit-edit data-key-id="{{ key.id }}" data-limit="{{ key.daily_request_limit if key.daily_request_limit else '' }}">Edit</button>
                     </td>
                     <td>
                         {% if not key.is_active %}
@@ -104,22 +120,22 @@
                         <span class="badge badge-green">Active</span>
                         {% endif %}
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono keys-td-meta">
                         {% if key.last_used_at %}<time datetime="{{ key.last_used_at }}" data-localize>{{ key.last_used_at }}</time>{% else %}—{% endif %}
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono keys-td-meta">
                         <time datetime="{{ key.created_at }}" data-localize="date">{{ key.created_at }}</time>
                     </td>
-                    <td style="white-space:nowrap;">
+                    <td class="u-white-space-nowrap">
                         {% if key.is_active %}
-                        <form method="POST" action="/admin/keys/{{ key.id }}/revoke" style="display:inline;">
+                        <form method="POST" action="/admin/keys/{{ key.id }}/revoke" class="u-display-inline">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                            <button type="submit" class="btn btn-link" onclick="return confirm('Revoke this key?')">Revoke</button>
+                            <button type="button" class="btn btn-link" data-confirm="Revoke this key?">Revoke</button>
                         </form>
                         {% else %}
-                        <form method="POST" action="/admin/keys/{{ key.id }}/delete" style="display:inline;">
+                        <form method="POST" action="/admin/keys/{{ key.id }}/delete" class="u-display-inline">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                            <button type="submit" class="btn btn-link" onclick="return confirm('Permanently delete this key?')">Delete</button>
+                            <button type="button" class="btn btn-link" data-confirm="Permanently delete this key?">Delete</button>
                         </form>
                         {% endif %}
                     </td>
@@ -127,7 +143,7 @@
                 {% endfor %}
                 {% if not keys %}
                 <tr>
-                    <td colspan="{{ 9 if multi_user_mode else 8 }}" style="text-align:center;padding:32px;color:var(--text-3);">No API keys yet.</td>
+                    <td colspan="{{ 9 if multi_user_mode else 8 }}" class="keys-td-empty">No API keys yet.</td>
                 </tr>
                 {% endif %}
             </tbody>
@@ -138,7 +154,7 @@
 </div>
 
 <!-- Create modal -->
-<div id="create-modal" class="modal">
+<div id="create-modal" class="modal" data-modal-reset>
     <div class="modal-panel">
         <div class="modal-title">Create API Key</div>
         <form method="POST" action="/admin/keys/create">
@@ -156,25 +172,41 @@
             </div>
             <div class="field">
                 <label class="field-label">Daily request limit</label>
-                <input type="number" name="daily_request_limit" class="field-input"
-                       min="1" max="{{ quota_limit_max }}" step="1" placeholder="Leave empty for unlimited"
+                <input type="number" id="create-limit-input" name="daily_request_limit" class="field-input"
+                       min="1" max="{{ quota_limit_max }}" step="1"
+                       placeholder="{{ 'Leave empty for the default' if quota_limit_default|default(none) is not none else 'Required' }}"
                        value="{{ quota_limit_default|default(none) if quota_limit_default|default(none) is not none else '' }}">
-                <div style="font-size:11px;color:var(--text-3);margin-top:6px;line-height:1.5;">
-                    Tool calls this key may make per UTC day. Empty means unlimited.
+                <div class="keys-field-help">
+                    Tool calls this key may make per UTC day.
                     Calls over the limit are refused before they run and do not
                     count toward it; the counter resets at UTC midnight. To stop a
                     key entirely, revoke it — a limit of 0 is not accepted.
                     {% if quota_limit_default|default(none) is not none %}
                     This box is pre-filled with the server's default for new keys
-                    ({{ quota_limit_default }}); change it or clear it — whatever
-                    is in the box when you submit is what the key gets, and an
-                    empty box creates an unlimited key. Keys that already exist
-                    are unaffected.
+                    ({{ quota_limit_default }}); an empty box also gets that
+                    default.
+                    {% else %}
+                    A limit is required: the server has no default for new keys.
                     {% endif %}
+                    Only an administrator can make a key unlimited.
+                    Keys that already exist are unaffected.
                 </div>
             </div>
+            {% if is_admin %}
+            <div class="field u-display-flex u-align-items-center u-gap-10px">
+                <input type="checkbox" name="unlimited" value="1" id="create-unlimited"
+                       data-unlimited-toggle data-unlimited-target="create-limit-input"
+                       class="u-width-18px u-height-18px u-accent-color-primary">
+                <label for="create-unlimited" class="u-font-size-14px u-color-text u-cursor-pointer">
+                    Unlimited
+                    <span class="keys-check-hint">
+                        No daily ceiling for this key. Administrators only.
+                    </span>
+                </label>
+            </div>
+            {% endif %}
             <div class="modal-footer">
-                <button type="button" onclick="document.getElementById('create-modal').classList.remove('open')" class="btn btn-ghost">Cancel</button>
+                <button type="button" data-modal-close="create-modal" class="btn btn-ghost">Cancel</button>
                 <button type="submit" class="btn btn-primary">Create</button>
             </div>
         </form>
@@ -182,8 +214,8 @@
 </div>
 
 <!-- Edit-limit modal. One modal reused for every row: the form's action is
-     rewritten to the key being edited, so the page carries one dialog rather
-     than one per key. -->
+     rewritten to the key being edited (by `data-limit-edit` in panel.js), so
+     the page carries one dialog rather than one per key. -->
 <div id="limit-modal" class="modal">
     <div class="modal-panel">
         <div class="modal-title">Daily request limit</div>
@@ -192,9 +224,13 @@
             <div class="field">
                 <label class="field-label">Calls per UTC day</label>
                 <input type="number" id="limit-input" name="daily_request_limit" class="field-input"
-                       min="1" max="{{ quota_limit_max }}" step="1" placeholder="Leave empty for unlimited">
-                <div style="font-size:11px;color:var(--text-3);margin-top:6px;line-height:1.5;">
-                    Empty clears the limit and returns the key to unlimited.
+                       min="1" max="{{ quota_limit_max }}" step="1" placeholder="Required">
+                <div class="keys-field-help">
+                    {% if is_admin %}
+                    Enter a limit, or tick Unlimited to remove it.
+                    {% else %}
+                    Enter a limit. Only an administrator can make a key unlimited.
+                    {% endif %}
                     <strong>Setting a limit on an unlimited key restarts its
                     count at zero</strong> — consumption is counted from the
                     moment the limit is set, not from midnight. Changing an
@@ -204,21 +240,25 @@
                     call already in flight finishes under the old value.
                 </div>
             </div>
+            {% if is_admin %}
+            <div class="field u-display-flex u-align-items-center u-gap-10px">
+                <input type="checkbox" name="unlimited" value="1" id="limit-unlimited"
+                       data-unlimited-toggle data-unlimited-target="limit-input"
+                       class="u-width-18px u-height-18px u-accent-color-primary">
+                <label for="limit-unlimited" class="u-font-size-14px u-color-text u-cursor-pointer">
+                    Unlimited
+                    <span class="keys-check-hint">
+                        No daily ceiling for this key. Administrators only.
+                    </span>
+                </label>
+            </div>
+            {% endif %}
             <div class="modal-footer">
-                <button type="button" onclick="document.getElementById('limit-modal').classList.remove('open')" class="btn btn-ghost">Cancel</button>
+                <button type="button" data-modal-close="limit-modal" class="btn btn-ghost">Cancel</button>
                 <button type="submit" class="btn btn-primary">Save</button>
             </div>
         </form>
     </div>
 </div>
-
-<script>
-function omcpEditLimit(keyId, current) {
-    var form = document.getElementById('limit-form');
-    form.action = '/admin/keys/' + keyId + '/limit';
-    document.getElementById('limit-input').value = current;
-    document.getElementById('limit-modal').classList.add('open');
-}
-</script>
 
 {% endblock %}

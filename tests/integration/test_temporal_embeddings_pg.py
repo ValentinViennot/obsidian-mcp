@@ -431,3 +431,30 @@ async def test_an_ordinary_re_embed_does_not_erase_the_history(
     ]
     assert [(r[1], r[2]) for r in historical] == [(at(1), at(2)), (at(2), at(4))]
     assert [r[0] for r in rows if r[2] is None] == ["beta says something new"]
+
+
+async def test_upstream_chunk_reuse_never_licenses_historical_vectors(corpus, sessionmaker):
+    from src.services import index_state
+    from src.services.index_state import KEY_EMBEDDING_FINGERPRINT
+
+    async with sessionmaker() as session:
+        await index_state.set_state(session, KEY_EMBEDDING_FINGERPRINT, index_state.embedding_fingerprint())
+        await session.commit()
+        reusable = await embeddings_service._lookup_reusable_vectors(session, corpus)
+        assert set(reusable) == {"alpha now talks about glaciers"}
+
+
+async def test_historical_row_cannot_pass_the_reuse_generation_interlock(corpus, sessionmaker):
+    from src.services import index_state
+    from src.services.index_state import KEY_EMBEDDING_FINGERPRINT
+
+    async with sessionmaker() as session:
+        await index_state.set_state(session, KEY_EMBEDDING_FINGERPRINT, index_state.embedding_fingerprint())
+        note = await session.get(NoteMetadata, corpus)
+        historical = (await session.execute(select(NoteEmbedding).where(
+            NoteEmbedding.note_id == corpus, NoteEmbedding.valid_to.is_not(None)
+        ))).scalar_one()
+        reused = {historical.id: historical.chunk_text}
+        await session.commit()
+        assert await embeddings_service._generation_matches(session, note, reused) is False
+        await session.rollback()

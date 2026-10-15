@@ -2,17 +2,216 @@
 
 > Deep rationale extracted from `CLAUDE.md`. Read before touching panel templates, flash messages, the admin guards, or the Danger zone.
 
-## No CSP, and vendored assets
+## The panel CSP, and vendored assets
 
-- Jinja2 control panel. htmx and Chart.js are **vendored** under
+- Jinja2 control panel. Chart.js is **vendored** under
   `src/control_panel/static/vendor/` and served from `/admin/static` — no CDN,
   no `integrity` to keep in sync (#130). There is no Tailwind; the styling is
   hand-written CSS in `base.html`. Google Fonts is the one remaining remote
-  origin and ships no executable code. **No CSP on the panel**, deliberately:
-  every template drives its controls with inline `onclick`/`onsubmit` and htmx
-  attributes, so the only policy they survive is one carrying `unsafe-inline`
-  for scripts — which permits exactly the injection a CSP is bought to stop.
+  origin and ships no executable code.
 
+- **The panel, auth and consent pages carry a nonce-based
+  Content-Security-Policy (#195).** This used to read "no CSP, deliberately":
+  every control ran from an inline `onclick`/`onsubmit`, so the only policy
+  the templates survived was one with `'unsafe-inline'` for scripts — which
+  permits exactly the injection a CSP is bought to stop. The handlers went
+  first, then the policy came. The value, from `build_policy` in
+  `src/services/panel_csp.py`:
+
+  ```
+  default-src 'self'
+  script-src 'nonce-N'
+  style-src 'nonce-N' https://fonts.googleapis.com
+  style-src-elem 'nonce-N' https://fonts.googleapis.com
+  style-src-attr 'none'
+  img-src 'self' data:
+  font-src https://fonts.gstatic.com
+  connect-src 'self'
+  object-src 'none'
+  base-uri 'none'
+  frame-ancestors 'none'
+  form-action 'self'        (the consent page: 'self' https:)
+  ```
+
+  Each source is there for something the templates do. `script-src` lists
+  the nonce and **no host source, not even `'self'`** — every script, inline
+  or `src=`, carries the nonce, so an injected `<script
+  src="/admin/static/…">` is refused as surely as an inline one. No
+  `'unsafe-eval'` (Chart.js evaluates nothing; htmx is gone, below) and no
+  `'strict-dynamic'` (nothing loads script dynamically). `style-src-elem`:
+  the nonced `<style>` blocks and the Google Fonts stylesheet `<link>`.
+  `img-src data:`: the SVG noise and select-arrow backgrounds; `'self'` for
+  the favicon request. `font-src`: Google's font files. `connect-src
+  'self'`: the dashboard's reindex `fetch`. `frame-ancestors 'none'`
+  duplicates `X-Frame-Options: DENY`, which stays for older browsers. The
+  only variable in the string is the server-generated nonce, and
+  `build_policy` refuses anything that is not a `token_urlsafe` value, so no
+  request-derived byte can reach the header.
+
+- **One nonce per response, and the policy is scoped by a marker, not by a
+  path.** `nonce_for(request)` makes `secrets.token_urlsafe(16)` on first use
+  and keeps it on `request.state`, which the endpoint and the middleware
+  share through the one ASGI `scope["state"]` — the template render and the
+  header read the same value, and the next request gets a new one.
+  `template_context` is a `Jinja2Templates` context processor registered on
+  exactly the four panel/auth/consent instances (`src/control_panel/routes.py`,
+  `src/control_panel/users.py`, `src/auth/routes.py`, `src/oauth/routes.py`)
+  and **not** on the transfer one; it returns `csp_nonce` and marks the
+  request as panel surface. `add_security_headers` in `src/main.py` writes the
+  policy only on a marked `text/html` response. The policy is correct only
+  for markup written to carry its nonce, and "rendered by one of those four
+  instances" is exactly that set: it covers the HTML error renders (login
+  401, bootstrap register 400) and any future panel route with no inventory
+  to keep, and it excludes by construction the transfer pages (own instance,
+  own stricter policy) and FastAPI's `/docs`, `/redoc` and
+  `/docs/oauth2-redirect`, whose un-nonced inline and CDN scripts a nonce-only
+  policy would break. A path prefix would need an exception list and would
+  still miss a panel template rendered under a new prefix. A context
+  processor rather than a Jinja global because tests render templates
+  through their own `Environment`, where a missing variable renders empty but
+  a missing callable raises. `tests/test_panel_csp_headers.py` asserts that
+  every `Jinja2Templates(` under `src/` except the transfer one registers the
+  processor, so a fifth instance cannot silently escape. **A response that
+  already carries an enforcing `Content-Security-Policy` is never
+  overwritten** (that is what keeps the transfer policy byte-for-byte); a
+  pre-existing report-only header does not count, because it enforces
+  nothing and must not switch enforcement off.
+
+- **No inline handlers and no `javascript:` URLs, ever.** Behaviour is
+  declared with `data-*` attributes and implemented by document-level
+  delegated listeners in `src/control_panel/static/panel.js`, loaded by
+  `base.html` with the nonce: `data-confirm`, `data-modal-open` / `-close` /
+  `-backdrop` (plus `data-modal-reset` on a dialog that must open in its
+  first-open state, #332), `data-autosubmit`, `data-copy-from`, `data-limit-edit` (with
+  `data-key-id` / `data-limit`), `data-unlimited-toggle` (with
+  `data-unlimited-target`, #323), `data-sidebar-open` / `-close`,
+  `data-async-reindex`. **A new template control is a `data-*` attribute
+  plus a delegated listener in `panel.js`, never an `on*=`.** Attribute
+  values are read as strings or element ids — never evaluated, never
+  assigned as markup — which also closes the old `confirm()` quoting defect
+  class: an apostrophe in an interpolated name once broke the JS string, the
+  handler threw, and a throwing `onclick` submits unconfirmed. The page
+  `<script>` blocks (count-up, chart build, timestamp localisation and the
+  rest) stay inline and nonced; moving them to files buys nothing under a
+  nonce policy and would turn `usage.html`'s `tojson` interpolation into a
+  data-attribute round trip. `vault.html`'s hover colours are CSS `:hover`
+  rules. `tests/test_panel_csp_templates.py` fails on any `on*=` attribute,
+  any `javascript:` URL, any `hx-` attribute, or any `<script>`/`<style>`
+  without `nonce="{{ csp_nonce }}"`.
+
+- **Destructive confirmations fail closed.** The nine `data-confirm`
+  controls (keys ×3, OAuth ×2, settings ×1, user edit ×2, and since #309
+  the final control of `empty_vault_confirm.html`) are
+  `type="button"`, not submit buttons; the listener calls `confirm()` and, on
+  yes, `form.requestSubmit()`, so the form's own validation and `submit`
+  event still run. Without script — blocked, failed to load, disabled — the
+  button does nothing. The old `onclick="return confirm(…)"` failed open: a
+  missing or throwing handler let the destructive POST through. None of
+  those forms has a text field, and none may carry any other submit control
+  (the static test asserts it), so Enter cannot submit around the prompt.
+  The settings reset modal and `reembed_confirm.html` are confirmations of a
+  different kind and keep real submit buttons: the modal needs script to
+  open, and the re-embed page *is* the confirmation step.
+
+- **htmx is removed, not configured.** It was loaded on every panel page and
+  used by none. Configured (`includeIndicatorStyles: false`, `allowEval:
+  false`) it would stop inserting un-nonced styles and stop evaluating, but
+  its attribute-driven request machinery remains: an injected `<div
+  hx-post="/admin/keys/create" hx-include="[name=csrf_token]"
+  hx-trigger="load">` needs no script and no eval and makes an
+  authenticated, CSRF-valid request — a script gadget that bypasses the nonce
+  policy by construction. A change that wants htmx back reintroduces it with
+  that configuration and re-argues the gadget; the static test forbids `hx-`
+  attributes and any htmx reference, so the reintroduction is deliberate.
+
+- **No inline style attributes; `style-src-attr 'none'`** (#289). Style
+  *elements* are the real CSS-injection primitive (attribute-selector
+  scraping of the CSRF token's value, font-based text probes), so they are
+  nonce-only under `style-src-elem`. An injected style *attribute* can
+  restyle the element it sits on (overlay, hide, UI redress), and since #289
+  that is refused too: the templates carry no `style=""` at all.
+  `'none'` is spelled out rather than the directive left out, so the ban
+  does not depend on what the `style-src` fallback happens to hold. The
+  fallback carries the nonce, so a browser without CSP3 `-elem`/`-attr`
+  gets the same nonce-only rule for elements and refuses attributes too.
+  **Not a static stylesheet under `'self'`**: it would admit any current or
+  future same-origin `text/css` response. Today's `/transfer/*` byte routes
+  need an `Authorization: Bearer` header and so cannot be loaded as a
+  stylesheet, but the panel's style policy should not depend on that staying
+  true. The CSS therefore stays in nonced `<style>` blocks, in this order in
+  `base.html`'s `<head>`: the component stylesheet, then
+  `_utilities.html`, then `{% block page_style %}`.
+  - `_utilities.html` is **generated, not hand-edited**: one
+    `u-<property>-<value-slug>` rule per short declaration found in the
+    pre-#289 templates. A new one-off style goes in the page's `page_style`
+    block as a page-prefixed class (`dash-`, `keys-`, `ue-`, …).
+  - **No `!important`.** Script sets dynamic presentation through CSSOM
+    (`el.style.display = …`, the progress width, the activity-row stagger,
+    Chart.js canvas sizing), which CSP does not govern and which beats any
+    class. `!important` would silently defeat those writes. Initial states
+    that script later changes are plain classes.
+  - Table cells need `.data-table tbody tr td.<cls>` (0,2,3), not a single
+    class: the base `.data-table td` and the hover-colour rule outrank one,
+    where the old inline style beat both.
+  - `tests/test_panel_csp_templates.py` fails on any template `style`
+    attribute (Jinja conditionals included), any script that builds one
+    (`style=` in a string, `setAttribute('style', …)`), and a vendored
+    Chart.js that starts writing them; `tests/test_panel_csp_headers.py`
+    scans every rendered panel page.
+
+- **The consent page's `form-action` is `'self' https:`, by owner decision.**
+  `form-action` belongs to the page that *submits* the form. The consent form
+  posts to `/authorize`, which answers 302 to the client's registered
+  redirect URI for approve and deny alike, and Chromium checks `form-action`
+  on every hop of a form-submission navigation — so a flat `'self'` breaks
+  every OAuth connection. The exact origin of the redirect URI was the first
+  draft and was rejected: a callback that 302s on to another HTTPS origin is
+  blocked on the second hop, after the code is already delivered, and a host
+  registered in a non-canonical spelling (`https://127.1/cb`) does not match
+  the canonical URL the browser navigates to. A broken approve on a live
+  connector is the most expensive failure this policy can cause. `https:`
+  still refuses `http:`, `javascript:` and `data:` targets; where a code can
+  go is decided by the HTTPS-only registration rule and `authorize_post`'s
+  exact-match re-validation, never by this header. `authorize_get` calls
+  `mark_consent` before rendering; every other page keeps `'self'`.
+
+- **`PANEL_CSP` is the rollback lever** (`enforce` | `report-only` | `off`,
+  default `enforce`, boot-validated — an unknown value refuses startup).
+  `report-only` sends the same value as
+  `Content-Security-Policy-Report-Only`; `off` sends none. Templates keep
+  their nonces and their delegation in every mode, so behaviour is
+  identical. The effective mode is logged at INFO on startup, and at WARNING
+  when it is not `enforce`, so a forgotten rollback shows in the logs.
+  Changing it is an `.env` edit plus a container recreate, no rebuild. The
+  rollout is **report-only first**: the first production deploy runs
+  `report-only` through a browser pass — every control, one real connector
+  approve and one deny, zero violations — and only that result authorises
+  the flip to `enforce`. Since #289 the pass is a headless Playwright walk
+  with a `securitypolicyviolation` listener installed before any page script,
+  plus positive controls proving the listener fires; report-only violations
+  fire the same event, which a by-hand look at the page cannot show. A violation found later
+  goes back to `report-only` and is fixed forward. The code default stays
+  `enforce`, so a fresh deployment is protected without operator action.
+
+- **Accepted limitations** (owner-accepted with the change; the reasoning is
+  in the `panel-csp` design):
+  1. *(Closed by #289.)* Inline style attributes were allowed; they are now
+     refused by `style-src-attr 'none'`.
+  2. *(Closed by #289.)* A browser without CSP3 `style-src-elem`/`-attr` got
+     `style-src 'unsafe-inline'`; the fallback now carries the nonce.
+  3. The consent page's `form-action` admits any HTTPS origin; an injection
+     there could post the form's hidden fields to an HTTPS origin.
+  4. `/docs`, `/redoc` and `/docs/oauth2-redirect` carry no CSP. They are not
+     proxy-routed; disabling them is a separate call.
+  5. A panel POST after the SSO session has expired is redirected by the
+     forward-auth chain to the identity provider, which `form-action 'self'`
+     blocks; the user sees a blocked navigation, and a reload proceeds to SSO.
+  6. `report-only` reports to the browser console only; there is no
+     collection endpoint (it would be a new unauthenticated write surface).
+  7. `panel.js` has no automated behavioural test — no JS runner exists; the
+     static structure test and the browser pass cover it.
+  8. CSP is not a CSRF control: `form-action 'self'` still admits an injected
+     form posting to the panel's own endpoints. The CSRF token is the control.
 
 ## Theming: one token source, dark canonical
 
@@ -91,30 +290,39 @@
   `--bg` into `<meta name="theme-color">`, because no stylesheet can reach a
   meta tag.
 
-- **The bootstrap is an inline `<script>` with no nonce, and that is
-  consistent, not an oversight.** There is deliberately no CSP on the panel
-  (above); every control here already runs from an inline `onclick`. A theme
-  bootstrap *must* be inline and synchronous in `<head>` — an external file
-  is a network round trip in front of first paint, which is the flash the
-  script exists to prevent. If a CSP is ever added to the panel, this script
-  needs a nonce along with every other inline handler; it is not a special
-  case.
+- **The bootstrap is an inline `<script>`, nonced like every other.** It
+  carries `nonce="{{ csp_nonce }}"` and is admitted by the panel CSP (above)
+  on all three roots. It stays inline because a theme bootstrap *must* be
+  inline and synchronous in `<head>` — an external file is a network round
+  trip in front of first paint, which is the flash the script exists to
+  prevent. It also registers the toggle's delegated `click` listener on
+  `document` for `[data-theme-toggle]`: the toggle renders on the login and
+  consent pages, which do not load `panel.js`, and a listener on `document`
+  works before the body exists. The toggle button itself has no handler.
 
-- **SVG colors ride in `style=""`, not in `fill=`/`stroke=`.** SVG2 parses
-  presentation attributes with the property's own grammar rather than as CSS
-  declarations, so `var()` substitution in them is not dependable across
-  browsers — a `fill="var(--gem-facet)"` that fails to substitute falls back
-  to black. `style=""` is real CSS and is already this panel's idiom.
+- **SVG colours ride in stylesheet classes, never in `fill=`/`stroke=` with
+  `var()`.** SVG2 parses presentation attributes with the property's own
+  grammar rather than as CSS declarations, so `var()` substitution in them is
+  not dependable across browsers — a `fill="var(--gem-facet)"` that fails to
+  substitute falls back to black. The gem marks use `.gem-edge`,
+  `.gem-facet` and `.gem-facet-2` in the nonced stylesheet (`base.html`,
+  `auth_base.html`, and `authorize.html` with the `--consent-*` tokens); the
+  pre-#289 `style=""` form is refused by `style-src-attr 'none'`.
 
 - **The transfer pages are a different surface and must stay one.**
   `transfer_upload.html` and `transfer_download.html` serve third parties
   under a strict per-request nonce CSP with static-response discipline
   (`src/transfer/routes.py`). They carry their own local `--t-*` token block,
   keep their light-first `prefers-color-scheme` behaviour, and have no
-  toggle, no `localStorage`, and no shared panel partial — including the
-  panel's would drag an unnonced inline script into a page whose whole point
-  is that everything inline is nonced. Their security headers must stay
-  byte-identical once each response's per-request nonce is canonicalized.
+  toggle, no `localStorage`, and no shared panel partial — the panel's
+  partial carries `{{ csp_nonce }}`, which the transfer instance does not
+  provide (it renders `{{ nonce }}` under its own `default-src 'none'`
+  policy), so including it would put an unnonced inline script into a page
+  whose whole point is that everything inline is nonced. The panel CSP never
+  touches these pages: their instance does not mark the request, and an
+  enforcing policy already on a response is left alone. Their security
+  headers must stay byte-identical once each response's per-request nonce is
+  canonicalized.
 
 - The archived ops-health and usage-slicing sweep wrappers locate their
   shared `colorscan` module by walking ancestors, then use its `repo_root()`
@@ -248,7 +456,10 @@
   succeeds — on the page an operator opens *because* something is wrong. So
   `_health_strip_or_degraded` rolls the failed transaction back (without it the
   render's own queries raise `InFailedSQLTransaction` instead of the real
-  error), records `panel_health_strip_failed` at ERROR so the ring buffer
+  error), refreshes the acting `User` the rollback just expired (the render
+  reads `user.is_admin` next; an expired instance is a `MissingGreenlet` 500,
+  #332 — its own record uses values captured before the rollback), records
+  `panel_health_strip_failed` at ERROR so the ring buffer
   catches it, and renders a "health summary unavailable" strip. Saying so beats
   rendering "ok" from a query that never returned. It goes through
   `security_events.emit` rather than the bare logger because a caller can drive
@@ -388,6 +599,58 @@ how the panel says so.
   not recognise rather than dropping it — which is the difference between a row
   that looks ordinary and a row that says it is not.
 
+## The Concurrency cards on `/admin/performance` (#188)
+
+The shadow → queue → enforce rollout (see
+[rate limits](rate-limits.md#readiness-and-the-rollout)) is decided on numbers,
+and before #188 there was nowhere to read them. `performance_page` calls one
+function, `concurrency_readiness.panel_section`, and the template renders two
+cards between the latency table and the search phases.
+
+- **"Concurrency pressure" — everyone, scoped as the page scopes.** Per tool
+  and per class (`embedding`, `vector`, `write`, `scan`, `light`) over the
+  page's selected window: executed calls, tool-pressured calls, queue
+  overruns, weighted `slot_timeout` refusals (`1 + suppressed`, the same
+  guarded weight as the latency table) and tool `queue_ms` p50/p95/p99/max. A
+  regular user counts only their own rows; an admin every row. The executed
+  and pre-body predicates are **imported** from `usage_stats`, not
+  re-derived, so a queue overrun the quota gate then refused is a pre-body
+  refusal here exactly as on the latency table.
+- **Only rows with `params.concurrency.v = 2` are read.** Legacy rows are left
+  out, not counted as zero — a pre-#188 row with `queue_ms: 0` would otherwise
+  read as "no pressure". A window with none gets an explicit empty state that
+  says why (pre-provenance rows and `MCP_CONCURRENCY_MODE=off` carry none),
+  never a table of zeroes that reads like a measurement.
+- **Tool pressure is counted from `observations`, not `code`.** A shadow row
+  whose first observation is the auth stage still counts as tool-pressured if
+  a tool-stage observation follows it.
+- **"Concurrency control" — admin only, and not even computed otherwise.**
+  `panel_section(…, is_admin=False)` returns before the snapshot or any
+  counter query runs, so a non-admin response cannot leak it through a
+  template slip. It shows: the live `Controller.snapshot()` (mode, epoch,
+  pool demand as `total of 15` with its four terms, active and waiting counts
+  per stage and class, the effective limits); the window's durable counters
+  for the running mode and epoch (`requests`, the transport outcomes, writer
+  outcomes, `pool_checkout_timeout`, and the `pool_high_water` /
+  `transport_wait_max_ms` maxima), with non-zero incidents badged; the durable
+  watermark and every uncovered interval in the window, as start and length;
+  and the readiness verdict for the **next** mode (shadow → `queue`, queue →
+  `enforce`; `enforce` and `off` show "no next mode") with each criterion's
+  PASS / FAIL / INSUFFICIENT_DATA and reason. Admin-only because the
+  counters, occupancy and pool state are process-wide — they have no owner to
+  scope by, the health page's rule.
+- **The verdict window is not the page window.** It is max(page window, the
+  target's minimum — 3 days for queue, 7 for enforce), ending at the durable
+  watermark, and it is the **same evaluator** `make concurrency-report` runs,
+  so the page and the report cannot disagree. A 24 h page therefore shows a
+  day's numbers above a verdict computed over a longer span; that is
+  deliberate, not a mismatch.
+- **CSP.** No inline script, handler or style attribute: existing classes, a
+  few `perf-cc-*` rules in the page's `page_style` block, and `data-localize`
+  on `<time>` elements for the shared timestamp localiser. The owner's
+  browser pass on this page is part of the change's deploy step, zero CSP
+  violations included.
+
 ## Flash messages
 
 - **Panel flash messages ride the session, never the query string** (#138,
@@ -406,6 +669,47 @@ how the panel says so.
   `error=` — those are protocol parameters on a redirect to the *client*, not
   panel flash. The pre-existing `flash_new_key` / `flash_key_error` /
   `flash_oauth_error` session entries keep their own dedicated render slots.
+
+## API keys: blank is the default, Unlimited is an admin's box (#323)
+
+The create form (`POST /admin/keys/create`) and the JSON twin share one
+key-creation budget and one non-admin active-key cap — see "Key creation is
+one budget across two representations" in [rate limits](rate-limits.md). What
+belongs here is the form's semantics, which changed by owner decision:
+
+- **A blank create field gets `DEFAULT_DAILY_REQUEST_LIMIT`.** It used to mean
+  unlimited, which made a scripted blank form a way to mint principals with no
+  daily quota. The field is still pre-filled with the default; with the default
+  null the field is required and a blank submission is a flashed error.
+- **The Unlimited checkbox** (`name="unlimited" value="1"`) is in both the
+  create and the edit-limit modal, **rendered only when `is_admin`** (from
+  `_panel_context`). It is the only panel control that produces or restores an
+  unlimited key, only the exact value `"1"` counts, and it wins over any number
+  submitted beside it. A non-admin `unlimited=1` is a tampered request: refused
+  with a flash, recorded as `panel_forbidden` (`unlimited_requires_admin`),
+  never downgraded to a limited key.
+- **`data-unlimited-toggle`** on the box, with `data-unlimited-target` naming
+  the number input's id, is handled by a delegated `change` listener in
+  `panel.js` that sets `disabled` on the input while the box is ticked (a
+  disabled input is not submitted). `editLimit` ticks the box and disables the
+  input when the key's current limit is empty — **only if the box exists**: a
+  non-admin's modal has none, so the input is always left enabled and a
+  non-admin can put a number on their own grandfathered unlimited key.
+- **The create dialog opens in its first-open state every time** (#332). It
+  carries `data-modal-reset`; the delegated `data-modal-open` branch resets its
+  form to the server-rendered values and re-syncs each Unlimited toggle
+  (`form.reset()` fires no `change`, so the sync is not optional) before
+  showing it. Before, a box ticked and then cancelled survived into the next
+  open with the limit disabled. The edit-limit modal does not opt in: it is
+  filled by `editLimit` from the row on every open.
+- **A blank edit is an error for everyone**, never a clear, and the edit path
+  never applies the default. Cancelling leaves an unlimited key unlimited.
+- The rules live once in `src/services/api_keys.py`, shared with
+  `src/api/routes.py`, so the two surfaces cannot drift (#162 and #323 were
+  both a rule enforced on one surface and not the other).
+- Budget refusals flash "Too many keys created recently — try again in N
+  minutes."; cap refusals flash the cap and "revoke a key". Both 303 back to
+  `/admin/keys` through the existing `flash_key_error` slot.
 
 ## Destructive actions take the index pass lock
 
@@ -467,6 +771,65 @@ how the panel says so.
   an unconditional `CREATE INDEX` aborts the entire reset on such a deployment
   and leaves the operator with a wiped column and no index (#6).
   `trigger_reembed` creates no index at all, so the condition is vacuous there.
+
+## "Confirm vault is empty" (#309)
+
+The indexer refuses to prune a scope whose vault root yields no markdown file
+while its index holds rows (`IndexIndeterminate`; see
+[indexing and embeddings](indexing-and-embeddings.md)): an empty root is far
+more often a mount that did not mount than a vault emptied on purpose. This
+action is how an administrator says it was on purpose.
+
+- **Where.** Single-user: a link in the settings Danger zone to
+  `GET /admin/settings/confirm-empty-vault` (rendered only when
+  `multi_user_mode` is off; in multi-user mode that route renders a refusal).
+  Multi-user: a link on each user's edit page to
+  `GET /admin/users/{id}/confirm-empty-vault`. Both are admin-only
+  (`require_admin_panel`, router-level for `/admin/users`), and their POSTs
+  pass the router's `verify_csrf` like every other panel POST. The shared
+  bodies live in `src/control_panel/empty_vault_confirm.py`; one template,
+  `empty_vault_confirm.html`, serves both.
+- **The page states the count.** It shows how many indexed notes
+  (`notes_metadata` rows of that scope) a confirmed pass would delete, and
+  issues a token only when there is something to confirm: zero rows says
+  "nothing to confirm", an ineligible target says why, and neither carries a
+  form. The final control is a `type="button"` with `data-confirm` in a form
+  of hidden fields only, so it fails closed (the ninth such control).
+- **Why the re-embed confirmation was not reused.** `reembed-confirm` signs a
+  random string and checks its age, nothing else: replayable within its
+  minute, by any administrator, naming no target. Tolerable for a re-embed;
+  not for authorising the deletion of a tenant's index. This token has its own
+  salt (`confirm-empty-vault-v1`) and binds the action name, the target scope
+  (`None` or the user id), the issuing administrator's id, the scope's
+  canonical vault assignment (`transfer.canonical_vault_root`, the value the
+  indexer re-checks the permission against), a random **process epoch**
+  generated at import, and a random nonce.
+- **Redemption refuses — granting nothing and starting nothing — unless**
+  the signature is valid for that salt; the token is at most 10 minutes old
+  (separate from the permission's 15-minute TTL); its epoch is this process's
+  (a restart empties the consumed-nonce set, so a pre-restart token must not
+  verify); the redeeming administrator is the issuer; the posted scope is the
+  bound one; the scope's assignment *now* equals the bound one; and the nonce
+  has not been consumed. Consumption is an insert into an in-process set,
+  synchronous with the checks (no `await` between "unused" and "used"), with
+  entries kept until their token could no longer verify anyway. `--workers 1`
+  makes that set the server's.
+- **Eligibility, decided first and from the database as it stands.** A
+  multi-user target that is deleted, inactive, has no vault assigned, or is
+  named by the published vault-overlap snapshot (or no snapshot has been
+  published yet) is refused. Single-user always has its one scope.
+- **On success** `empty_prune.grant(scope, assignment, granted_by=<admin>)`
+  — which logs the WARNING with the administrator and the scope — then
+  `_spawn` starts `indexer.index_scope_now(scope)`: one full-hash pass and
+  its embed stage for **that scope only**. `_reindex_background` (Reindex
+  Now, re-embed, reset) keeps its callers and still fans out to every active
+  user in multi-user mode; its single-user branch now isolates the index and
+  embed stages, so an indeterminate index stage does not stop the embed stage
+  over committed rows (#309 task 3.2).
+  A refusal logs a WARNING with the reason and flashes it; the outcome lands
+  as a session flash on the settings or user page (settings gained the flash
+  block for this).
+- Tests: `tests/test_issue_309_panel_confirm_empty.py`.
 
 ## Two coverage questions, and the dashboard answers both
 
@@ -540,6 +903,21 @@ how the panel says so.
   demotion of *this* actor commits; serializing the writes is no use if the
   loser of the race then performs the mutation anyway.
 
+- **A refusal that rolls back records values captured before the rollback,
+  never the `User`** (#332). The acting user is loaded through the request's
+  own session, and `AsyncSession.rollback()` expires every persistent instance
+  in it — whatever `expire_on_commit` says — so a `user.id` read afterwards is
+  a lazy load, `MissingGreenlet` under asyncio, and the refusal becomes a 500
+  with no record. The `actor_revoked` refusals take `actor_snapshot(user)`
+  (`src/control_panel/routes.py`) before rolling back, the password change's
+  `wrong_current_password` / `same_as_current` refusals record the `actor_id`
+  captured at the top rather than `fresh.id`, and the key-creation refusals do
+  the same (see [rate limits](rate-limits.md)). Hermetic tests cannot see this
+  class — a `SimpleNamespace` user never expires, and a `User` loaded in a
+  different session is detached, which a rollback leaves alone — so it is
+  pinned in `tests/integration/test_issue_332_rollback_expiry_pg.py`, which
+  loads the actor into the handler's own session.
+
 - **The guard's key now lives in `src/oauth/grants.py`, and its contention set
   is wider than the two admin handlers** (#197, #198). `ACCOUNT_GUARD_LOCK_KEY`
   and `lock_account_guard(session)` moved there because
@@ -566,9 +944,10 @@ how the panel says so.
   taken stays a correctly-signed credential until its itsdangerous timestamp
   passes `session_max_age` — seven days. The verification on #198 replayed a
   pre-logout cookie against the container's installed Starlette and got the
-  user back. This panel has **no CSP and will not get one** (see the top of
-  this note), so "an XSS steals the cookie" is a live path rather than a
-  theoretical one, and the panel that cookie reaches mints `readwrite` `omcp_`
+  user back. When this was written the panel had **no CSP**; it has
+  a nonce policy now (see the top of this note), which narrows script
+  injection but does not retire "an XSS steals the cookie" as a path to
+  design for, and the panel that cookie reaches mints `readwrite` `omcp_`
   keys and approves OAuth grants. The only thing that can be revoked is a row,
   so `user_sessions` (migration 024) is the row and `src/auth/session.py` is
   its single implementation.

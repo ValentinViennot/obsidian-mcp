@@ -692,3 +692,18 @@ def test_the_reset_path_still_gates_hnsw_creation_on_the_dimension(danger, monke
     assert "USING hnsw" not in joined
     assert "ALTER COLUMN embedding TYPE vector(3072)" in joined
     assert "CREATE INDEX" not in joined
+
+
+
+def test_dashboard_totals_are_truthful_before_animation_runs():
+    """A script/timer limitation must not turn two indexed notes into zero."""
+    import re
+
+    html = _render({"notes_indexed": 2, "notes_with_embeddings": 2, "embedding_pct": 100})
+    counters = re.findall(r'data-countup="([0-9]+)">([^<]*)</div>', html)
+    assert counters
+    assert all(target == visible for target, visible in counters), counters
+    assert counters[:2] == [("2", "2"), ("2", "2")]
+    embedded = html.split('<div class="stat-label">Embedded</div>', 1)[1].split('<!-- Coverage progress bar -->', 1)[0]
+    assert '/ 2</span>' in embedded
+    assert '100%' in html

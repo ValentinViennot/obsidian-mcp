@@ -10,8 +10,12 @@
 #
 #   record-backup.sh <path-to-dump>
 #
-#   DB_CONTAINER   the PostgreSQL container (the Makefile passes its own value,
-#                  which `Makefile.local` may override)
+#   DB_BACKEND     `docker` (default) or `cnpg` — see docker/db-exec.sh, which
+#                  is the channel both this script and the dump go through
+#   DB_CONTAINER   docker backend: the PostgreSQL container (the Makefile passes
+#                  its own value, which `Makefile.local` may override)
+#   CNPG_NAMESPACE / CNPG_CLUSTER / KUBECTL
+#                  cnpg backend: passed straight through to docker/db-exec.sh
 #   DB_NAME        the database, defaulting to the deployment's `obsidian_mcp`.
 #                  That default is the **same database name the Makefile's
 #                  `pg_dump -U postgres obsidian_mcp` names** — the two are
@@ -20,8 +24,9 @@
 #
 # ## The three branches, and why they differ
 #
-# The insert goes through **the same `docker exec … psql` channel the dump
-# itself used**. It has to: the container that runs the application cannot see
+# The insert goes through **the same `docker/db-exec.sh … psql` channel the
+# dump itself used** (`docker exec`, or `kubectl exec` into the CNPG primary).
+# It has to: the container that runs the application cannot see
 # the backups directory (deliberately — mounting it would put a host path into
 # a public repo's compose file), so this script is host-side, and the only
 # database handle a host-side script has is the one `pg_dump` just used.
@@ -54,11 +59,15 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 BACKUP_PATH="${1:-}"
+DB_BACKEND="${DB_BACKEND:-docker}"
 DB_CONTAINER="${DB_CONTAINER:-}"
 DB_NAME="${DB_NAME:-obsidian_mcp}"
+DB_EXEC_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/db-exec.sh"
+export DB_BACKEND DB_CONTAINER
 
-if [ -z "$BACKUP_PATH" ] || [ -z "$DB_CONTAINER" ]; then
-    echo -e "${RED}record-backup.sh: usage: DB_CONTAINER=<container> record-backup.sh <dump-path>${NC}" >&2
+if [ -z "$BACKUP_PATH" ] || { [ "$DB_BACKEND" = docker ] && [ -z "$DB_CONTAINER" ]; }; then
+    echo -e "${RED}record-backup.sh: usage: [DB_BACKEND=docker] DB_CONTAINER=<container> record-backup.sh <dump-path>${NC}" >&2
+    echo -e "${RED}                        DB_BACKEND=cnpg [CNPG_NAMESPACE=db CNPG_CLUSTER=pg] record-backup.sh <dump-path>${NC}" >&2
     exit 2
 fi
 
@@ -90,14 +99,14 @@ STDERR_FILE=$(mktemp)
 trap 'rm -f "$STDERR_FILE"' EXIT
 
 psql_run() {
-    docker exec -i "$DB_CONTAINER" psql -U postgres -d "$DB_NAME" \
+    bash "$DB_EXEC_SCRIPT" -i psql -U postgres -d "$DB_NAME" \
         -v ON_ERROR_STOP=1 -qtAX "$@" 2>"$STDERR_FILE"
 }
 
 if ! PROBE_STDOUT=$(psql_run <<<"SELECT to_regclass('public.backups_log') IS NOT NULL"); then
     echo -e "${RED}Backup RECORDING FAILED: could not ask the database whether backups_log exists${NC}" >&2
     cat "$STDERR_FILE" >&2
-    echo -e "${YELLOW}The dump itself is intact at $BACKUP_PATH. This is the same docker exec psql channel pg_dump just used, so a failure here is a real fault rather than a missing table.${NC}" >&2
+    echo -e "${YELLOW}The dump itself is intact at $BACKUP_PATH. This is the same db-exec.sh psql channel pg_dump just used, so a failure here is a real fault rather than a missing table.${NC}" >&2
     exit 1
 fi
 

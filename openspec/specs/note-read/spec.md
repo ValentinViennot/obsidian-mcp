@@ -400,3 +400,57 @@ The parsed frontmatter mapping SHALL keep the float itself; this coercion is a p
 - **THEN** the `frontmatter` view SHALL be omitted whole and reported in `metadata_omissions` with a reason distinguishing a coercion-induced collision from a native one
 - **AND** no key SHALL be silently kept in preference to the other, and `frontmatter_yaml` SHALL still carry both
 
+### Requirement: Optional bounded indexed relationship context
+
+`read_note` SHALL accept `include_relationships` (default false) and
+`relationship_limit` (default 10, range 1–50 when enabled). Absent or false
+`include_relationships` SHALL preserve the existing result bytes and budgets.
+Enabled reads SHALL add distinct resolved outgoing targets and backlinks with
+exact indexed paths and titles, scoped to the caller at both endpoints.
+They SHALL NOT scan, index, write notes or alter ownership rules.
+
+The relationship context SHALL declare `basis=indexed_snapshot` and
+`completeness=indexed_only`. Source `note_status` SHALL be `matches_read` only
+when the normalized full-text hash from the same disk read and the current
+extraction version match the indexed source; otherwise it SHALL be `stale` or
+`unindexed`. Source and edges SHALL come from one database snapshot. This
+status SHALL NOT claim current target bytes or completeness over unindexed files.
+True has-more flags SHALL identify direction or response-budget truncation,
+and true `extraction_truncated` SHALL identify the indexed source extraction
+cap; flags SHALL be absent otherwise, without implying vault completeness.
+
+The enabled result SHALL fit `MAX_READ_RESPONSE_CHARS` measured over the whole
+serialized MCP CallToolResult, including both SDK text and structured renderings
+and JSON escaping, excluding JSON-RPC framing. Optional metadata MAY be dropped
+whole with `response_omissions` (field names or compact category `metadata`),
+neighbor lists MAY shrink with has-more flags, and content MAY be shortened only
+as an exact contiguous prefix with correct continuation offsets. The exact path,
+raw content hash and indexed status SHALL survive; if useful framing cannot fit,
+the tool SHALL return a bounded error asking for a read without relationships.
+
+#### Scenario: Read and follow an indexed relationship
+
+- **GIVEN** indexed HowTo, Evergreen and Decision notes with resolved links
+- **WHEN** the caller reads HowTo with relationships and follows its Evergreen path
+- **THEN** Evergreen SHALL report the caller-owned HowTo backlink and Decision target
+- **AND** no other owner's source, target or title SHALL appear
+
+#### Scenario: Empty and unindexed sources remain distinguishable
+
+- **WHEN** the caller reads an indexed empty note and a newly created unindexed note
+- **THEN** both MAY carry empty lists, but their status SHALL be `matches_read` and `unindexed` respectively
+- **AND** neither SHALL claim vault completeness
+
+#### Scenario: Index updates do not describe unread current bytes
+
+- **WHEN** current source text differs from the index or its extraction version is obsolete
+- **THEN** the graph SHALL be labeled `stale` even if indexed neighbors are returned
+- **AND** a concurrent index commit between graph queries SHALL NOT mix source and edge versions
+
+#### Scenario: A small response budget still has explicit continuation
+
+- **WHEN** metadata, neighbors and escaped content exceed the whole-result cap
+- **THEN** the complete SDK result SHALL fit the cap and retain explicit indexed status
+- **AND** retained content SHALL be exact, with a useful `next_offset` when more remains
+- **AND** an empty list caused by response truncation SHALL have its has-more flag
+

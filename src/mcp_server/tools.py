@@ -2175,7 +2175,7 @@ def _read_note_refusal(message: str) -> ReadNoteResult:
 
 @_tracked(
     "read_note",
-    ["path", "section", "offset", "limit"],
+    ["path", "section", "offset", "limit", "include_relationships", "relationship_limit"],
     refusal_result=_read_note_refusal,
 )
 async def read_note_impl(
@@ -2183,6 +2183,8 @@ async def read_note_impl(
     section: str | None = None,
     offset: int = 0,
     limit: int | None = None,
+    include_relationships: bool = False,
+    relationship_limit: int = 10,
 ) -> ReadNoteResult:
     """Read a note by its vault-relative path, capped to a context-safe size.
 
@@ -2258,12 +2260,14 @@ async def read_note_impl(
     # parameter validation, then section resolution. Exactly one error comes
     # back, and no content-bearing field rides with it.
     try:
-        note = read_file(path, user_id=uid)
+        note = read_file(path, user_id=uid, **({"include_index_hash": True} if include_relationships else {}))
     except FileNotFoundError:
         return _fail(_body_refusal(f"Note not found: {path}", "not_found"))
     except ValueError as e:
         return _fail(_body_refusal(str(e), "validation_failed"))
 
+    if include_relationships and not 1 <= relationship_limit <= 50:
+        return _fail(_body_refusal("read_note: relationship_limit must be between 1 and 50.", "invalid_argument"))
     if limit is not None:
         if limit < 1:
             return _fail(_body_refusal(f"read_note: limit must be >= 1 (got {limit}).", "invalid_argument"))
@@ -2340,6 +2344,16 @@ async def read_note_impl(
     # from a dropped one, and the two lists never carry each other's entries
     # (#154, design D10).
     apply_metadata_budget(result, carried, metadata_budget, view_coercions)
+    if include_relationships:
+        from src.mcp_server.relationships import load_relationships
+        async with async_session() as session:
+            # Source hash and both directions must describe one indexed
+            # snapshot even if the indexer commits between these SELECTs.
+            await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+            result.relationships = await load_relationships(
+                session, note["path"], note["index_content_hash"], uid,
+                relationship_limit, _owner_predicate_for,
+            )
     return result
 
 

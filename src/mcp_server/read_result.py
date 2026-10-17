@@ -34,7 +34,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, PrivateAttr, model_serializer
 from src.services.tool_outcomes import BodyOutcome
@@ -558,6 +558,23 @@ def build_outline(content: str, cap: int) -> NoteOutline | None:
 # ── the result ──────────────────────────────────────────────────────────────
 
 
+class RelatedNote(_OmitNone):
+    path: str
+    title: str
+
+
+class RelationshipContext(_OmitNone):
+    basis: Literal["indexed_snapshot"] = "indexed_snapshot"
+    completeness: Literal["indexed_only"] = "indexed_only"
+    note_status: Literal["matches_read", "stale", "unindexed"]
+    outgoing: list[RelatedNote] = []
+    backlinks: list[RelatedNote] = []
+    # Present only when true; absence does not imply vault completeness.
+    outgoing_has_more: Literal[True] | None = None
+    backlinks_has_more: Literal[True] | None = None
+    extraction_truncated: Literal[True] | None = None
+
+
 class ReadNoteResult(_OmitNone):
     """What `read_note` returns.
 
@@ -624,6 +641,8 @@ class ReadNoteResult(_OmitNone):
     metadata_coercions: list[MetadataCoercion] | None = None
     notice: str | None = None
     error: str | None = None
+    relationships: RelationshipContext | None = None
+    response_omissions: list[str] | None = None
 
 
 # ── the metadata budget ─────────────────────────────────────────────────────

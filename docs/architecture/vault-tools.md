@@ -591,7 +591,7 @@ in-process caller) terminates.
 
 **Every note write tool caps its own result.** `create_note`, `edit_note` (all modes, `dry_run` included), and `set_frontmatter` refuse a result over `MAX_NOTE_BYTES` with a tool-level error and no write, via `_note_size_error()` in `tools.py`. That is what keeps the tool, not the transport, in charge of every supported write — the transport limit sits deliberately above every tool cap. `MAX_NOTE_BYTES` lives in `src/config.py` (not `tools.py`) because the transport formula needs it.
 
-**Precisely: it is a per-component budget, not a single ceiling on the whole response.** Since #149 `read_note` returns fields, and each note-controlled field carries its own budget:
+**Default reads use a per-component budget, not a single ceiling on the whole response.** Since #149 `read_note` returns fields, and each note-controlled field carries its own budget:
 
 | field | budget |
 | --- | --- |
@@ -621,6 +621,52 @@ Satisfying the byte caps says nothing about the response. A 3 MB note is well in
 **If you add a tool that returns file or note content, it needs the character cap too.** `_window()` and `_capped_text()` in `tools.py` are the shared helpers.
 
 Over-cap reads return the first window plus truncation **as data** — `truncated`, `offset`, `next_offset` (absent at the end), `total_chars` — a server-authored `notice` carrying the guidance prose, and, for a whole-note read, the `outline` object. `limit` may lower the cap for one call but never raise it; raising is an operator decision via the env var.
+
+### Optional relationship context on `read_note`
+
+`read_note(path, include_relationships=True, relationship_limit=10)` adds an
+indexed graph snapshot. The limit is 1–50 distinct notes per direction; repeated
+links to one note occupy one slot. Outgoing entries contain only resolved,
+caller-owned note paths and titles. Backlinks likewise require caller ownership
+of the source. The source lookup and both endpoint joins use the same existing
+owner predicate, including `user_id IS NULL` for an ownerless credential.
+Dangling links remain available through `get_links`; this summary does not
+pretend to resolve them. This mode neither scans nor changes the index.
+
+`relationships.basis` is always `indexed_snapshot`, and `completeness` is always
+`indexed_only`. `note_status=matches_read` means the source index's normalized
+full-text hash and extraction version match the **same disk read** that supplied
+the response; `stale` means they differ, and `unindexed` means there is no owned
+source row. This internal comparison uses the indexer's newline normalization;
+the public `content_hash` remains the raw file digest used for write preconditions.
+The three graph queries share a PostgreSQL repeatable-read transaction so a
+concurrent indexing commit cannot mix an old source hash with new edges.
+No status certifies current target bytes, unindexed notes or a fully scanned
+vault. An empty list on an unindexed source is unknown, not evidence of no links.
+
+True `outgoing_has_more` / `backlinks_has_more` flags mean indexed neighbors
+were omitted by the direction limit or response budget. True
+`extraction_truncated` means the indexed source extraction reached its cap.
+Flags are absent otherwise; their absence never changes `indexed_only` into a
+vault completeness claim. Separate `get_links` / `get_backlinks` calls can inspect
+the graph independently, subject to their own existing bounds.
+
+Only this opt-in mode applies `MAX_READ_RESPONSE_CHARS` to the **complete
+serialized MCP CallToolResult**: the SDK's pretty JSON text block, structured
+content, field names and escaping all count. JSON-RPC framing and the caller's
+request ID do not. Optional metadata drops whole in a fixed order, recorded in
+`response_omissions`; at very small caps its compact `metadata` category means
+optional metadata was omitted. Relationship lists then shrink with explicit
+has-more flags, and exact contiguous content is windowed with `next_offset`.
+Nothing is replaced with an in-band marker. The path, raw hash and indexed status
+are retained; an unusually long path can leave no usable framing, in which case
+a bounded tool error asks the caller to read without relationships. Absent or
+false `include_relationships` keeps the existing result bytes and field budgets.
+
+Real SDK protocol tests in `tests/integration/test_read_relationships_pg.py`
+exercise the indexed HowTo → Evergreen → Decision journey, source freshness,
+owner isolation, a concurrent index commit, and escaped content continuation
+under 1,000 / 2,000 / 4,000-character whole-result caps on isolated PostgreSQL.
 
 ## Section addressing
 

@@ -253,7 +253,7 @@ and ops layer around them.
   `CLAUDE.md`, served live
 
 ### Read and write
-- `read_note(path, section?, offset=0, limit?)` returns a **structured
+- `read_note(path, section?, offset=0, limit?, include_relationships=false, relationship_limit=10)` returns a **structured
   result** — `path`, `title`, `tags`, `frontmatter_yaml` and a JSON
   `frontmatter` view, `heading` (section reads), `content`, and
   truncation as data (`truncated`, `offset`, `next_offset`,
@@ -261,7 +261,13 @@ and ops layer around them.
   `MAX_READ_RESPONSE_CHARS` (default 40,000) — see
   [Response size limits](#response-size-limits). `section=<heading>`
   returns one section's body instead of the whole note; `offset`
-  continues a truncated read.
+  continues a truncated read. Opt in with `include_relationships=true` for
+  indexed resolved targets and backlinks (default 10, maximum 50 per direction).
+  The snapshot declares source freshness and truncation; it cannot certify
+  unindexed notes or current target bytes. This mode shares one cap across the
+  entire MCP result, including metadata and both SDK renderings, so it may
+  omit optional metadata and return fewer neighbors. See
+  [relationship context](docs/architecture/vault-tools.md#optional-relationship-context-on-read_note).
 - `create_note(path, content)`, atomic write, refuses overwrite
 - `edit_note(path, …)` with four mutually exclusive modes: full
   replace (default), `append=True`, `find=…` (with optional

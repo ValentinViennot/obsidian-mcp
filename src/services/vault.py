@@ -2050,7 +2050,7 @@ def _decode_note_bytes(data: bytes) -> str:
     return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
 
 
-def read_file(relative_path: str, user_id: int | None = None) -> dict:
+def read_file(relative_path: str, user_id: int | None = None, *, include_index_hash: bool = False) -> dict:
     """Read a note, returning frontmatter + content + the file's digest.
 
     The note's **bytes** are read once. The text every field below is derived
@@ -2107,6 +2107,10 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
         # body's and never `content`'s. `read_note` hands it back as
         # `content_hash` and the write tools take it as `expected_hash`.
         "content_hash": content_hash_for_bytes(data),
+        # Same observed bytes, normalized exactly as the indexer hashes them.
+        # Internal read context only, never the caller's write precondition.
+        **({"index_content_hash": hashlib.sha256(raw.encode("utf-8")).hexdigest()}
+           if include_index_hash else {}),
         "size": info.st_size,
         "modified": info.st_mtime,
     }

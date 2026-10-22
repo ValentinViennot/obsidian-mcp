@@ -170,6 +170,8 @@ async def read_note(
     section: str | None = None,
     offset: int = 0,
     limit: int | None = None,
+    include_relationships: bool = False,
+    relationship_limit: int = 10,
 ) -> ReadNoteResult:
     """Read a note from the Obsidian vault by its relative path.
 
@@ -223,11 +225,30 @@ async def read_note(
       unknown section). It is a normal result, not a transport error, and the
       content-bearing fields are absent beside it.
 
-    Budgets are per field, not per response: `content` is bounded by the
+    By default budgets are per field, not per response: `content` is bounded by the
     server's response cap, the outline by its own equal budget, and the
     metadata fields by a third — so a truncated whole-note read can carry
     several capped components. Read the one section you need with `section=`
     rather than paging a large note.
+
+    With `include_relationships=True`, `relationships` carries resolved outgoing
+    notes and backlinks from the caller's indexed graph. `basis=indexed_snapshot`
+    and `completeness=indexed_only` never certify unindexed files or current
+    target bytes. `note_status` is `matches_read` only when this same read's
+    normalized full text and the extraction version match the source index;
+    otherwise it is `stale` or `unindexed`. Empty lists on an unindexed note
+    are unknown, not proof of no links. True `outgoing_has_more` or
+    `backlinks_has_more` signals omitted indexed neighbors; true
+    `extraction_truncated` signals the source extraction cap. These flags are
+    absent otherwise. Use `get_links`/`get_backlinks` for separate graph reads.
+
+    This opt-in mode shares one cap across the entire serialized MCP result,
+    including text and structured renderings, JSON escaping and relationship
+    metadata (excluding JSON-RPC framing). It can omit optional metadata whole,
+    naming fields in `response_omissions` (`metadata` is the compact category),
+    shorten neighbor lists with has-more flags, and page exact content via
+    `next_offset`. If even useful framing cannot fit, it returns a bounded tool
+    error asking for a read without relationships. The default mode is unchanged.
 
     **Round trips.** A whole-note `content` is byte-exact input for
     `edit_note(path, content)` only when the read is complete and unwindowed
@@ -253,8 +274,20 @@ async def read_note(
             `next_offset` the response reports to continue.
         limit: Maximum characters of `content` to return. Only lowers the
             server cap; it cannot raise it.
+        include_relationships: Include the bounded indexed relationship snapshot.
+            Defaults to false; does not scan, index or modify any note.
+        relationship_limit: Maximum distinct notes per direction, 1–50 (default
+            10), used only when include_relationships is true. The shared response
+            budget can lower this further.
     """
-    return await read_note_impl(path, section=section, offset=offset, limit=limit)
+    result = await read_note_impl(
+        path, section=section, offset=offset, limit=limit,
+        include_relationships=include_relationships, relationship_limit=relationship_limit,
+    )
+    if include_relationships:
+        from src.mcp_server.relationships import bound_relationship_read
+        return bound_relationship_read(result, settings.max_read_response_chars)
+    return result
 
 
 @mcp.tool()

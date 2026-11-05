@@ -108,6 +108,7 @@ async def approve(document=None, *, bound=None, action="approve", redirect=REDIR
     return await oauth._authorize_post_cimd(
         request(),
         action=action,
+        connection_alias="Synthetic CIMD connection",
         client_id=URL,
         redirect_uri=redirect,
         code_challenge=oauth._base64url_sha256(VERIFIER),
@@ -409,6 +410,7 @@ async def test_referenced_rows_cannot_starve_the_cimd_sweep(db):
         await session.flush()
         for i in range(200):  # the first 200 (lowest ids) are referenced
             session.add(OAuthToken(
+                connection_alias="Synthetic test connection",
                 token_hash=format(i, "064x"), token_type="access",
                 client_id="cimd_" + format(i, "059x"), scope="read", grant_id=f"g{i}",
                 grant_issued_at=old, expires_at=far, revoked=True,

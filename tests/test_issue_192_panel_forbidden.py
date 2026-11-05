@@ -269,6 +269,7 @@ def test_an_oauth_client_belonging_to_someone_else_is_recorded(captured):
 
 def test_an_oauth_token_belonging_to_someone_else_is_recorded(captured):
     token = OAuthToken(
+        connection_alias="Synthetic test connection",
         token_hash="h",
         token_type="access",
         client_id="c-1",
@@ -586,6 +587,7 @@ class _RowcountResult:
 
 def _grant_token() -> OAuthToken:
     token = OAuthToken(
+        connection_alias="Synthetic test connection",
         token_hash="h",
         token_type="access",
         client_id="c-1",

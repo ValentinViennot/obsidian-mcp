@@ -99,6 +99,7 @@ def test_auth_code_exchange_puts_both_tokens_in_one_grant(monkeypatch):
         scope="read readwrite offline_access",
     )
     code = OAuthCode(
+        connection_alias="Synthetic test connection",
         code_hash=oauth._hash("the-code"),
         client_id=client.client_id,
         redirect_uri=client.redirect_uris[0],

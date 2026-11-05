@@ -13,10 +13,12 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from src.auth.session import (
     UNSET_VAULT_ROOT,
     current_actor,
+    current_connection_author,
     current_principal,
     current_user_id,
     current_vault_root,
 )
+from src.services.connection_identity import connection_author
 from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthClient, OAuthToken, User
@@ -661,6 +663,7 @@ class APIKeyMiddleware:
         # from the credential row this request authenticated with, and reset
         # with the rest so it can never label another request's log line.
         token_actor = current_actor.set(None)
+        token_connection = current_connection_author.set(None)
         # The identity every per-principal rate control is keyed on, bound
         # below from the same row: `("api_key", api_keys.id)` or
         # `("oauth", oauth_tokens.grant_id)`. Default `None` — no principal —
@@ -808,6 +811,7 @@ class APIKeyMiddleware:
             current_user_id.reset(token_user)
             current_vault_root.reset(token_vault)
             current_actor.reset(token_actor)
+            current_connection_author.reset(token_connection)
             current_daily_request_limit.reset(token_limit)
             current_principal.reset(token_principal)
 
@@ -960,6 +964,13 @@ class APIKeyMiddleware:
                 # survives the row's deletion, which the panel performs
                 # after NULLing `usage_logs.key_id` (issue #77).
                 current_actor.set(("api_key", api_key.name, api_key.key_prefix))
+                try:
+                    author = connection_author(api_key.name, "api_key", api_key.id)
+                except ValueError:
+                    # Legacy invalid key names may read; write admission refuses
+                    # an unnamed connection without inventing an author.
+                    author = None
+                current_connection_author.set(author)
                 # The key row is loaded, so the quota ceiling is free here
                 # too (#162). NULL — every key until an operator sets one —
                 # means unlimited, and `_tracked` then issues no quota
@@ -1025,6 +1036,7 @@ class APIKeyMiddleware:
                     .where(
                         OAuthToken.token_hash == token_hash,
                         OAuthToken.token_type == "access",
+                        OAuthToken.connection_alias.is_not(None),
                         OAuthToken.revoked == False,
                     )
                 )
@@ -1180,6 +1192,13 @@ class APIKeyMiddleware:
                 current_oauth_token_id.set(oauth_token.id)
                 current_user_id.set(oauth_token.user_id)
                 current_actor.set(("oauth", client_name, oauth_token.client_id))
+                try:
+                    author = connection_author(
+                        getattr(oauth_token, "connection_alias", None), "oauth", oauth_token.grant_id
+                    )
+                except ValueError:
+                    author = None
+                current_connection_author.set(author)
                 # The **grant**, not the access token: `grant_id` is NOT
                 # NULL and shared by every rotation of one `/authorize`
                 # approval (migration 014, #64), so refreshing an access

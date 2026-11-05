@@ -53,12 +53,14 @@ class FakeToken:
         token_hash: str | None = None,
         id: int | None = None,
         grant_issued_at: datetime.datetime | None = None,
+        connection_alias: str = "Synthetic test connection",
     ):
         if id is None:
             id = FakeToken._next_id
             FakeToken._next_id += 1
         self.id = id
         self.grant_id = grant_id
+        self.connection_alias = connection_alias
         self.token_type = token_type
         self.scope = scope
         self.client_id = client_id

@@ -750,14 +750,15 @@ def _authorize(client, client_id, redirect_uri="http://localhost:3118/callback",
     return client.get("/authorize", params=params)
 
 
-def test_the_consent_page_shows_the_host_and_url_never_the_name(client, origin):
+def test_consent_shows_verified_host_and_name_only_as_editable_alias(client, origin):
     origin.serve(CLAUDE_CODE_URL, dict(CLAUDE_CODE_DOC, client_name="Totally Not Claude"))
     response = _authorize(client, CLAUDE_CODE_URL)
     assert response.status_code == 200, response.text
     page = response.text
     assert "claude.ai" in page
     assert CLAUDE_CODE_URL in page
-    assert "Totally Not Claude" not in page
+    assert page.count("Totally Not Claude") == 1
+    assert 'name="connection_alias" value="Totally Not Claude"' in page
     assert "fetched that document" in page
     assert "program on this computer" in page  # loopback-only warning
     # The header itself is added by the app's CSP middleware (pinned in

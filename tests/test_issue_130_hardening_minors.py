@@ -227,20 +227,20 @@ def test_delete_user_nulls_the_usage_log_key_references():
 
 @pytest.mark.parametrize("name", ["", "   ", "\t\n"])
 def test_a_blank_key_name_is_refused(name):
-    assert panel_routes._key_name_error(name) == "Key name is required."
+    assert panel_routes._key_name_error(name) is not None
 
 
 def test_an_overlong_key_name_is_refused_before_postgres_raises():
-    message = panel_routes._key_name_error("k" * 256)
+    message = panel_routes._key_name_error("k" * 129)
 
-    assert message is not None and "255" in message
+    assert message is not None and "128" in message
 
 
 def test_a_name_at_the_limit_is_accepted():
-    assert panel_routes._key_name_error("k" * 255) is None
+    assert panel_routes._key_name_error("k" * 128) is None
 
 
-@pytest.mark.parametrize("name", ["laptop/key", "key;drop", "emoji \U0001f600"])
+@pytest.mark.parametrize("name", ["bad<name", "key\nnext", "key\u200bname"])
 def test_a_name_outside_the_json_pattern_is_refused(name):
     assert panel_routes._key_name_error(name) is not None
 
@@ -250,15 +250,16 @@ def test_the_ordinary_names_the_json_api_accepts_still_pass(name):
     assert panel_routes._key_name_error(name) is None
 
 
-def test_the_form_and_the_json_api_share_one_pattern():
+def test_the_form_and_the_json_api_share_one_name_policy():
     from src.api.routes import CreateKeyRequest
 
-    json_pattern = CreateKeyRequest.model_fields["name"].metadata
-    patterns = {
-        getattr(item, "pattern", None) for item in json_pattern
-    } - {None}
-
-    assert patterns == {panel_routes._KEY_NAME_RE.pattern}
+    for name in ("Research / writing", "Équipe", "emoji 😀"):
+        assert panel_routes._key_name_error(name) is None
+        assert CreateKeyRequest(name=name).name == name
+    for name in ("", "bad<name", "key\nnext", "x" * 129):
+        assert panel_routes._key_name_error(name)
+        with pytest.raises(ValueError):
+            CreateKeyRequest(name=name)
 
 
 # --- Item 8: overlapping danger-zone actions do not unpause each other ----

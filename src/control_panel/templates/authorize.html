@@ -290,6 +290,18 @@
             margin-top: 24px;
         }
 
+        input[name="connection_alias"] {
+            display: block;
+            width: 100%;
+            margin-top: 10px;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--surface-2);
+            color: var(--text);
+            font: inherit;
+        }
+
         .btn-approve {
             flex: 1;
             padding: 10px;
@@ -380,7 +392,7 @@
             {# A Client ID Metadata Document client (#357) is identified by the
                HOST of its client identifier URL — the server fetched the
                document from it, which is the one thing it can vouch for. The
-               document's self-declared name is deliberately not rendered. #}
+               document's self-declared name only prefills the editable alias below. #}
             <div class="identity">
                 {% if client_kind == "cimd" %}
                 <div class="identity-row">
@@ -552,9 +564,18 @@
                 </label>
                 {% endif %}
 
+                <label class="scope-option">
+                    <div>
+                        <div class="scope-option-title">Connection name</div>
+                        <div class="scope-option-desc">Choose how this connection appears in your vault history. The application name stays separate.</div>
+                        <input type="text" name="connection_alias" value="{{ connection_alias or '' }}"
+                               maxlength="128" required autocomplete="off" aria-label="Connection name">
+                    </div>
+                </label>
+
                 <div class="actions">
                     <button type="submit" name="action" value="approve" class="btn-approve">Approve</button>
-                    <button type="submit" name="action" value="deny"    class="btn-deny">Deny</button>
+                    <button type="submit" name="action" value="deny"    class="btn-deny" formnovalidate>Deny</button>
                 </div>
             </form>
         </div>

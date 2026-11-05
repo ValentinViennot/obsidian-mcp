@@ -559,3 +559,9 @@ the OIDC events carries a subject, an issuer (expected or claimed), an email,
 a group, or anything else the provider sent**; nothing logs the issuer at all.
 The `VerifiedIdentity` dataclass has a redacted `repr` so a stray log line
 cannot carry one either.
+
+Named-connection uploads now share the vault-commit operational warnings. They
+are post-publication audit-gap notices, covered by the same exemption as tool
+commits: upload redemption charges the minter's write bucket before consuming
+bytes, and suppression would conceal a missing Git audit trail. No author name
+or synthetic email is added to those warning records.

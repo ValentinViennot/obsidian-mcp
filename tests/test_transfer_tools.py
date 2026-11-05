@@ -195,13 +195,15 @@ def token_from(result: str) -> str:
 # ── 5.1 request_upload ──────────────────────────────────────────────────────
 
 
-async def test_request_upload_mints_a_bound_link(vault, readwrite, minted):
+async def test_request_upload_mints_a_bound_link(vault, readwrite, minted, synthetic_connection_author):
     result = await tools.request_upload_impl("Attachments/shot.png")
     assert "https://vault.example.com/transfer/upload#" in result
     assert "Attachments/shot.png" in result
     assert "max_bytes" in result
 
     (row,) = minted
+    assert row.git_author_name == synthetic_connection_author.name
+    assert row.git_author_email == synthetic_connection_author.email
     assert row.direction == "upload"
     assert row.path == "Attachments/shot.png"
     assert row.vault_root == str(vault)
@@ -1206,6 +1208,7 @@ async def test_an_oauth_token_with_no_expiry_mints_nothing(
     from src.mcp_server.auth import current_oauth_token_id
 
     credential["row"] = OAuthToken(
+        connection_alias="Synthetic test connection",
         id=5,
         token_hash="o" * 64,
         token_type="access",
@@ -1445,3 +1448,14 @@ async def test_check_upload_still_logs_only_the_handle_after_the_liveness_check(
     await tools.check_upload_impl(PUB_ID)
     entry = next(e for e in usage_log if e["tool"] == "check_upload")
     assert entry["params"] == {"upload_id": PUB_ID}
+
+
+async def test_unnamed_connection_cannot_mint_upload(vault, readwrite, minted):
+    from src.auth.session import current_connection_author
+    token = current_connection_author.set(None)
+    try:
+        result = await tools.request_upload_impl('Attachments/shot.png')
+    finally:
+        current_connection_author.reset(token)
+    assert result.refusal.code == 'connection_name_required'
+    assert minted == []

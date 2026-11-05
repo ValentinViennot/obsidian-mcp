@@ -547,8 +547,8 @@ _STAGING_CLEANUP = (
 #: bare logger rather than joining the catalogue.
 #:
 #: First, the bound is already there and is the same one `_POST_PUBLICATION`
-#: relies on: only a write-class tool can reach `src/services/git_vault.py` at
-#: all, so `MCP_WRITE_RATE_LIMIT_PER_MINUTE` (60) caps the rate at which a
+#: relies on: write-class tools and upload redemption both charge the same
+#: write bucket before publication, so `MCP_WRITE_RATE_LIMIT_PER_MINUTE` caps a
 #: credential can produce these — and in practice a broken repository produces
 #: exactly one line per write, not a burst per write.
 #:
@@ -565,7 +565,7 @@ _STAGING_CLEANUP = (
 #: line only is quoted, control-stripped and bounded to 200 characters.
 _VAULT_COMMIT = (
     "post-publication vault-commit failure on a successful write; reachable "
-    "only from a write-class tool and therefore already bounded by the write "
+    "only from write-class tools or upload redemption, already bounded by the write "
     "bucket, and deliberately not routed through the suppressor because "
     "commit-on-write is an audit mechanism and these lines are the only "
     "statement that its trail has a gap — a bound that withheld them would "

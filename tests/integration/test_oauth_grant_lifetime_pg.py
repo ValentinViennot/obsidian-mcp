@@ -246,6 +246,7 @@ async def seed_code(sessionmaker, *, code=CODE, client_id="c1", used=False,
     async with sessionmaker() as session:
         session.add(
             OAuthCode(
+                connection_alias="Synthetic test connection",
                 code_hash=oauth._hash(code),
                 client_id=client_id,
                 redirect_uri=REDIRECT_URI,
@@ -270,6 +271,7 @@ async def seed_family(sessionmaker, *, grant_id="g1", issued_at, client_id="c1",
     async with sessionmaker() as session:
         session.add(
             OAuthToken(
+                connection_alias="Synthetic test connection",
                 token_hash=oauth._hash(access_value),
                 token_type="access",
                 client_id=client_id,
@@ -281,6 +283,7 @@ async def seed_family(sessionmaker, *, grant_id="g1", issued_at, client_id="c1",
         )
         session.add(
             OAuthToken(
+                connection_alias="Synthetic test connection",
                 token_hash=oauth._hash(refresh_value),
                 token_type="refresh",
                 client_id=client_id,
@@ -791,6 +794,7 @@ async def test_the_absolute_period_is_anchored_to_the_exchange_not_the_approval(
     approved_at = datetime.now(UTC)
     redirect = await oauth.authorize_post(
         _Req(),
+        connection_alias="Synthetic test connection",
         action="approve",
         client_id="c1",
         redirect_uri=REDIRECT_URI,
@@ -816,9 +820,9 @@ async def test_the_absolute_period_is_anchored_to_the_exchange_not_the_approval(
 # ── migration 029 meets a live refresh ─────────────────────────────────────
 
 
-async def test_a_pre_029_family_refreshes_immediately_after_the_upgrade(monkeypatch):
-    """The owner decision, end to end: no connector is logged out by the
-    deploy, and the clock starts at the migration."""
+async def test_pre_029_clock_backfill_survives_named_connection_cutover(monkeypatch):
+    """The lifetime migration backfills the clock; the later named-connection
+    cutover intentionally revokes this unnamed legacy family."""
     import asyncpg
 
     db = _Database("test_grant_life_029")
@@ -870,8 +874,10 @@ async def test_a_pre_029_family_refreshes_immediately_after_the_upgrade(monkeypa
             await eng.dispose()
 
         assert backfilled > old, "the clock starts at migration, not at creation"
-        assert response.status_code == 200, response.body
-        assert len(rows) == 3
+        assert response.status_code == 400, response.body
+        assert json.loads(response.body)["error"] == "invalid_grant"
+        assert len(rows) == 1
+        assert rows[0].revoked is True
         assert {r.grant_issued_at for r in rows} == {backfilled}
     finally:
         await _run_maintenance(

@@ -16,6 +16,7 @@ from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.auth.session import get_active_session_user
+from src.services.connection_identity import normalize_connection_alias
 from src.config import settings
 from src.database import async_session
 from src.limiter import limiter
@@ -914,6 +915,7 @@ async def _authorize_get(
         "client_kind": "dcr",
         "resources": _query_resources(request),
         "client_name": client.client_name,
+        "connection_alias": _connection_alias_default(client.client_name),
         "redirect_host": redirect_host,
         "client_trust": client_trust,
         "client_registered_at": client_registered_at,
@@ -959,7 +961,8 @@ async def _authorize_get_cimd(
 
     The application identity is the **host of the client identifier URL**,
     the one thing this server can vouch for (it fetched the document from
-    it); the document's self-declared `client_name` is not rendered (D10).
+    it); the self-declared `client_name` only prefills the editable connection
+    alias, never the verified application identity (D10).
     The authorization hash of the projection shown goes into the signed
     state, and the POST refuses anything else (D7).
     """
@@ -999,6 +1002,7 @@ async def _authorize_get_cimd(
         "client_kind": "cimd",
         "resources": _query_resources(request),
         "client_name": None,
+        "connection_alias": _connection_alias_default(projection.client_name),
         "client_host": client_host,
         "client_id_url": client_id,
         "first_approved_at": (
@@ -1035,6 +1039,13 @@ async def _authorize_get_cimd(
     return response
 
 
+
+def _connection_alias_default(client_name: str | None) -> str:
+    try:
+        return normalize_connection_alias(client_name)
+    except ValueError:
+        return ""
+
 @router.post("/authorize")
 async def authorize_post(
     request: Request,
@@ -1046,6 +1057,7 @@ async def authorize_post(
     scope: str = Form("read"),
     state: str = Form(""),
     client_state: str = Form(""),
+    connection_alias: str = Form(""),
 ):
     oauth_resource.begin(request, await _form_resources(request))
     try:
@@ -1059,6 +1071,7 @@ async def authorize_post(
             scope=scope,
             state=state,
             client_state=client_state,
+            connection_alias=connection_alias,
         )
     finally:
         oauth_resource.finish(request)
@@ -1075,6 +1088,7 @@ async def _authorize_post(
     scope,
     state,
     client_state,
+    connection_alias="",
 ):
     # Verify CSRF state against the signed cookie
     signed_cookie = request.cookies.get("oauth_state", "")
@@ -1111,6 +1125,17 @@ async def _authorize_post(
         _authorize_refused(request, "invalid_scope", submitted_client_id=client_id)
         return JSONResponse({"error": "invalid_scope", "error_description": str(exc)}, status_code=400)
 
+    if action == "approve":
+        try:
+            connection_alias = normalize_connection_alias(connection_alias)
+        except ValueError:
+            _authorize_refused(request, "invalid_connection_alias", submitted_client_id=client_id)
+            return JSONResponse(
+                {"error": "invalid_request", "error_description":
+                 "Choose a connection name (1–128 characters, without control characters or < >)."},
+                status_code=400,
+            )
+
     if cimd.is_internal_id(client_id):
         return _cimd_refused(request, cimd.CimdRefusal("internal_id_submitted"), client_id)
     if cimd.is_cimd_client_id(client_id) and settings.oauth_cimd_enabled:
@@ -1124,6 +1149,7 @@ async def _authorize_post(
             scope=scope,
             client_state=client_state,
             bound_hash=bound_hash,
+            connection_alias=connection_alias,
         )
 
     async with async_session() as session:
@@ -1339,6 +1365,7 @@ async def _authorize_post(
 
         oauth_code = OAuthCode(
             code_hash=_hash(code),
+            connection_alias=connection_alias,
             client_id=client_id,
             redirect_uri=redirect_uri,
             scope=scope,
@@ -1384,6 +1411,7 @@ async def _authorize_post_cimd(
     scope,
     client_state,
     bound_hash,
+    connection_alias="",
 ):
     """The consent POST for a CIMD client (#357, D6/D7).
 
@@ -1392,6 +1420,14 @@ async def _authorize_post_cimd(
     approve, in the code's transaction — upserts the synthetic per-(URL,
     user) row and stamps its use marker in the same statement.
     """
+    if action == "approve":
+        try:
+            connection_alias = normalize_connection_alias(connection_alias)
+        except ValueError:
+            _authorize_refused(request, "invalid_connection_alias", submitted_client_id=client_id)
+            return JSONResponse({"error": "invalid_request", "error_description":
+                "A valid connection name is required."}, status_code=400)
+
     session_user_id: int | None = None
     if action == "approve" and settings.multi_user_mode:
         async with async_session() as session:
@@ -1506,6 +1542,7 @@ async def _authorize_post_cimd(
         await session.execute(upsert)
         session.add(OAuthCode(
             code_hash=_hash(code),
+            connection_alias=connection_alias,
             client_id=row_id,
             redirect_uri=redirect_uri,
             scope=scope,
@@ -1630,7 +1667,7 @@ async def _handle_auth_code(form, request=None):
         code_hash = _hash(code)
         code_query = (
             select(OAuthCode)
-            .where(OAuthCode.code_hash == code_hash)
+            .where(OAuthCode.code_hash == code_hash, OAuthCode.connection_alias.is_not(None))
             .with_for_update()
             .execution_options(populate_existing=True)
         )
@@ -1925,6 +1962,7 @@ async def _handle_auth_code(form, request=None):
             client_id=client_id,
             scope=granted_scope,
             grant_id=grant_id,
+            connection_alias=getattr(oauth_code, "connection_alias", None),
             grant_issued_at=now,
             expires_at=clamped.access_expires_at,
             user_id=oauth_code.user_id,
@@ -1935,6 +1973,7 @@ async def _handle_auth_code(form, request=None):
             client_id=client_id,
             scope=granted_scope,
             grant_id=grant_id,
+            connection_alias=getattr(oauth_code, "connection_alias", None),
             grant_issued_at=now,
             expires_at=clamped.refresh_expires_at,
             user_id=oauth_code.user_id,
@@ -2135,6 +2174,7 @@ async def _handle_refresh(form, request=None):
             grant_query = select(OAuthToken.grant_id).where(
                 OAuthToken.token_hash == token_hash,
                 OAuthToken.token_type == "refresh",
+                    OAuthToken.connection_alias.is_not(None),
             )
             grant_ids = (await session.execute(grant_query)).scalars().all()
             if not grant_ids:
@@ -2170,6 +2210,7 @@ async def _handle_refresh(form, request=None):
                 .where(
                     OAuthToken.token_hash == token_hash,
                     OAuthToken.token_type == "refresh",
+                    OAuthToken.connection_alias.is_not(None),
                 )
                 .with_for_update()
                 .execution_options(populate_existing=True)
@@ -2531,6 +2572,7 @@ async def _handle_refresh(form, request=None):
                 # revocation or downgrade applied to the grant still covers the
                 # pair the client is about to start using.
                 grant_id=old_token.grant_id,
+                connection_alias=getattr(old_token, "connection_alias", None),
                 # Inherited verbatim, exactly like `grant_id` (#326): rotation
                 # must never restart the family's absolute clock. Read off the
                 # row re-read under the grant lock.
@@ -2544,6 +2586,7 @@ async def _handle_refresh(form, request=None):
                 client_id=client_id,
                 scope=granted_scope,
                 grant_id=old_token.grant_id,
+                connection_alias=getattr(old_token, "connection_alias", None),
                 grant_issued_at=old_token.grant_issued_at,
                 expires_at=clamped.refresh_expires_at,
                 user_id=old_token.user_id,

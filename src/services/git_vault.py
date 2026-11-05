@@ -67,11 +67,9 @@ timer, where a failure is an alert rather than a stalled tool call.
   cancellation also runs) would add a second, worse failure mode to the first.
   The sweep commits it within a tick, under "changed outside the MCP server",
   which is the honest label for a write nobody can attribute.
-* **`PUT /transfer/upload` does not commit.** It publishes vault bytes without
-  being a tool call, runs under a capability rather than inside a `_tracked`
-  body, and has no accumulator to record into. The sweep attributes it, which
-  is also more honest: the party that streamed the bytes is not the principal
-  that chose the path.
+* **Uploads commit as the named connection that minted the capability.**
+  The token stores that author snapshot; redemption commits inside the same
+  publication lock. A redeemer cannot supply or override the author.
 * **A second uvicorn worker breaks the lock**, exactly as it breaks the rate
   limiter. `--workers 1` is already the contract; this adds nothing new to it.
 """
@@ -86,6 +84,7 @@ import time
 from contextvars import ContextVar
 
 from src.config import settings
+from src.services.connection_identity import ConnectionAuthor
 
 logger = logging.getLogger(__name__)
 
@@ -370,8 +369,8 @@ def _git_env(author_name: str, author_email: str) -> dict:
         {
             "GIT_AUTHOR_NAME": author_name,
             "GIT_AUTHOR_EMAIL": author_email,
-            "GIT_COMMITTER_NAME": author_name,
-            "GIT_COMMITTER_EMAIL": author_email,
+            "GIT_COMMITTER_NAME": settings.git_agent_name,
+            "GIT_COMMITTER_EMAIL": settings.git_agent_email,
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_ASKPASS": "",
             "SSH_ASKPASS": "",
@@ -667,7 +666,7 @@ def reset_state_for_tests() -> None:
     _commit_lock = asyncio.Lock()
 
 
-async def commit_recorded(tool: str, principal: str | None) -> bool:
+async def commit_recorded(tool: str, principal: str | None, author: ConnectionAuthor | None = None) -> bool:
     """Commit whatever this tool call recorded. Returns whether it committed.
 
     The one thing `_tracked` calls. It is the flush half of `record_write`: the
@@ -720,16 +719,10 @@ async def commit_recorded(tool: str, principal: str | None) -> bool:
                 seen.add(rel)
                 rel_paths.append(rel)
 
-        message = build_message(tool, rel_paths, principal)
-        async with _commit_lock:
-            return await asyncio.to_thread(
-                commit_paths,
-                rel_paths,
-                message,
-                settings.git_agent_name,
-                settings.git_agent_email,
-                root,
-            )
+        if author is None:
+            from src.auth.session import current_connection_author
+            author = current_connection_author.get()
+        return await commit_published(root, rel_paths, tool, author, principal)
     except Exception as exc:  # noqa: BLE001 - rule 1: never fail a write
         logger.warning(
             "Vault commit for %s failed unexpectedly (%s); the write stands "
@@ -738,4 +731,28 @@ async def commit_recorded(tool: str, principal: str | None) -> bool:
             type(exc).__name__,
             extra={"reason": "commit_raised", "tool": tool, "error_type": type(exc).__name__},
         )
+        return False
+
+
+async def commit_published(root, rel_paths, tool: str, author: ConnectionAuthor | None,
+                           principal: str | None = None) -> bool:
+    """Commit a completed publication with its captured author; never fail bytes.
+
+    Callers hold the vault publication lock. Upload redemption passes the
+    immutable author snapshot from the capability, never request headers.
+    """
+    try:
+        if not settings.git_vault_enabled or not settings.git_commit_on_write:
+            return False
+        if not isinstance(author, ConnectionAuthor):
+            logger.warning("Vault commit for %s failed unexpectedly (missing connection author); bytes remain published.",
+                           tool, extra={"reason": "missing_connection_author", "tool": tool})
+            return False
+        message = build_message(tool, rel_paths, principal or author.name)
+        async with _commit_lock:
+            return await asyncio.to_thread(commit_paths, rel_paths, message,
+                                           author.name, author.email, root)
+    except Exception as exc:
+        logger.warning("Vault commit for %s failed unexpectedly (%s); bytes remain published.",
+                       tool, type(exc).__name__, extra={"reason": "commit_raised", "tool": tool})
         return False

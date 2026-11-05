@@ -39,7 +39,7 @@ import pytest  # noqa: E402
 
 import src.mcp_server.auth as mcp_auth  # noqa: E402
 import src.mcp_server.tools as tools  # noqa: E402
-from src.auth.session import current_actor  # noqa: E402
+from src.auth.session import current_actor, current_connection_author  # noqa: E402
 from src.control_panel.routes import _usage_actor  # noqa: E402
 from src.models.db import APIKey, OAuthToken, UsageLog  # noqa: E402
 
@@ -206,6 +206,7 @@ def _drive(bearer: str, session: _MiddlewareSession, multi_user: bool = False) -
 
     async def downstream(scope, receive, send):
         captured["actor"] = current_actor.get()
+        captured["connection"] = current_connection_author.get()
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
@@ -235,6 +236,7 @@ def _drive(bearer: str, session: _MiddlewareSession, multi_user: bool = False) -
             )
             # Read back inside the same context the middleware ran in.
             captured["after"] = current_actor.get()
+            captured["connection_after"] = current_connection_author.get()
         finally:
             mp.undo()
 
@@ -266,6 +268,7 @@ def test_middleware_binds_the_oauth_client_name_and_id():
     from datetime import datetime, timedelta, timezone
 
     token = OAuthToken(
+        connection_alias="Synthetic test connection",
         grant_issued_at=datetime.now(timezone.utc),
         id=11,
         token_hash="y",
@@ -814,6 +817,7 @@ def _oauth_token_row(user_id=None):
     from datetime import datetime, timedelta, timezone
 
     return OAuthToken(
+        connection_alias="Synthetic test connection",
         grant_issued_at=datetime.now(timezone.utc),
         id=11, token_hash="y", token_type="access", client_id="client-abc",
         scope="read", user_id=user_id, grant_id="g1",

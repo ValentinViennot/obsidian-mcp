@@ -85,3 +85,37 @@ clears the notification marker, without deleting recovery versions. A busy write
 lock stays a silent retry. Failed notification delivery leaves the next sweep
 eligible to retry; the original engine exit status is preserved. Notification
 availability follows macOS user permissions, so use `status` when diagnosing sync.
+
+## Named connection authors
+
+Every vault-mutating MCP tool, including upload-capability minting, requires a
+validated connection author before its body can run, even when Git support is
+disabled. Missing or invalid names produce `connection_name_required`; reads
+remain available. No unnamed request acquires a fallback author. Names are
+NFC-normalized, stripped, 1–128 characters, and reject Unicode Cc/Cf and angle
+brackets. OAuth uses the grant's chosen alias; API keys use their name.
+
+The Git AUTHOR is the connection name plus a stable synthetic email formed
+from SHA-256 of credential kind, a NUL separator and the stable grant/key ID
+(first 32 hex characters), under `connections.obsidian-mcp.invalid`. Renaming
+a connection leaves its email unchanged. The server's configured identity
+remains COMMITTER. Both travel only in each subprocess environment; no global
+or repository Git configuration changes. Request ContextVars and explicit
+author snapshots isolate concurrent clients.
+
+Uploads store the minter's author name/email on the capability. Redemption
+refuses legacy unnamed capabilities before reading bytes, and commits the
+published path under that snapshot while holding the existing vault sync
+lock, including confirmed publication followed by a completion-record failure.
+A request cannot override the snapshot with a header or request context. Git
+failure never rolls back published bytes or changes a successful upload reply.
+
+## Working-clone backups
+
+`scripts/vault_backup.py` creates an exclusive, private tar outside the vault
+while holding the same kernel lock as supported writers. It retains the whole
+working tree and `.git`, including uncommitted files and displaced editor inodes,
+then reads every archived file and emits a SHA-256. It never overwrites a backup
+or deletes recovery data. Independent editors must be closed by the operator.
+A deployment snapshot additionally stops the application and restores its full
+PostgreSQL dump into an isolated instance before running any migration.

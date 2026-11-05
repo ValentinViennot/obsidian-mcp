@@ -792,6 +792,7 @@ def test_middleware_rejects_an_ownerless_oauth_token_in_multi_user_mode(
     from src.models.db import OAuthToken
 
     tok = OAuthToken(
+        connection_alias="Synthetic test connection",
         grant_issued_at=datetime.now(timezone.utc),
         id=11,
         token_hash="x",
@@ -956,6 +957,7 @@ def _oauth_token(user_id=UNASSIGNED_UID, scope="readwrite"):
     from src.models.db import OAuthToken
 
     return OAuthToken(
+        connection_alias="Synthetic test connection",
         grant_issued_at=datetime.now(timezone.utc),
         id=21,
         token_hash="x",

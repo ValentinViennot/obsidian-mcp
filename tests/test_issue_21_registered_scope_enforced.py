@@ -109,6 +109,7 @@ def _approve(client, *, requested_scope):
         resp = asyncio.run(
             routes.authorize_post(
                 req,
+                connection_alias="Synthetic test connection",
                 action="approve",
                 client_id="client123",
                 redirect_uri=REGISTERED_URI,

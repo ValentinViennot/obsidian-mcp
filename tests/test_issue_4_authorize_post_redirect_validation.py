@@ -152,6 +152,7 @@ def _call(client, *, action, redirect_uri, multi_user=False):
         resp = asyncio.run(
             routes.authorize_post(
                 req,
+                connection_alias="Synthetic test connection",
                 action=action,
                 client_id="client123",
                 redirect_uri=redirect_uri,

@@ -202,6 +202,7 @@ async def make_oauth(maker, user_id, client_id="c1"):
         ))
         await session.flush()
         token = OAuthToken(
+            connection_alias="Synthetic test connection",
             token_hash=oauth._hash(raw), token_type="access", client_id=client_id,
             scope="read", grant_id="g1", user_id=user_id,
             expires_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1),
@@ -559,6 +560,7 @@ async def test_grant_and_revoke_paths_issue_no_synchronous_commit(db, monkeypatc
     code, verifier = secrets.token_urlsafe(32), "v" * 64
     async with maker() as session:
         session.add(OAuthCode(
+            connection_alias="Synthetic test connection",
             user_id=uid, code_hash=oauth._hash(code), client_id="c1",
             redirect_uri=REDIRECT_URI, scope="read",
             code_challenge=oauth._base64url_sha256(verifier),

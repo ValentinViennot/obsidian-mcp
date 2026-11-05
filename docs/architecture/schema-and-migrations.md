@@ -7,7 +7,7 @@
 > `031`–`036`, respectively. The upstream rationale below retains its historical
 > revision references; use the [compatibility map](upstream-sync-20261015.md)
 > when locating current migration files. The November synchronization appends upstream `031`–`037` as fork `037`–`043`.
-> The single current Alembic head is `043`; deployed fork revisions stay unchanged.
+> Named connections append fork `044`. The single current Alembic head is `044`; deployed fork revisions stay unchanged.
 > Native OIDC uses `native_oidc_subject` to preserve legacy PocketID subjects.
 
 ## Schema drift is not only what `alembic check` sees
@@ -1321,3 +1321,18 @@ script refuses any pending migration and restores its previous image pin;
 these releases need a planned rollout with the old writer stopped. This is
 required by the keyword-vector migrations, whose new representation must not
 be written by old application code.
+
+## 044: named connections and intentional OAuth cutover
+
+Adds nullable `connection_alias` (128 characters) on OAuth codes and tokens,
+plus `git_author_name` (128) and `git_author_email` (255) on transfer tokens.
+Columns carry the `named connection identity (044_named_connections)` marker.
+An existing column must have the exact nullable, default-free type and marker
+or upgrade refuses it; downgrade drops only marker-owned columns. All table
+operations name `public` explicitly. Bounded locks cover the cutover transaction.
+
+Only unnamed OAuth tokens/codes are invalidated; API keys remain unchanged,
+and stamp-back replay preserves named grants. Revocation is deliberately not
+reversed by downgrade. `tests/integration/test_named_connections_pg.py` checks
+fresh cutover, key preservation, replay, clean Alembic comparison and real
+code-exchange/refresh inheritance.

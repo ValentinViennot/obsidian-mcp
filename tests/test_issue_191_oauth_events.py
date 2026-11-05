@@ -524,6 +524,7 @@ def _authorize_post(monkeypatch, *, client, action="approve", session_user=None,
     request.scope["headers"] = [(b"cookie", f"oauth_state={signed}".encode())]
     params = {
         "action": action,
+        "connection_alias": "Synthetic test connection",
         "client_id": kw.pop("client_id", "client123"),
         "redirect_uri": kw.pop("redirect_uri", REGISTERED_URI),
         "code_challenge": oauth._base64url_sha256(VERIFIER),
@@ -617,6 +618,7 @@ def test_a_deny_is_still_a_deny_when_the_identity_read_fails(monkeypatch, events
 
     response = asyncio.run(
         oauth.authorize_post(
+            connection_alias="Synthetic test connection",
             request=request,
             action="deny",
             client_id="client123",

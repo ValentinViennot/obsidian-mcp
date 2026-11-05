@@ -107,7 +107,9 @@ def test_a_commit_is_made_with_the_supplied_identity(repo):
     # git's hostname-derived guess and on the owner's desktop would be the
     # owner — the exact confusion this feature exists to remove.
     assert (author, email) == ("Agent", "agent@example.invalid")
-    assert (committer, committer_email) == ("Agent", "agent@example.invalid")
+    assert (committer, committer_email) == (
+        git_vault.settings.git_agent_name, git_vault.settings.git_agent_email
+    )
     assert porcelain(repo) == ""
 
 

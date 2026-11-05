@@ -574,3 +574,20 @@ def _offline_change_feed(request):
     finally:
         for name, real in saved.items():
             setattr(change_feed, name, real)
+
+
+@pytest.fixture(autouse=True)
+def synthetic_connection_author():
+    """Direct tool tests use an explicitly synthetic named connection.
+
+    Production defaults to no author. Middleware tests replace this context
+    from their credential, and refusal tests explicitly clear it.
+    """
+    from src.auth.session import current_connection_author
+    from src.services.connection_identity import connection_author
+    author = connection_author("Synthetic test connection", "api_key", "test-fixture")
+    token = current_connection_author.set(author)
+    try:
+        yield author
+    finally:
+        current_connection_author.reset(token)

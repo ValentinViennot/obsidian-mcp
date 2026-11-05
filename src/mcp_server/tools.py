@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from src.auth.session import (
+    current_connection_author,
     ACTOR_LABEL_MAX as _ACTOR_LABEL_MAX,
     ACTOR_REF_MAX as _ACTOR_REF_MAX,
     actor_columns,
@@ -70,6 +71,7 @@ from src.mcp_server.read_result import (
     screen_unrenderable,
 )
 from src.models.db import UsageLog
+from src.services.connection_identity import ConnectionAuthor
 from src.services import concurrency, git_vault, rate_limits, refusals, security_events, timing
 from src.services.tool_outcomes import BodyOutcome, body_refusal as _body_refusal
 from src.services.embeddings import (
@@ -215,7 +217,7 @@ def _git_principal() -> str | None:
     return actor.get("actor_label") or actor.get("actor_kind")
 
 
-async def _commit_vault_writes(tool_name: str) -> None:
+async def _commit_vault_writes(tool_name: str, author=None) -> None:
     """Commit whatever this call published. **Never raises, never delays a failure.**
 
     Awaited by `_tracked` after the body has completed and its result is
@@ -240,7 +242,7 @@ async def _commit_vault_writes(tool_name: str) -> None:
     module that owns the operation, is also what keeps the *reason* for the
     swallow beside the code that swallows.
     """
-    await git_vault.commit_recorded(tool_name, _git_principal())
+    await git_vault.commit_recorded(tool_name, _git_principal(), author=author)
 
 
 # PostgreSQL SQLSTATE for foreign_key_violation — the only insert failure
@@ -1721,6 +1723,7 @@ def _tracked(
             # usage row, so each tool body contributes only what it alone knows
             # — which path it just published — and the decorator contributes
             # the identity, once, after the body has finished.
+            call_author = current_connection_author.get()
             git_token = git_vault.begin() if write_class else None
             sync_guard = None
 
@@ -2120,7 +2123,7 @@ def _tracked(
                     except Exception:
                         pass
                 if git_token is not None:
-                    await _commit_vault_writes(tool_name)
+                    await _commit_vault_writes(tool_name, call_author)
                 return result
             finally:
                 try:
@@ -4293,6 +4296,12 @@ def _require_write() -> str | None:
     there is no tracked call to name.
     """
     if current_permission.get() == "readwrite":
+        if not isinstance(current_connection_author.get(), ConnectionAuthor):
+            return _body_refusal(
+                "Name this connection before writing. Reconnect OAuth and choose a connection name, "
+                "or edit this API key’s name in the control panel. Nothing was written.",
+                "connection_name_required",
+            )
         return None
     uid = current_user_id.get()
     actor = _actor_columns()
@@ -8678,14 +8687,8 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
     except OSError as e:
         return _body_refusal(f"Could not write {rel}: {e}", "io_failure")
 
-    # `import_from_url` is the eighth write-class tool and publishes vault
-    # bytes through an authenticated MCP call like the other seven, so it
-    # commits like them. (`PUT /transfer/upload` also publishes vault bytes,
-    # and deliberately does **not** commit here: it is not a tool call, runs
-    # under a capability rather than in a `_tracked` body, and has no
-    # accumulator to record into. Its writes are the reconcile sweep's, which
-    # is the honest attribution — the capability's minter chose the path, not
-    # the party that streamed the bytes.)
+    # The import commits with this tool call's named connection author.
+    # Upload redemption commits separately from its capability's author snapshot.
     git_vault.record_write(root, rel)
     if change_feed.is_note_path(rel):
         h = written.get("note_hash")

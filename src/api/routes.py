@@ -1,11 +1,12 @@
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.session import _SingleUserSentinel
+from src.services.connection_identity import normalize_connection_alias
 from src.config import settings
 from src.control_panel.routes import (
     _assert_key_owner,
@@ -64,7 +65,13 @@ class CreateKeyRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(..., min_length=1, max_length=255, pattern=r"^[\w\-. ]+$")
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def normalized_connection_name(cls, value):
+        return normalize_connection_alias(value)
+
     permission: str = Field("read", pattern="^(read|readwrite)$")
     # Null asks for unlimited (admin-only); absent is "apply the configured
     # default" — both resolved by `key_issuance.resolve_create_limit`. The bounds are the same ones
@@ -240,6 +247,32 @@ async def list_keys(
     ]
 
 
+class RenameKeyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def normalized_name(cls, value):
+        return normalize_connection_alias(value)
+
+
+@router.put("/keys/{key_id}/name")
+async def rename_key(
+    key_id: int,
+    req: RenameKeyRequest,
+    request: Request = None,
+    session: AsyncSession = Depends(get_session),
+    user: User | _SingleUserSentinel = Depends(require_user_panel),
+):
+    """Correct a connection name while preserving the credential and identity."""
+    result = await session.execute(select(APIKey).where(APIKey.id == key_id))
+    key = _assert_key_owner(result.scalar_one_or_none(), user, request=request)
+    key.name = req.name
+    await session.commit()
+    return {"id": key.id, "name": key.name}
+
+
 @router.put("/keys/{key_id}/limit", response_model=KeyLimitResponse)
 async def set_key_limit(
     key_id: int,
@@ -256,8 +289,7 @@ async def set_key_limit(
 
     The API had create, revoke and delete but no update surface at all, so a
     limit could be set at creation and then never changed without the panel.
-    This is deliberately the *only* mutable field exposed: widening the API's
-    write surface is not what this change is for.
+    Connection names have a separate owner-scoped endpoint.
 
     Ownership, auth and CSRF are the router's and `_assert_key_owner`'s — the
     same posture as the sibling key routes, using the same predicate as the

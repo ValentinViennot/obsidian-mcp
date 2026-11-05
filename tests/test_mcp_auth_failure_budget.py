@@ -132,6 +132,7 @@ def _key(**kwargs):
 
 def _token(**kwargs):
     return OAuthToken(
+        connection_alias="Synthetic test connection",
         id=91,
         token_hash="cafe",
         token_type="access",

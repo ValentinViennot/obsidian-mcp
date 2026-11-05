@@ -113,7 +113,7 @@ PRECONDITION_CODES = frozenset(
 # Body-only codes omit unrelated bucket fields. Existing gate codes retain
 # their historical wire shape, including argument_too_long at the provider.
 BODY_CODES = frozenset({
-    "permission_denied", "related_source_not_found", "related_source_not_embedded",
+    "connection_name_required", "permission_denied", "related_source_not_found", "related_source_not_embedded",
     "vault_assignment_changed", "vault_anchor_lost_at_publish",
     "vault_confirmation_unavailable", "invalid_argument", "validation_failed",
     "invalid_path", "unsafe_path", "not_found", "already_exists",

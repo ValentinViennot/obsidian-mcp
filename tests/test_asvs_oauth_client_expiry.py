@@ -428,6 +428,7 @@ def _approve(session, monkeypatch):
     return asyncio.run(
         oauth.authorize_post(
             _FakeRequest(signed),
+            connection_alias="Synthetic test connection",
             action="approve",
             client_id="client123",
             redirect_uri=REGISTERED_URI,
@@ -564,6 +565,7 @@ def _approve_multi_user(session, monkeypatch):
             response = asyncio.run(
                 oauth.authorize_post(
                     _FakeRequest(signed),
+                    connection_alias="Synthetic test connection",
                     action="approve",
                     client_id="client123",
                     redirect_uri=REGISTERED_URI,

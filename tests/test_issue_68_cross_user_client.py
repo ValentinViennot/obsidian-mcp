@@ -119,6 +119,7 @@ def approve(client, *, multi_user, session_user_id=None, action="approve"):
         response = asyncio.run(
             oauth.authorize_post(
                 _FakeRequest(signed),
+                connection_alias="Synthetic test connection",
                 action=action,
                 client_id="client123",
                 redirect_uri=REGISTERED_URI,
@@ -230,6 +231,7 @@ def _exchange(client_user_id, code_user_id):
         user_id=client_user_id,
     )
     code = OAuthCode(
+        connection_alias="Synthetic test connection",
         code_hash=oauth._hash("the-code"),
         client_id=client.client_id,
         redirect_uri=REGISTERED_URI,
@@ -352,6 +354,7 @@ def _approve_contended(winner_user_id, session_user_id):
         response = asyncio.run(
             oauth.authorize_post(
                 _FakeRequest(signed),
+                connection_alias="Synthetic test connection",
                 action="approve",
                 client_id="client123",
                 redirect_uri=REGISTERED_URI,

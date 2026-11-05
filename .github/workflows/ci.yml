@@ -5,267 +5,356 @@ on:
     branches: [main]
   push:
     branches: [main]
-
-# Supersede an in-flight run for the same PR / branch. `github.ref` is the PR's
-# merge ref on pull_request, so pushes to a PR cancel their own predecessor and
-# never each other's.
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
-  PYTHON_VERSION: "3.12"
+  PYTHON_VERSION: '3.12'
+  IMAGE: ghcr.io/valentinviennot/obsidian-mcp
+  TRIVY_IMAGE: aquasec/trivy:0.69.3@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
 
 jobs:
-  # The full suite, with the opt-in Postgres integration modules actually
-  # running. `PGVECTOR_TEST_ADMIN_URL` names a *server*; the harness in
-  # tests/integration/_harness.py creates and drops its own `test_<uuid>`
-  # database per module, so the `postgres` database in the URL is only ever a
-  # maintenance connection.
-  tests:
-    name: tests
-    runs-on: ubuntu-latest
-    # Offline suite + the real-Postgres integration modules in one job: ~27 min
-    # on main before #416, which adds ~380 tests. 30 was cancelling green runs.
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      runtime: ${{ steps.changes.outputs.runtime }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: changes
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            echo runtime=true >> "$GITHUB_OUTPUT"
+          else
+            echo "runtime=$(python3 scripts/ci_release.py changes --base "$BASE" --head "$HEAD")" >> "$GITHUB_OUTPUT"
+          fi
+
+  offline:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Enable and exercise mount namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -Urm --propagation private true
+      - run: python scripts/ci_tests.py offline
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pytest-offline
+          path: pytest-offline.xml
+          if-no-files-found: error
+
+  database:
+    name: ${{ matrix.partition }}
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [schema, postgres]
     services:
       postgres:
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: test
-        ports:
-          - 5432:5432
+        ports: ['5432:5432']
         options: >-
           --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-
-      - name: Install dependencies
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Require database and Docker test prerequisites
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-
-      # tests/test_nested_mount_publication.py's real bind-mount case spawns
-      # `unshare -Urm`. Ubuntu 24.04 ships an AppArmor restriction on
-      # unprivileged user namespaces; the knob does not exist on older images,
-      # so its absence is not a failure.
-      - name: Allow unprivileged user namespaces
-        run: |
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          else
-            echo "kernel.apparmor_restrict_unprivileged_userns absent — nothing to relax"
-          fi
-
-      # Fail early and legibly rather than letting the suite skip its way past
-      # the namespace harness. The junit gate below is the authoritative check;
-      # this one just names the cause.
-      - name: Verify the mount-namespace harness can run
-        run: unshare -Urm --propagation private true
-
-      # tests/integration/test_search_eval_pg.py runs `make search-eval-export`
-      # through real `psql` (#356, design D3), and fails rather than skips when
-      # it is missing. GitHub's Ubuntu image ships the client today; this only
-      # installs it if the image ever stops doing so.
-      - name: Ensure the PostgreSQL client is present
-        run: |
+          docker info > /dev/null
           if ! psql --version; then
             sudo apt-get update && sudo apt-get install -y postgresql-client
-            psql --version
           fi
-
-      - name: Run the test suite
+      - name: Run the disjoint database partition
         env:
-          # Real Postgres for tests/integration/*. The harness creates and drops
-          # its own databases on this server.
           PGVECTOR_TEST_ADMIN_URL: postgresql+asyncpg://postgres:test@localhost:5432/postgres
-          # tests/test_fts_integration.py runs read-only SELECTs and rolls
-          # back, so pointing it at the service's maintenance database is
-          # safe. Enabled after #124 corrected the module's Norwegian
-          # inflection pair to one the snowball stemmer collapses in both
-          # directions (huset/hus; datasenteret/datasenter was not).
           TEST_DATABASE_URL: postgresql+asyncpg://postgres:test@localhost:5432/postgres
-        run: pytest -q -rs --junitxml=pytest-report.xml
-
-      # House rule: a gate that silently skips is not a gate. The namespace
-      # harness is the only case in the suite whose premise depends on runner
-      # kernel policy, so its skip is turned into a failure here.
-      - name: Assert the nested-mount namespace harness actually ran
+          PARTITION: ${{ matrix.partition }}
+        run: python scripts/ci_tests.py "$PARTITION"
+      - uses: actions/upload-artifact@v4
         if: always()
-        run: |
-          python - <<'PY'
-          import sys, xml.etree.ElementTree as ET
+        with:
+          name: pytest-${{ matrix.partition }}
+          path: pytest-${{ matrix.partition }}.xml
+          if-no-files-found: error
 
-          NAME = "test_nested_mount_cases_pass_in_a_mount_namespace"
-          tree = ET.parse("pytest-report.xml")
-          hits = [c for c in tree.iter("testcase") if c.get("name") == NAME]
-          if not hits:
-              sys.exit(f"{NAME} did not run at all — it was not collected.")
-          for case in hits:
-              skipped = case.find("skipped")
-              if skipped is not None:
-                  sys.exit(
-                      f"{NAME} was SKIPPED ({skipped.get('message')}). "
-                      "Unprivileged user+mount namespaces must work on the "
-                      "runner; a gate that silently skips is not a gate."
-                  )
-          print(f"{NAME} ran.")
-          PY
-
-  # Migrations vs. ORM models on a throwaway pgvector container the target
-  # starts itself (docker is present on the runner). It never reads the deploy
-  # `.env` and does not depend on the gitignored Makefile.local — the Makefile
-  # `-include`s that file optionally and `test-schema` uses none of its
-  # variables. PYTHON= points the target at setup-python's interpreter, which
-  # is the one carrying the installed deps.
-  schema-gate:
-    name: schema-gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-
-      - name: Install dependencies
+      - name: Secret history scan
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          set -o pipefail
+          docker run --rm -v "$PWD:/repo:ro" zricethezav/gitleaks:v8.24.0 \
+            detect --source /repo --redact --no-banner -v --exit-code 1 2>&1 | tee gitleaks.log
+          grep -qE '[0-9]+ commits scanned' gitleaks.log
+      - name: Vault leak checker
+        run: python scripts/check-vault-leak.py
+      - name: Dependency audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
 
-      - name: make test-schema
-        run: make test-schema PYTHON="$(which python)"
-
-  # Spec validation. The CLI is published as @fission-ai/openspec (the bare
-  # `openspec` npm name is a different package), pinned to the version the repo
-  # is developed against.
   openspec:
-    name: openspec
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '22'
+      - run: npx -y @fission-ai/openspec@1.3.1 validate --specs --strict
 
-      - name: openspec validate --specs --strict
-        run: npx -y @fission-ai/openspec@1.3.1 validate --specs --strict
-
-  # `docker compose config` on every stack this repo ships, base and overrides.
-  #
-  # tests/test_container_hardening.py asserts the *shape* of these files —
-  # limits present, nothing published that should not be — from plain YAML,
-  # because the test container has no docker CLI. What it cannot do is tell you
-  # the files are valid compose: an unknown key, a bad interpolation, or the
-  # `pids_limit` / `deploy.resources.limits.pids` conflict are all things only
-  # the real parser rejects. So the parser runs here.
-  #
-  # The env below stands in for a populated `.env`. The compose files use
-  # `${VAR:?...}` for everything an operator must set, which is deliberate —
-  # `up` refuses rather than mounting an empty ./vault — and which means this
-  # job has to supply them. A new required variable added without a line here
-  # fails this job, which is the intended reminder to document it.
-  compose-config:
-    name: compose-config
-    runs-on: ubuntu-latest
+  compose:
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
-      SECRET_KEY: ci-not-a-real-key
-      POSTGRES_PASSWORD: ci-not-a-real-password
-      OBSIDIAN_DB_PASSWORD: ci-not-a-real-runtime-password
+      SECRET_KEY: ci-synthetic-only-secret
+      POSTGRES_PASSWORD: ci-synthetic-only-bootstrap-password
+      OBSIDIAN_DB_PASSWORD: ci-synthetic-only-runtime-password
       VAULT_HOST_PATH: ./vault
       MCP_HOSTNAME: obsidian-mcp.example.com
     steps:
       - uses: actions/checkout@v4
-
-      - name: docker compose config
+        with:
+          persist-credentials: false
+      - name: Validate base and proxy overrides
         run: |
-          set -euxo pipefail
-          # `env_file: .env` is required, so give the job one. Its contents are
-          # irrelevant: the variables above are already in the environment,
-          # which is what interpolation reads.
-          : > .env
-          : > postgres.env
+          touch .env postgres.env
           docker compose -f docker-compose.yml config -q
-          docker compose -f docker-compose.yml -f docker-compose.caddy.yml config -q
-          docker compose -f docker-compose.yml -f docker-compose.traefik.yml config -q
-
-      - name: the proxy overrides must actually drop the published port
-        run: |
-          set -euo pipefail
-          # `ports: []` would silently NOT do this — compose merges the key by
-          # concatenation. This asserts the merged result, which is the only
-          # place the mistake is visible.
           for override in docker-compose.caddy.yml docker-compose.traefik.yml; do
+            docker compose -f docker-compose.yml -f "$override" config -q
             docker compose -f docker-compose.yml -f "$override" config --format json \
-              | python3 -c "import json,sys; p = json.load(sys.stdin)['services']['obsidian-mcp'].get('ports') or []; sys.exit(f'{sys.argv[1]}: obsidian-mcp still publishes {p}') if p else None" "$override"
-            echo "$override: published port dropped"
+              | python3 -c 'import json,sys; assert not json.load(sys.stdin)["services"]["obsidian-mcp"].get("ports")'
           done
 
-  # The same gate `make trivy` runs before every deploy, mirrored into CI the
-  # way the Honeydew projects run it: build the image, scan, fail the check on
-  # HIGH/CRITICAL findings. Flags match the Makefile gate exactly —
-  # `ignore-unfixed` so a CVE with no upstream fix cannot block an unrelated
-  # PR (the same reasoning that makes `audit` advisory), and `vuln` scanners
-  # only, so CI red always means `make deploy` would refuse too.
-  trivy-scan:
-    name: trivy-scan
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  image:
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      artifact_id: ${{ steps.candidate.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Build Docker image
-        run: docker build -t obsidian-mcp:ci .
-
-      - name: Run Trivy scan
-        uses: aquasecurity/trivy-action@master
         with:
-          image-ref: "obsidian-mcp:ci"
-          severity: "HIGH,CRITICAL"
-          exit-code: "1"
-          ignore-unfixed: true
-          scanners: "vuln"
-
-  # Advisory: a new upstream CVE disclosed against a pinned dependency must not
-  # block an unrelated PR. It still shows red in the checks list.
-  audit:
-    name: audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the only runtime candidate
+        uses: docker/build-push-action@v6
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install pip-audit
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: obsidian-mcp:candidate
+          labels: |
+            org.opencontainers.image.source=https://github.com/ValentinViennot/obsidian-mcp
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=runtime-candidate
+          cache-to: type=gha,mode=max,scope=runtime-candidate
+      - name: Scan that candidate
         run: |
-          python -m pip install --upgrade pip
-          pip install pip-audit
+          ignore=()
+          if [ -f .trivyignore ]; then ignore=(--ignorefile /src/.trivyignore); fi
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            -v "$PWD:/src:ro" "$TRIVY_IMAGE" image --severity HIGH,CRITICAL \
+            --exit-code 1 --ignore-unfixed --no-progress --scanners vuln \
+            "${ignore[@]}" obsidian-mcp:candidate
+      - name: Smoke-test that candidate with synthetic data
+        run: scripts/ci_image_smoke.sh obsidian-mcp:candidate
+      - name: Preserve the exact tested candidate
+        run: |
+          mkdir candidate
+          docker image inspect obsidian-mcp:candidate --format '{{.Id}}' > candidate/image-id
+          docker save obsidian-mcp:candidate | gzip > candidate/image.tar.gz
+          cd candidate && sha256sum image.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        id: candidate
+        with:
+          name: runtime-candidate-${{ github.run_attempt }}
+          path: candidate/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
 
-      - name: pip-audit -r requirements.txt
-        run: pip-audit -r requirements.txt
+  pr-gate:
+    name: pr-gate
+    if: always()
+    needs: [changes, offline, database, security, openspec, compose, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every applicable gate
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          needs = json.loads(os.environ['NEEDS'])
+          runtime = needs['changes']['outputs'].get('runtime')
+          assert runtime in ('true', 'false'), 'missing change classification'
+          for name, result in needs.items():
+              expected = 'skipped' if runtime == 'false' and name in ('offline', 'database', 'image') else 'success'
+              assert result['result'] == expected, f"{name}: expected {expected}, got {result['result']}"
+          PY
+
+  publish:
+    if: >-
+      github.repository == 'ValentinViennot/obsidian-mcp' &&
+      github.ref == 'refs/heads/main' && github.event_name != 'pull_request' &&
+      needs.changes.outputs.runtime == 'true'
+    needs: [pr-gate, changes, offline, database, security, openspec, compose, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.image.outputs.artifact_id }}
+          merge-multiple: true
+          path: candidate
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+      - name: Publish the tested bytes without rebuilding
+        id: release
+        run: |
+          set -euo pipefail
+          (cd candidate && sha256sum -c SHA256SUMS)
+          gzip -dc candidate/image.tar.gz | docker load
+          expected=$(cat candidate/image-id)
+          test "$(docker image inspect obsidian-mcp:candidate --format '{{.Id}}')" = "$expected"
+          test "$(docker image inspect obsidian-mcp:candidate --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          test "$(docker image inspect obsidian-mcp:candidate --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = "https://github.com/$GITHUB_REPOSITORY"
+          tag="sha-$GITHUB_SHA-run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker tag obsidian-mcp:candidate "$IMAGE:$tag"
+          docker push "$IMAGE:$tag"
+          digest=$(oras resolve "$IMAGE:$tag")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker pull "$IMAGE@$digest"
+          test "$(docker image inspect "$IMAGE@$digest" --format '{{.Id}}')" = "$expected"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest the tested image
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.release.outputs.digest }}
+          push-to-registry: true
+      - name: Generate exact-source release manifest
+        env:
+          DIGEST: ${{ steps.release.outputs.digest }}
+          EVIDENCE: >-
+            {"offline":"${{ needs.offline.result }}","schema":"${{ needs.database.result }}",
+            "postgres":"${{ needs.database.result }}","security":"${{ needs.security.result }}",
+            "openspec":"${{ needs.openspec.result }}","compose":"${{ needs.compose.result }}",
+            "image":"${{ needs.image.result }}"}
+        run: |
+          python3 scripts/ci_release.py manifest --commit "$GITHUB_SHA" --digest "$DIGEST" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --evidence "$EVIDENCE" --output obsidian-mcp-release.json
+      - name: Publish immutable release manifest
+        id: manifest
+        run: |
+          tag="release-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          oras push --artifact-type application/vnd.obsidian-mcp.release.v1+json \
+            "$IMAGE:$tag" obsidian-mcp-release.json:application/json
+          digest=$(oras resolve "$IMAGE:$tag")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "reference=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest release manifest for protected GitOps ingestion
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obsidian-mcp-release-${{ github.sha }}-${{ github.run_attempt }}
+          path: obsidian-mcp-release.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Trigger protected GitOps ingestion
+        if: vars.OBSIDIAN_RELEASE_AUTOMATION_ENABLED == 'true'
+        env:
+          GITOPS_PIPELINE_TRIGGER_URL: ${{ secrets.GITOPS_PIPELINE_TRIGGER_URL }}
+          GITOPS_PIPELINE_TRIGGER_TOKEN: ${{ secrets.GITOPS_PIPELINE_TRIGGER_TOKEN }}
+          OBSIDIAN_RELEASE_MANIFEST: ${{ steps.manifest.outputs.reference }}
+        run: |
+          test -n "$GITOPS_PIPELINE_TRIGGER_URL"
+          test -n "$GITOPS_PIPELINE_TRIGGER_TOKEN"
+          curl --fail-with-body --silent --show-error --max-time 30 \
+            --request POST "$GITOPS_PIPELINE_TRIGGER_URL" \
+            --form "token=$GITOPS_PIPELINE_TRIGGER_TOKEN" --form 'ref=main' \
+            --form "variables[OBSIDIAN_RELEASE_MANIFEST]=$OBSIDIAN_RELEASE_MANIFEST" \
+            --form "variables[USL_SOURCE_REPOSITORY]=$GITHUB_REPOSITORY" \
+            --form "variables[USL_SOURCE_REF]=$GITHUB_REF" \
+            --form "variables[USL_SOURCE_COMMIT]=$GITHUB_SHA" \
+            --form "variables[USL_GITHUB_RUN_ID]=$GITHUB_RUN_ID"
+      - name: Release summary
+        env:
+          DIGEST: ${{ steps.release.outputs.digest }}
+          MANIFEST: ${{ steps.manifest.outputs.reference }}
+        run: |
+          # shellcheck disable=SC2016
+          printf 'Tested image: `%s@%s`\n\nAttested release manifest: `%s`\n' "$IMAGE" "$DIGEST" "$MANIFEST" >> "$GITHUB_STEP_SUMMARY"

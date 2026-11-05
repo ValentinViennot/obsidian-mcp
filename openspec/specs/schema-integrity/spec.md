@@ -1,7 +1,7 @@
 # schema-integrity Specification
 
 ## Purpose
-TBD - created by archiving change schema-reconciliation. Update Purpose after archive.
+The contract between the alembic migrations and the ORM models: `alembic check` stays clean, each migration reconciles a same-named unit of known shape rather than adopting one of unknown provenance, downgrades drop only marked units, the schema gate pins every constraint Alembic does not compare, and backups classify each table as derived or durable — including (#351) migration 033's `content_changed_at` and the three durable change-feed tables, which carry no foreign key.
 ## Requirements
 ### Requirement: Schema agrees with the ORM models
 
@@ -605,3 +605,229 @@ The issuance column carries a server default, unlike 025's marker, only so that 
 - **THEN** it SHALL report no new upgrade operations
 - **AND** the schema gate SHALL verify the `grant_issued_at` server default through the catalogue, since autogenerate does not compare server defaults
 
+### Requirement: Migration 031 SHALL own the keyword excerpt column and SHALL re-head every keyword vector in SQL
+
+Migration 031 SHALL add `notes_metadata.body_excerpt` (`text`, nullable, no server default, no backfill) carrying the migration's ownership marker as its column comment, mirrored byte-identically in `src/models/db.py` so that `alembic check` compares it; a same-named column of another type, NOT NULL, or with a default SHALL be refused by name, and a column of the exact shape carrying the marker SHALL be reconciled without change. `downgrade()` SHALL, under the index generation lock, set every non-NULL `content_tsvector` to `ts_filter(content_tsvector, '{d}')` — removing every weight-`A` lexeme so the previous image sees the pre-change matching semantics and its later D-only writes do not mix with headed rows — and only then drop a marked column.
+
+Because an old-image process writing between 031's commit and its own replacement can preserve a stale head across a move, the compose `make deploy` SHALL stop the application container before `alembic upgrade head` whenever a migration is pending (`alembic current` differs from `alembic heads`), and `DEPLOYMENT.md`'s upgrade notes SHALL state the order stop → migrate → start for a hand-driven compose stack. The Kubernetes bundle needs no change: `strategy: Recreate` ends the old pod before the new pod's `migrate` initContainer runs, and the design records that.
+
+In the same transaction, 031 SHALL re-head every `notes_metadata` row whose `content_tsvector` is not NULL, reading no file: it SHALL first acquire the index generation advisory lock (`pg_advisory_xact_lock` on the key `src/services/index_state.py` defines, mirrored as a literal and pinned equal by a test); it SHALL take the FTS configs from the stored `fts_fingerprint` row — its `configs` when present, `settings.fts_configs` when the key is absent, and SHALL refuse naming the key when the stored value cannot be read; and it SHALL then, per row whose vector carries no weight-`A` lexeme (`length(ts_filter(content_tsvector, '{a}')) = 0`), set `content_tsvector = head(title, aliases) || ts_filter(content_tsvector, '{d}')` through the shared `rehead` builder, with `aliases` from the shared rule over the stored frontmatter, each UPDATE in its own savepoint. A per-row SQLSTATE 54000 SHALL leave that row unchanged, be counted and logged by row id, and not fail the migration; any other error SHALL fail the migration with nothing committed. The re-head SHALL be byte-idempotent — a row already carrying a head is skipped, because a second application would shift the body's positions — and 031 SHALL raise `statement_timeout` for its own duration and pin and assert `search_path`.
+
+#### Scenario: Fresh upgrade
+
+- **WHEN** a database at 030 holding rows with unweighted vectors is upgraded to 031
+- **THEN** `body_excerpt` SHALL exist nullable with the marker and read NULL on every row
+- **AND** every row with a vector SHALL hold its title's lexemes at weight `A` and its former lexemes at weight `D`, equal to what the incremental writer produces for the same title, aliases and body
+
+#### Scenario: Stamp-back re-runs cleanly and changes no vector twice
+
+- **WHEN** the schema gate stamps the database back to 030 and upgrades again
+- **THEN** 031 SHALL reconcile the marked column without error and every re-headed vector SHALL be byte-equal to its value after the first run
+
+#### Scenario: The stored fingerprint decides the configs
+
+- **WHEN** `indexer_state` records `fts_fingerprint` with `configs: ["simple"]` while the environment says `FTS_CONFIGS=english`
+- **THEN** the head SHALL be built under `simple`, and when the key is absent it SHALL be built under the environment's configs
+
+#### Scenario: An unreadable fingerprint refuses
+
+- **WHEN** `fts_fingerprint` holds a value that is not a JSON object with a known version
+- **THEN** 031 SHALL fail naming the key and change nothing
+
+#### Scenario: A row at the size limit does not fail the migration
+
+- **WHEN** one row's re-headed vector exceeds the 1 MiB tsvector limit
+- **THEN** that row SHALL keep its previous vector, the migration SHALL log its id and complete, and every other row SHALL be re-headed
+
+#### Scenario: An impostor column is refused
+
+- **WHEN** `body_excerpt` already exists as NOT NULL, with a default, or with another type
+- **THEN** the migration SHALL fail naming the column and the disagreement, and change nothing
+
+#### Scenario: Downgrade restores D-only vectors and drops only what 031 created
+
+- **WHEN** a downgrade runs against a database upgraded by 031 whose rows carry headed vectors
+- **THEN** afterwards no `content_tsvector` SHALL contain a weight-`A` lexeme, every body lexeme SHALL still be present, and the marked column SHALL be dropped
+- **AND** a downgrade against an unmarked same-named column SHALL leave that column in place naming it, after re-filtering the vectors
+
+#### Scenario: A pending migration stops the compose app before it migrates
+
+- **WHEN** `make deploy` runs on a compose host whose database is at 030 with image 031 built
+- **THEN** it SHALL stop the application container, run `alembic upgrade head`, and only then recreate the container
+- **AND** when the database is already at head it SHALL keep the previous order (migrate, then recreate)
+
+#### Scenario: The schema agrees with the model afterwards
+
+- **WHEN** `alembic check` runs after the migration has been applied
+- **THEN** it SHALL report no new upgrade operations
+
+### Requirement: Migration 032 SHALL own the task table and the task-truncation column as marked units
+
+Migration 032 (`down_revision` `"031"`) SHALL create `note_tasks` with these columns: `id` integer primary key; `note_id` integer NOT NULL, foreign key to `notes_metadata.id` `ON DELETE CASCADE`; `line` integer NOT NULL; `status_char` varchar(1) NOT NULL; `state` varchar(16) NOT NULL with a CHECK limiting it to `open`, `done`, `cancelled`; `text` text NOT NULL; `text_cut` boolean NOT NULL default false; `due`, `scheduled`, `start` and `done_on` as nullable `date`; `priority` varchar(8) NULL with a CHECK limiting it to `highest`, `high`, `medium`, `low`, `lowest`; `tags` varchar(128)[] NULL; `tags_cut` boolean NOT NULL default false; and `heading_path` text NULL. The table SHALL have a unique constraint on `(note_id, line)`, an index on `note_id` and an index on `(state, due)`. It SHALL carry the migration's ownership marker as its table comment. Migration 032 SHALL also add `notes_metadata.tasks_truncated BOOLEAN NOT NULL DEFAULT false` and `notes_metadata.tasks_failed BOOLEAN NOT NULL DEFAULT false`, each with its own column marker. Every name, type, constraint, index and marker SHALL be mirrored in `src/models/db.py` so that `alembic check` is clean. The migration SHALL write no data. A same-named table or column of a different shape SHALL be refused by name, and one of the exact shape carrying the marker SHALL be reconciled without change. It SHALL set `lock_timeout` and `statement_timeout` and `RESET` them before returning. `downgrade()` SHALL drop the table and the column only where they carry the marker. `note_tasks` SHALL be classified as a derived table: `make db-backup` and the Kubernetes backup Job SHALL dump it schema-only, and `tests/test_backup_derived_tables.py` SHALL list it.
+
+#### Scenario: Fresh upgrade
+
+- **WHEN** a database at 031 is upgraded to 032
+- **THEN** `note_tasks` SHALL exist empty with its constraints, indexes and marker, and every `notes_metadata` row SHALL read `tasks_truncated = false` and `tasks_failed = false` without a table rewrite
+
+#### Scenario: Stamp-back re-runs cleanly
+
+- **WHEN** the schema gate stamps the database back to 031 and upgrades again
+- **THEN** 032 SHALL reconcile the marked table and column without error and write nothing
+
+#### Scenario: An impostor is refused
+
+- **WHEN** a `note_tasks` table without the marker, or a `tasks_truncated` or `tasks_failed` column of another type, already exists
+- **THEN** the migration SHALL fail naming the object and change nothing
+
+#### Scenario: The cascade holds
+
+- **WHEN** a `notes_metadata` row with task rows is deleted
+- **THEN** its task rows SHALL be deleted in the same statement
+
+#### Scenario: The schema agrees with the model
+
+- **WHEN** `make test-schema` runs, and `make db-check` runs after deploy
+- **THEN** both SHALL report "No new upgrade operations detected"
+
+#### Scenario: Migrations run as a non-superuser
+
+- **WHEN** `test_nonsuperuser_migrations_pg.py` runs 032 as the database-owning, non-superuser role
+- **THEN** the migration SHALL succeed
+
+### Requirement: Migration 033 SHALL add `content_changed_at` and the feed tables as marked, reconcilable objects
+Migration 033 (revising 032) SHALL add `notes_metadata.content_changed_at timestamptz`, backfill it with `COALESCE(modified_at, indexed_at)`, and then make it `NOT NULL` with `DEFAULT now()`. It SHALL create three tables, with the columns, CHECK constraints, unique constraints and indexes of the design, and **no foreign key on any of them**:
+- `note_events`, with a `bigserial` surrogate key, a plain nullable `user_id`, a `seq bigint NOT NULL`, and `UNIQUE (user_id, seq) NULLS NOT DISTINCT`;
+- `note_event_scopes`, with `user_id` unique `NULLS NOT DISTINCT`, `last_seq`, `pruned_through_seq` and `pruned_at`;
+- `note_event_gaps`.
+
+It SHALL put a marker comment byte-identical to the model's on the new column and on each table. A re-run against a database already carrying a same-named object SHALL verify its shape and refuse an unmarked or differently shaped one by name. `downgrade()` SHALL drop only marked objects. After upgrade, `alembic check` SHALL report no new upgrade operations.
+
+#### Scenario: Backfill
+- **WHEN** 033 runs over rows with `modified_at` set and rows with `modified_at` NULL
+- **THEN** every row SHALL have `content_changed_at` equal to its `modified_at`, or to its `indexed_at` where `modified_at` was NULL, and the column SHALL be `NOT NULL`
+
+#### Scenario: Constraints asserted by the schema gate
+- **WHEN** the schema gate inspects `pg_constraint` for the three feed tables
+- **THEN** `UNIQUE (user_id, seq)` and the scope uniqueness SHALL be present with `NULLS NOT DISTINCT`, the CHECK predicates SHALL match the design, and no foreign key SHALL exist
+
+#### Scenario: Clean drift check
+- **WHEN** `make test-schema` runs migrations to head and `alembic check`
+- **THEN** both SHALL pass with no new upgrade operations
+
+### Requirement: The three feed tables SHALL be classified as durable for backups
+`note_events`, `note_event_scopes` and `note_event_gaps` SHALL be dumped with their rows by `make db-backup` and the Kubernetes backup Job. They SHALL appear in the durable list that `tests/test_backup_derived_tables.py` pins: their history, attributions, sequence counters and retention watermarks cannot be rebuilt from the vault, and a cursor stays valid across a restore only if events and counters are restored together.
+
+#### Scenario: Backup classification
+- **WHEN** `tests/test_backup_derived_tables.py` runs
+- **THEN** it SHALL pass with the three tables in the durable list and none in the schema-only list
+
+### Requirement: Migration 034 SHALL add the chunk-locator, prefix and chunking-version columns as marked, reconcilable units with no backfill
+Migration 034 (revising 033) SHALL add `note_embeddings.heading_path text[]`, `note_embeddings.section_ordinal integer`, `note_embeddings.embed_prefix text` `notes_metadata.embedded_chunking_version smallint` and `notes_metadata.embedded_input_digest varchar(64)`, all nullable, with no default, no index and no backfill. It SHALL add `ck_note_embeddings_heading_meta`, which requires the three row columns to be all NULL, or all non-NULL with `section_ordinal >= 0` and `(section_ordinal = 0) = (cardinality(heading_path) = 0)`. It SHALL add `ck_notes_metadata_embedded_chunking_version`, which requires NULL or `>= 1`. Both CHECKs SHALL be added `NOT VALID` and then validated. Each column SHALL carry a marker comment byte-identical to the ORM model's. A re-run against a database already carrying a same-named column or constraint SHALL verify its exact shape and marker, and SHALL refuse anything else by name before changing anything. The migration SHALL pin and assert `search_path` and SHALL set and reset `lock_timeout` and `statement_timeout`, in both `upgrade()` and `downgrade()`, so the downgrade's wait on the generation lock is bounded. It SHALL need only ownership of the tables.
+
+`downgrade()` SHALL, in one transaction holding the index generation advisory lock, clear `embedded_content_hash` for every note holding a row with a non-NULL `embed_prefix`, delete those rows, and then drop only the marked constraints and columns.
+
+#### Scenario: Upgrade leaves existing rows untouched
+- **WHEN** 034 runs over a database holding pre-034 embedding rows
+- **THEN** every existing row SHALL read NULL in the three new row columns and every note NULL in `embedded_chunking_version` and `embedded_input_digest`, and no vector SHALL be modified
+
+#### Scenario: Clean drift check, including a round trip
+- **WHEN** `make test-schema` runs migrations to head, then `downgrade 033` and `upgrade head` again
+- **THEN** `alembic check` SHALL report no new upgrade operations after both upgrades
+
+#### Scenario: CHECKs asserted through the catalogue
+- **WHEN** the schema gate reads `pg_constraint`
+- **THEN** both CHECK definitions SHALL match the design and be validated
+
+#### Scenario: An impostor is refused
+- **WHEN** a same-named column of another type, or without the marker, already exists before 034 runs
+- **THEN** the migration SHALL fail naming it and SHALL change nothing
+
+#### Scenario: Downgrade removes heading-era vectors
+- **WHEN** `downgrade 033` runs over a database holding both pre-034 rows and rows with a prefix
+- **THEN** the prefixed rows SHALL be deleted, their notes SHALL have `embedded_content_hash` NULL, the pre-034 rows SHALL remain, and the marked columns SHALL be gone
+
+#### Scenario: Non-superuser migration
+- **WHEN** `tests/integration/test_nonsuperuser_migrations_pg.py` runs to head as a non-superuser owner
+- **THEN** it SHALL pass
+
+### Requirement: Migration 035 SHALL add the tags part to every tagged keyword vector in SQL or commit nothing, and SHALL leave `alembic check` clean
+
+Migration 035 (`down_revision "034"`) SHALL add, alter and drop no schema object. In one transaction it SHALL raise `lock_timeout` to 10 s and `statement_timeout` to 15 min for its own duration, pin and assert `search_path` and the qualified `notes_metadata` table as 031 does, acquire the index generation advisory lock (`pg_advisory_xact_lock` on the key `src/services/index_state.py` defines, mirrored as a literal and pinned equal by a test) before reading any row, and take the FTS configs from the stored `fts_fingerprint` row — its `configs` when present, `settings.fts_configs` when the key is absent, and a refusal naming the key, with nothing changed, when the stored value cannot be read. Before its first UPDATE, 035 SHALL run a read-only size preflight over every row the rewrite would change (the same two predicates): for each, it SHALL estimate the post-035 vector's data size as `S(ts_filter(content_tsvector, '{d}')) + S(head(title, aliases, tags))`, the head built by the shared builder under those configs, where `S(v)` is `Σ over unnest(v) of (octet_length(lexeme) rounded up to even) + (2 + 2 × cardinality(positions) when positions is non-empty, else 0)` — PostgreSQL's own accounting of a tsvector's string area, within four bytes of PostgreSQL's own count for a concatenation (it over-counts a lexeme the parts share, which is stored once; measured four under on one case and exact on another), a difference the 64-byte margin absorbs — and when any estimate exceeds 1,048,511 bytes (the 1,048,575-byte limit less a 64-byte alignment margin) it SHALL abort with nothing written, naming the count and the row ids (ids only, never paths or text), so that a Kubernetes `migrate` initContainer fails in seconds rather than after rewriting rows. The rewrite's all-or-nothing rule remains the backstop for any row the estimate passes. It SHALL then, reading no file, for each `notes_metadata` row whose `content_tsvector` is not NULL, in id order, set `content_tsvector = head(title, aliases, tags) || ts_filter(content_tsvector, '{d}')` through the shared `rehead` builder, with `title` from the stored column, `aliases` from the shared aliases rule over the stored frontmatter and `tags` from the shared `tags_text` rule over the stored `tags`, where the UPDATE's own predicate requires both that the row's vector carries no weight-`B` lexeme (`length(ts_filter(content_tsvector, '{b}')) = 0`) and that the row's tags text produces at least one lexeme under those configs. 035 SHALL be all-or-nothing: any error on any row, SQLSTATE 54000 (the 1 MiB tsvector limit) included, SHALL fail the whole migration with nothing committed, and the error SHALL name the row's `notes_metadata.id` and the SQLSTATE (never the path or any note text); no row SHALL be left untagged by a migration that succeeded. 035 SHALL log one summary line with the counts re-headed, already tagged and without tag lexemes. `DEPLOYMENT.md`'s 035 upgrade note SHALL give the operator a read-only SQL statement to run against the live database before merging, reporting only the count of tagged rows, the count and ids of rows flagged and the largest estimate, where that statement SHALL never pass a row 035's preflight would abort on (a false flag is acceptable, a false pass is not): it SHALL strip U+0002 and U+0003 from the tags exactly as `tags_text` does before parsing them, SHALL flag a candidate row whose `S(ts_filter(content_tsvector, '{a}')) + S(ts_filter(content_tsvector, '{d}')) + B` exceeds the margin — the parts summed separately as 035's preflight counts them, never `S` of the merged vector, in which a lexeme shared by title and body is stored once — where `B` is an upper bound on the tags part 035 builds, computed by parsing each tag's full form and its `/`-expanded form as separate documents and counting, per distinct lexeme, `even(bytes) + 2 + 2 × least(positions, 256)`, so that no position saturation in a long concatenated document can make it smaller than the part `tags_text` yields; with several FTS configs the per-config parses SHALL be combined with `UNION ALL` (never the deduplicating `UNION`, which keeps one of two equal per-config rows and under-counts the head 035 builds under every config), and `DEPLOYMENT.md` SHALL give that multi-config form written out — and SHALL flag every candidate row whose vector carries no weight-`A` lexeme (a D-only row 031 left at the limit), because the head 035 rebuilds for such a row from title and aliases is not in its stored vector and the aliases rule is not expressible in that statement; the note SHALL say that a flagged D-only row must be shortened, or rewritten through the halving retreat by an edit or `make rebuild-tsvectors` on the current image, before upgrading; SHALL state that an abort under Kubernetes `Recreate` is downtime until the image digest is reverted; and SHALL state the remedy for a preflight abort or a 54000 failure: the database is still at 034, so serve the previous image, shorten the named note's body or tags so that its vector is smaller, let that image re-index it, and deploy again. `downgrade()` SHALL, under the index generation lock, set every vector that carries a weight-`B` lexeme to `ts_filter(content_tsvector, '{a,d}')`. Because an old-image process writing between 035's commit and its own replacement would write untagged vectors that 035 never revisits, the compose `make deploy` SHALL keep stopping the application container before `alembic upgrade head` whenever a migration is pending, and `DEPLOYMENT.md`'s 035 upgrade note SHALL state the order stop → migrate → start.
+
+#### Scenario: Upgrade adds the tags part to tagged rows only
+
+- **WHEN** a database at 034 holds a row headed by 031 whose `tags` are `["hoa"]`, an untagged row, and a row whose only tag is `the`, and it is upgraded to 035
+- **THEN** the tagged row SHALL hold `hoa` at weight `B`, its title and aliases lexemes at weight `A`, and the same body lexemes, weights and relative positions as before
+- **AND** the untagged row and the stop-word-tagged row SHALL be byte-equal to their values before the upgrade
+
+#### Scenario: A D-only row is re-headed byte-exactly
+
+- **WHEN** a row 031 left without a head (at the size limit then, within it now) carries tags and is upgraded to 035
+- **THEN** its vector SHALL be byte-equal to what the incremental writer produces for the same title, aliases, tags and body
+
+#### Scenario: Stamp-back re-runs change no vector twice
+
+- **WHEN** the schema gate stamps the database back to 034 and upgrades again
+- **THEN** every vector SHALL be byte-equal to its value after the first run
+
+#### Scenario: The stored fingerprint decides the configs
+
+- **WHEN** `indexer_state` records `fts_fingerprint` with `configs: ["simple"]` while the environment says `FTS_CONFIGS=english`
+- **THEN** the tags part SHALL be built under `simple`, and when the key is absent it SHALL be built under the environment's configs
+
+#### Scenario: An unreadable fingerprint refuses
+
+- **WHEN** `fts_fingerprint` holds a value that is not a JSON object with a known version
+- **THEN** 035 SHALL fail naming the key and change nothing
+
+#### Scenario: The preflight aborts on a near-limit row before writing anything
+
+- **WHEN** a 034 database holds a tagged row whose vector's data size is within 64 bytes of the 1,048,575-byte limit, and other tagged rows of ordinary size, and it is upgraded to 035
+- **THEN** 035 SHALL fail before its first UPDATE, naming one row and that row's id, `alembic_version` SHALL still read `034`, every vector SHALL be byte-equal to its value before the attempt, and `alembic check` SHALL report no new upgrade operations afterwards
+
+#### Scenario: The operator statement reports a D-only row the stored-vector estimate would pass
+
+- **WHEN** a 034 database holds a tagged row with no weight-`A` lexeme whose `S(content_tsvector) + S(tags part)` is within the margin but whose `S(ts_filter(content_tsvector, '{d}')) + S(head(title, aliases, tags))` exceeds it, and the `DEPLOYMENT.md` statement is run against it
+- **THEN** the statement SHALL report that row's id among the flagged rows, and upgrading that database to 035 SHALL abort in the preflight naming the same id
+
+#### Scenario: Every row the preflight rejects is flagged by the operator statement
+
+- **WHEN** a 034 database holds, besides the D-only row, a headed tagged row whose title and body share lexemes (stored once in the merged vector) and whose separately counted parts exceed the margin, and a row whose tag contains U+0002 between stop words (`the\x02a`, which `tags_text` reads as `thea`)
+- **AND** when it also holds a headed near-limit row with 128 tags `00000/x`…`00127/x` and 66 distinct 999-byte tags of the stop words `and` and `the` (Codex impl r2: a single concatenated document saturates positions and under-counts the expanded segments)
+- **THEN** every id the 035 preflight names SHALL be among the statement's flagged ids
+
+#### Scenario: The multi-config statement counts every config
+
+- **WHEN** the stored fingerprint names `english,simple`, and a headed near-limit row carries the tags `00000/x`…`00127/x` so that 035's preflight rejects it
+- **THEN** the documented multi-config statement (`UNION ALL`) SHALL flag it, and the same statement with `UNION` in place of `UNION ALL` would not
+
+#### Scenario: The preflight names every rejected row
+
+- **WHEN** fifty-one tagged rows each exceed the margin
+- **THEN** the refusal SHALL name the count fifty-one and all fifty-one ids, with no ellipsis
+
+#### Scenario: The preflight passes an ordinary database
+
+- **WHEN** every tagged row's estimate is within the margin
+- **THEN** the preflight SHALL write nothing and the rewrite SHALL proceed
+
+#### Scenario: A row at the size limit fails the whole migration
+
+- **WHEN** one tagged row's re-headed vector exceeds the 1 MiB tsvector limit although its estimate passed the preflight (the test bypasses the preflight)
+- **THEN** 035 SHALL fail naming that row's id and SQLSTATE 54000, `alembic_version` SHALL still read `034`, and every vector SHALL be byte-equal to its value before the attempt
+
+#### Scenario: Any other row error fails the whole migration
+
+- **WHEN** an UPDATE of one row fails with any other error
+- **THEN** 035 SHALL fail with nothing committed and `alembic_version` SHALL still read `034`
+
+#### Scenario: Downgrade strips the tags part
+
+- **WHEN** a downgrade to 034 runs against a database upgraded by 035
+- **THEN** no `content_tsvector` SHALL contain a weight-`B` lexeme, every weight-`A` and weight-`D` lexeme SHALL still be present, and a lexeme that was in both the tags and the body SHALL keep its body positions
+
+#### Scenario: The schema agrees with the model after the round trip
+
+- **WHEN** `alembic check` runs after upgrade to 035, and after a downgrade to 034 followed by upgrading again (`alembic check` cannot run at a non-head revision; 031's precedent)
+- **THEN** it SHALL report no new upgrade operations each time

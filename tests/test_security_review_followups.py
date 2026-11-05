@@ -31,7 +31,14 @@ async def test_full_text_search_clamps_limit(monkeypatch):
 
     await search.full_text_search(session, "needle", limit=10**9)
 
-    statement = session.execute.await_args.args[0]
+    # The conjunctive select is the first non-`SET LOCAL` statement (#344
+    # added the parse-text and snippet statements after it).
+    from sqlalchemy import Select
+
+    statement = next(
+        call.args[0] for call in session.execute.await_args_list
+        if isinstance(call.args[0], Select)
+    )
     assert statement._limit_clause.value == 500
 
 
@@ -44,7 +51,10 @@ async def test_semantic_search_clamps_before_overfetch(monkeypatch):
     # vector select, then — because the owner predicate makes every query
     # filtered (#127, D1a) — the zero-row exact re-run: one more `SET LOCAL`
     # and the identical statement.
-    session.execute.side_effect = [None, None, None, result, None, result]
+    # #355: a fresh session, so semantic_search opens its REPEATABLE READ,
+    # READ ONLY snapshot first.
+    session.in_transaction = MagicMock(return_value=False)
+    session.execute.side_effect = [None, None, None, None, result, None, result]
     monkeypatch.setattr(
         embeddings, "get_embedding", AsyncMock(return_value=[0.0] * 1024)
     )
@@ -54,7 +64,7 @@ async def test_semantic_search_clamps_before_overfetch(monkeypatch):
     statement = session.execute.await_args_list[-1].args[0]
     assert statement._limit_clause.value == 250
     # The re-run is the identical statement, so the clamp holds on both.
-    assert session.execute.await_args_list[3].args[0] is statement
+    assert session.execute.await_args_list[4].args[0] is statement
 
 
 class _Request:

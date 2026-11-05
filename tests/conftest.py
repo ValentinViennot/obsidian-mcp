@@ -21,6 +21,10 @@ if str(ROOT) not in sys.path:
 # asserts it still matches `Settings.model_fields`, so adding a setting without
 # adding it here is a test failure rather than a silent hole.
 SETTINGS_ENV_KEYS = (
+    "OIDC_ENABLED", "OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET",
+    "OIDC_REQUIRED_GROUP", "OIDC_SUBJECT_USER_IDS", "LOCAL_LOGIN_ENABLED",
+    # OIDC provider profile (#416).
+    "OIDC_TOKEN_AUTH_METHOD", "OIDC_EXTRA_SCOPES", "OIDC_DISPLAY_NAME", "OIDC_CA_FILE",
     "DATABASE_URL",
     # Superuser opt-out (#324).
     "DATABASE_ALLOW_SUPERUSER",
@@ -41,8 +45,15 @@ SETTINGS_ENV_KEYS = (
     # The scan's stat shortcut and its backstop (#282).
     "INDEX_STAT_SHORTCUT",
     "INDEX_FULL_HASH_INTERVAL_HOURS",
+    # The change feed (#351).
+    "CHANGE_FEED_RETENTION_DAYS",
+    "CHANGE_FEED_MAX_EVENTS_PER_SCOPE",
+    "CHANGE_FEED_MAX_EVENTS_PER_PASS",
+    "CHANGE_FEED_LOCK_TIMEOUT_MS",
     "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSIONS",
+    # Query-only instruction (#367, heading-chunks D7).
+    "EMBEDDING_QUERY_INSTRUCTION",
     "CHUNK_SIZE",
     "CHUNK_OVERLAP",
     "EMBED_CHUNK_BUDGET_PER_USER",
@@ -54,6 +65,12 @@ SETTINGS_ENV_KEYS = (
     "ALLOWED_ORIGINS",
     "ALLOWED_HOSTS",
     "FTS_CONFIGS",
+    "RANK_WEIGHTS",
+    "KEYWORD_EXCERPT_CHARS",
+    "KEYWORD_SNIPPET_ROWS",
+    "HYBRID_RRF_K",
+    # Search confidence (#389).
+    "SEARCH_LOW_CONFIDENCE_SIMILARITY",
     "EMBEDDING_PROVIDER",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
@@ -61,6 +78,12 @@ SETTINGS_ENV_KEYS = (
     # Embedding transport (#185).
     "EMBEDDING_ALLOW_PLAINTEXT",
     "EMBEDDING_CA_FILE",
+    # The optional reranker (#367).
+    "RERANK_URL",
+    "RERANK_MODEL",
+    "RERANK_TIMEOUT_MS",
+    "RERANK_MAX_DOCUMENTS",
+    "RERANK_ALLOW_PLAINTEXT",
     "MAX_FILE_READ_BYTES",
     "MAX_FILE_WRITE_BYTES",
     "MAX_READ_RESPONSE_CHARS",
@@ -99,6 +122,9 @@ SETTINGS_ENV_KEYS = (
     "OAUTH_KNOWN_REDIRECT_HOSTS",
     "OAUTH_CLIENT_UNUSED_EXPIRY_DAYS",
     "OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS",
+    "OAUTH_CIMD_ENABLED",
+    "OAUTH_CIMD_CACHE_MAX_SECONDS",
+    "OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE",
     "MCP_CONCURRENCY_MODE",
     "MCP_CONCURRENCY_WAIT_SECONDS",
     "MCP_CONCURRENCY_TRANSPORT_WAIT_SECONDS",
@@ -504,3 +530,47 @@ def _reset_indexer_scan_state():
     if indexer is not None:
         indexer._last_full_hash.clear()
         indexer.clear_sweep_state()
+
+
+#: Offline modules that exercise the change feed's own behaviour and must see
+#: the real helpers (they open no database session).
+_CHANGE_FEED_REAL = {"test_change_feed_offline.py", "test_note_hash.py"}
+
+
+@pytest.fixture(autouse=True)
+def _offline_change_feed(request):
+    """Stub the change feed's database writers in the offline suite (#351).
+
+    The offline suite's fake sessions model the database only as far as each
+    module's own contract needs; the feed's statements (the advisory lock, the
+    event INSERT, the purges) would fail against them and turn every
+    `move_note` into a "DB update failed" partial outcome. Those statements are
+    pinned against real PostgreSQL in `tests/integration/test_change_feed_pg.py`,
+    which this fixture leaves untouched.
+
+    Patched by hand rather than through `monkeypatch`: requesting that fixture
+    here would set it up ahead of every other autouse fixture and so undo the
+    test's own patches only after their teardowns had run.
+    """
+    path = Path(str(request.node.fspath))
+    if "integration" in path.parts or path.name in _CHANGE_FEED_REAL:
+        yield
+        return
+    from src.services import change_feed
+
+    async def _append(*_a, **_k):
+        return 0
+
+    async def _none(*_a, **_k):
+        return None
+
+    stubs = {"append_events": _append, "discard_scope": _none,
+             "purge_scope": _none, "record_tool_events": _none, "prune": _none}
+    saved = {name: getattr(change_feed, name) for name in stubs}
+    for name, stub in stubs.items():
+        setattr(change_feed, name, stub)
+    try:
+        yield
+    finally:
+        for name, real in saved.items():
+            setattr(change_feed, name, real)

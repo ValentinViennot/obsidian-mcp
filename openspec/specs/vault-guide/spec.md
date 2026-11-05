@@ -1,7 +1,8 @@
 # vault-guide Specification
 
 ## Purpose
-TBD - created by archiving change vault-guide-with-primer. Update Purpose after archive.
+What `get_vault_guide` serves: the shared Obsidian primer and the vault's own `CLAUDE.md`, the primer's neutral framing rules, and its pointers to the tools that answer common agent questions — `list_tasks` for checkbox tasks and (#351) `get_changes` with a stored `next_since` cursor for what changed since the last session.
+
 ## Requirements
 ### Requirement: Tool name and registration
 
@@ -60,13 +61,20 @@ When `CLAUDE.md` does not exist at the vault root, the tool SHALL include a shor
 
 ### Requirement: Other tools reference the guide neutrally
 
-MCP tool docstrings on peer tools (e.g., `create_note`, `edit_note`) SHALL NOT instruct the agent to call `get_vault_guide` first using compelling language such as "MUST", "IMPORTANT: Call …first", or equivalent. References to `get_vault_guide` in peer-tool docstrings SHALL use neutral framing such as "see `get_vault_guide` for vault conventions".
+MCP tool docstrings on peer tools (e.g., `create_note`, `edit_note`) and the server's `instructions` SHALL NOT instruct the agent to call `get_vault_guide` first using compelling language such as "MUST", "IMPORTANT: Call …first", or equivalent. References to `get_vault_guide` in peer-tool docstrings and in the server instructions SHALL use neutral framing such as "see `get_vault_guide` for vault conventions" or "`get_vault_guide` describes this vault's conventions; one call per session is enough".
 
 #### Scenario: Peer-tool docstrings use neutral framing
 
 - **WHEN** the docstring of a peer write tool (e.g., `create_note`) is inspected
 - **THEN** the docstring SHALL NOT contain the phrase "MUST call" or "IMPORTANT: Call … first" in reference to `get_vault_guide`
 - **AND** if the docstring mentions `get_vault_guide`, it SHALL frame the reference as informational ("see", "for context", "describes")
+
+#### Scenario: The server instructions use neutral framing
+
+- **WHEN** the server's `instructions` are inspected
+- **THEN** they SHALL mention `get_vault_guide`
+- **AND** SHALL NOT contain "MUST call" or "IMPORTANT" in reference to it
+- **AND** SHALL frame the once-per-session advice as sufficiency ("one call per session is enough"), not as an order
 
 ### Requirement: Usage logging records the new tool name
 
@@ -97,3 +105,29 @@ The guide returned by `get_vault_guide` SHALL reference the raw file-access tool
 - **WHEN** `get_vault_guide` is invoked
 - **THEN** the response SHALL mention `request_upload`, `check_upload`, `request_download`, and `import_from_url` and the upload-link flow in one short paragraph
 
+### Requirement: Guide points at `list_tasks` for task queries
+
+The primer returned by `get_vault_guide` SHALL state, in its Tasks section and in neutral framing, that `list_tasks` lists checkbox tasks across the vault (open, done or cancelled, with Tasks-plugin dates) from the index without reading notes, and that Tasks-plugin query blocks are literal text this server does not evaluate. The server instructions SHALL name `list_tasks` in one sentence outside the 512-character lead, and SHALL stay within the 2,000-character cap.
+
+#### Scenario: The primer names list_tasks
+
+- **WHEN** `get_vault_guide` is invoked
+- **THEN** the primer's Tasks section SHALL mention `list_tasks` and SHALL say that query blocks are not evaluated
+- **AND** the wording SHALL NOT use "MUST", "IMPORTANT" or an equivalent imperative to rank it above other tools
+
+#### Scenario: The instructions name list_tasks within their caps
+
+- **WHEN** the server's `instructions` are inspected
+- **THEN** they SHALL contain `list_tasks`, the first 512 characters SHALL be unchanged by this change, and the total SHALL be at most 2,000 characters
+
+### Requirement: The guide SHALL describe the change-feed cursor convention in neutral framing
+The served primer SHALL contain one line that names `get_changes`, says that `get_changes(since=<stored cursor>)` lists what changed in the vault since the cursor, and says to store the returned `next_since` in the agent's own notes for the next session, and SHALL point to `order_by="content_changed"` with `since` on `get_recent` / `list_notes` for notes whose content changed. The line SHALL use the neutral framing the other guide references use. It SHALL NOT contain "MUST", "IMPORTANT" or an imperative to call the tool before any other.
+
+#### Scenario: The guide mentions the feed
+- **WHEN** `get_vault_guide` is invoked
+- **THEN** the primer SHALL mention `get_changes`, `next_since` and `order_by="content_changed"`
+- **AND** the primer section SHALL remain byte-identical between a vault with `CLAUDE.md` and one without
+
+#### Scenario: Neutral framing
+- **WHEN** the primer line naming `get_changes` is inspected
+- **THEN** it SHALL NOT contain "MUST", "IMPORTANT" or "call … first"

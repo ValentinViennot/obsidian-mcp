@@ -409,8 +409,8 @@ _CORPUS = [
 ]
 
 
-def test_the_extraction_version_is_three():
-    assert indexer.CURRENT_EXTRACTION_VERSION == 4
+def test_the_extraction_version_is_five():
+    assert indexer.CURRENT_EXTRACTION_VERSION == 5
 
 
 def test_version_two_cleans_identically_to_version_one():

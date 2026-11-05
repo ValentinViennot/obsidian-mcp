@@ -1,0 +1,733 @@
+[
+ {
+  "inputSchema": {
+   "additionalProperties": false,
+   "properties": {
+    "include_relationships": {
+     "default": false,
+     "title": "Include Relationships",
+     "type": "boolean"
+    },
+    "limit": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Limit"
+    },
+    "offset": {
+     "default": 0,
+     "title": "Offset",
+     "type": "integer"
+    },
+    "path": {
+     "title": "Path",
+     "type": "string"
+    },
+    "relationship_limit": {
+     "default": 10,
+     "title": "Relationship Limit",
+     "type": "integer"
+    },
+    "section": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Section"
+    }
+   },
+   "required": [
+    "path"
+   ],
+   "title": "read_noteArguments",
+   "type": "object"
+  },
+  "name": "read_note",
+  "outputSchema": {
+   "$defs": {
+    "MetadataCoercion": {
+     "description": "One metadata value this response rendered in a canonicalized form.\n\nServer-authored, every field of it, exactly as `MetadataOmission` is: the\nchannel is out of band precisely so that nothing has to be signalled inside\nthe note-controlled field itself.",
+     "properties": {
+      "detail": {
+       "title": "Detail",
+       "type": "string"
+      },
+      "field": {
+       "title": "Field",
+       "type": "string"
+      },
+      "reason": {
+       "title": "Reason",
+       "type": "string"
+      }
+     },
+     "required": [
+      "field",
+      "reason",
+      "detail"
+     ],
+     "title": "MetadataCoercion",
+     "type": "object"
+    },
+    "MetadataOmission": {
+     "description": "One metadata field this response could not carry, and why.\n\nServer-authored, every field of it. This is the *only* channel that reports\na dropped field: nothing is ever signalled by writing a marker into the\nnote-controlled field itself.",
+     "properties": {
+      "detail": {
+       "title": "Detail",
+       "type": "string"
+      },
+      "field": {
+       "title": "Field",
+       "type": "string"
+      },
+      "reason": {
+       "title": "Reason",
+       "type": "string"
+      }
+     },
+     "required": [
+      "field",
+      "reason",
+      "detail"
+     ],
+     "title": "MetadataOmission",
+     "type": "object"
+    },
+    "NoteOutline": {
+     "description": "The outline, with its degraded states as data rather than as prose.\n\n`truncated` is the explicit marker the requirement asks for: when the\nbudget cannot hold even one entry, `entries` is empty and `truncated` is\ntrue, which is a statement, not a silence. `omitted`, `first_ordinal` and\n`last_ordinal` are present exactly when the listing is incomplete — a\ncomplete listing carries no omission summary, so nothing has to be reserved\nfor one.",
+     "properties": {
+      "entries": {
+       "default": [],
+       "items": {
+        "$ref": "#/$defs/OutlineEntry"
+       },
+       "title": "Entries",
+       "type": "array"
+      },
+      "first_ordinal": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "First Ordinal"
+      },
+      "last_ordinal": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Last Ordinal"
+      },
+      "omitted": {
+       "anyOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Omitted"
+      },
+      "truncated": {
+       "default": false,
+       "title": "Truncated",
+       "type": "boolean"
+      }
+     },
+     "title": "NoteOutline",
+     "type": "object"
+    },
+    "OutlineEntry": {
+     "description": "One section of a truncated whole-note read's heading outline.",
+     "properties": {
+      "depth": {
+       "title": "Depth",
+       "type": "integer"
+      },
+      "duplicate": {
+       "title": "Duplicate",
+       "type": "boolean"
+      },
+      "exceeds_cap": {
+       "title": "Exceeds Cap",
+       "type": "boolean"
+      },
+      "ordinal": {
+       "title": "Ordinal",
+       "type": "integer"
+      },
+      "size": {
+       "title": "Size",
+       "type": "integer"
+      },
+      "text": {
+       "title": "Text",
+       "type": "string"
+      }
+     },
+     "required": [
+      "ordinal",
+      "depth",
+      "text",
+      "size",
+      "exceeds_cap",
+      "duplicate"
+     ],
+     "title": "OutlineEntry",
+     "type": "object"
+    },
+    "RelatedNote": {
+     "properties": {
+      "path": {
+       "title": "Path",
+       "type": "string"
+      },
+      "title": {
+       "title": "Title",
+       "type": "string"
+      }
+     },
+     "required": [
+      "path",
+      "title"
+     ],
+     "title": "RelatedNote",
+     "type": "object"
+    },
+    "RelationshipContext": {
+     "properties": {
+      "backlinks": {
+       "default": [],
+       "items": {
+        "$ref": "#/$defs/RelatedNote"
+       },
+       "title": "Backlinks",
+       "type": "array"
+      },
+      "backlinks_has_more": {
+       "anyOf": [
+        {
+         "const": true,
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Backlinks Has More"
+      },
+      "basis": {
+       "const": "indexed_snapshot",
+       "default": "indexed_snapshot",
+       "title": "Basis",
+       "type": "string"
+      },
+      "completeness": {
+       "const": "indexed_only",
+       "default": "indexed_only",
+       "title": "Completeness",
+       "type": "string"
+      },
+      "extraction_truncated": {
+       "anyOf": [
+        {
+         "const": true,
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Extraction Truncated"
+      },
+      "note_status": {
+       "enum": [
+        "matches_read",
+        "stale",
+        "unindexed"
+       ],
+       "title": "Note Status",
+       "type": "string"
+      },
+      "outgoing": {
+       "default": [],
+       "items": {
+        "$ref": "#/$defs/RelatedNote"
+       },
+       "title": "Outgoing",
+       "type": "array"
+      },
+      "outgoing_has_more": {
+       "anyOf": [
+        {
+         "const": true,
+         "type": "boolean"
+        },
+        {
+         "type": "null"
+        }
+       ],
+       "default": null,
+       "title": "Outgoing Has More"
+      }
+     },
+     "required": [
+      "note_status"
+     ],
+     "title": "RelationshipContext",
+     "type": "object"
+    }
+   },
+   "description": "What `read_note` returns.\n\nEvery field is either server-controlled or a note-controlled value sitting\nalone in a field of its own. Nothing here is composed into a frame, so\nnothing note-controlled can change which field another value appears in —\nthat is the whole point (#149).\n\nOn an error result the content-bearing fields are absent: `error` is the\nanswer, and a caller must never find a half-response beside it.",
+   "properties": {
+    "content": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Content"
+    },
+    "content_hash": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Content Hash"
+    },
+    "error": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Error"
+    },
+    "frontmatter": {
+     "anyOf": [
+      {
+       "additionalProperties": true,
+       "type": "object"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Frontmatter"
+    },
+    "frontmatter_yaml": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Frontmatter Yaml"
+    },
+    "heading": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Heading"
+    },
+    "metadata_coercions": {
+     "anyOf": [
+      {
+       "items": {
+        "$ref": "#/$defs/MetadataCoercion"
+       },
+       "type": "array"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Metadata Coercions"
+    },
+    "metadata_omissions": {
+     "anyOf": [
+      {
+       "items": {
+        "$ref": "#/$defs/MetadataOmission"
+       },
+       "type": "array"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Metadata Omissions"
+    },
+    "next_offset": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Next Offset"
+    },
+    "notice": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Notice"
+    },
+    "offset": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Offset"
+    },
+    "outline": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/NoteOutline"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null
+    },
+    "path": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Path"
+    },
+    "relationships": {
+     "anyOf": [
+      {
+       "$ref": "#/$defs/RelationshipContext"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null
+    },
+    "response_omissions": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Response Omissions"
+    },
+    "tags": {
+     "anyOf": [
+      {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Tags"
+    },
+    "title": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Title"
+    },
+    "total_chars": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Total Chars"
+    },
+    "truncated": {
+     "anyOf": [
+      {
+       "type": "boolean"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Truncated"
+    }
+   },
+   "title": "ReadNoteResult",
+   "type": "object"
+  }
+ },
+ {
+  "inputSchema": {
+   "additionalProperties": false,
+   "properties": {
+    "include_primer": {
+     "default": true,
+     "title": "Include Primer",
+     "type": "boolean"
+    }
+   },
+   "title": "get_vault_guideArguments",
+   "type": "object"
+  },
+  "name": "get_vault_guide",
+  "outputSchema": {
+   "properties": {
+    "result": {
+     "title": "Result",
+     "type": "string"
+    }
+   },
+   "required": [
+    "result"
+   ],
+   "title": "get_vault_guideOutput",
+   "type": "object"
+  }
+ },
+ {
+  "inputSchema": {
+   "additionalProperties": false,
+   "properties": {
+    "limit": {
+     "default": 50,
+     "title": "Limit",
+     "type": "integer"
+    },
+    "path": {
+     "title": "Path",
+     "type": "string"
+    }
+   },
+   "required": [
+    "path"
+   ],
+   "title": "note_historyArguments",
+   "type": "object"
+  },
+  "name": "note_history",
+  "outputSchema": {
+   "properties": {
+    "result": {
+     "title": "Result",
+     "type": "string"
+    }
+   },
+   "required": [
+    "result"
+   ],
+   "title": "note_historyOutput",
+   "type": "object"
+  }
+ },
+ {
+  "inputSchema": {
+   "additionalProperties": false,
+   "properties": {
+    "end_line": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "End Line"
+    },
+    "path": {
+     "title": "Path",
+     "type": "string"
+    },
+    "section": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Section"
+    },
+    "start_line": {
+     "anyOf": [
+      {
+       "type": "integer"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Start Line"
+    }
+   },
+   "required": [
+    "path"
+   ],
+   "title": "note_blameArguments",
+   "type": "object"
+  },
+  "name": "note_blame",
+  "outputSchema": {
+   "properties": {
+    "result": {
+     "title": "Result",
+     "type": "string"
+    }
+   },
+   "required": [
+    "result"
+   ],
+   "title": "note_blameOutput",
+   "type": "object"
+  }
+ },
+ {
+  "inputSchema": {
+   "additionalProperties": false,
+   "properties": {
+    "limit": {
+     "default": 20,
+     "title": "Limit",
+     "type": "integer"
+    },
+    "path": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "null"
+      }
+     ],
+     "default": null,
+     "title": "Path"
+    },
+    "regex": {
+     "default": false,
+     "title": "Regex",
+     "type": "boolean"
+    },
+    "text": {
+     "title": "Text",
+     "type": "string"
+    }
+   },
+   "required": [
+    "text"
+   ],
+   "title": "find_when_writtenArguments",
+   "type": "object"
+  },
+  "name": "find_when_written",
+  "outputSchema": {
+   "properties": {
+    "result": {
+     "title": "Result",
+     "type": "string"
+    }
+   },
+   "required": [
+    "result"
+   ],
+   "title": "find_when_writtenOutput",
+   "type": "object"
+  }
+ }
+]

@@ -315,3 +315,22 @@ async def test_query_embedding_refuses_wrong_vector_cardinality_without_retry(ol
         with pytest.raises(ProviderBatchSizeMismatch, match=f'{count} vectors for 1 input'):
             await provider.embed_one('a query')
         assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["query", "document"])
+async def test_batch_fallback_preserves_embedding_kind(monkeypatch, kind):
+    provider = OllamaProvider()
+    seen = []
+
+    async def fail_batch(_inputs):
+        raise ConnectError("synthetic batch failure")
+
+    async def one(text, *, kind):
+        seen.append((text, kind))
+        return [0.1]
+
+    monkeypatch.setattr(provider, "_embed_inputs", fail_batch)
+    monkeypatch.setattr(provider, "embed_one", one)
+    assert await provider.embed_batch(["a", "b"], kind=kind) == [[0.1], [0.1]]
+    assert seen == [("a", kind), ("b", kind)]

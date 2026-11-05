@@ -71,6 +71,7 @@ from src.services import vault as vault_service
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.fts import combined_tsquery, index_tsvector_sql
+from src.services.fts import tags_text as fts_tags_text
 from src.services.search import full_text_search
 from test_search_recall import (
     _as_authenticated_request,
@@ -240,7 +241,7 @@ async def corpus(sessionmaker, queries):
         None,
     ))
 
-    fragment, cfg_params = index_tsvector_sql()
+    fragment, cfg_params = index_tsvector_sql(tags_bind="tags_text")
     async with sessionmaker() as session:
         notes = []
         for path, _vecs, attrs, _body in pending:
@@ -268,9 +269,16 @@ async def corpus(sessionmaker, queries):
         tsv = text(
             f"UPDATE notes_metadata SET content_tsvector = {fragment} WHERE id = :id"
         )
-        for path, _vecs, _attrs, body in pending:
+        for path, _vecs, row_attrs, body in pending:
             if body is not None:
-                await session.execute(tsv, {"id": ids[path], "content": body, **cfg_params})
+                # The title rides in the vector at weight A (#344), so the
+                # corpus has title-matched rows for the oracle to exempt.
+                await session.execute(tsv, {
+                    "id": ids[path], "content": body,
+                    "title": path.rsplit("/", 1)[-1].removesuffix(".md"),
+                    "aliases": "",
+                    "tags_text": fts_tags_text(row_attrs.get("tags")), **cfg_params,
+                })
 
         # Links for `get_neighborhood` and `find_orphans`: a chain over every
         # third `B/` note, and a star around B/note-0003. `N/`, `T/`, `E/` and
@@ -309,7 +317,7 @@ def embed_as(monkeypatch):
     """Make `get_embedding` return a chosen vector, for old and new alike."""
     state = {"vec": None}
 
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return state["vec"]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
@@ -430,7 +438,14 @@ async def _old_get_recent(sessionmaker, uid, limit=20, folder=None, tags=None,
         return "No recent notes found"
     lines = [f"Last {len(notes)} modified notes:\n"]
     for n in notes:
-        mod = n.modified_at.strftime("%Y-%m-%d %H:%M") if n.modified_at else "unknown"
+        # The one deliberate render change since the projection (#280): the
+        # time is converted to UTC and labelled (utc-time-fixes). The query —
+        # what this reference pins — is the pre-change body verbatim.
+        mod = (
+            n.modified_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if n.modified_at
+            else "unknown"
+        )
         tags_str = f" [{', '.join(n.tags)}]" if n.tags else ""
         lines.append(f"- `{n.file_path}` — {n.title}{tags_str} (modified {mod})")
     return "\n".join(lines)
@@ -775,9 +790,21 @@ async def _semantic_pair(sessionmaker, embed_as, vec, **kw):
     token = timing.begin()
     try:
         async with sessionmaker() as session:
+            # #355: semantic_search requires its REPEATABLE READ, READ ONLY
+            # snapshot; this test opens the transaction, so it opens it so.
+            await session.execute(text(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
             await session.execute(text("SET LOCAL enable_indexscan = off"))
             new = await semantic_search(session, "q", **kw)
         new_fb = timing.current()["exact_fallback"]
+        # #355 adds `section` and hands the renderer the uncut chunk; the old
+        # arm predates both. Project the new result back onto the old shape so
+        # this stays a test of #280's projection identity.
+        new = [
+            {**{k: v for k, v in r.items() if k != "section"},
+             "chunk": None if r["chunk"] is None else r["chunk"][:500]}
+            for r in new
+        ]
     finally:
         timing.clear(token)
     return old, new, old_fb, new_fb
@@ -848,6 +875,12 @@ KEYWORD_QUERIES = ["meeting", "roadmap budget", "vault", "sprint planner", "noth
 
 @pytest.mark.parametrize("limit", [5, 20, 200])
 async def test_keyword_search_is_identical(sessionmaker, corpus, limit):
+    """The keyword oracle, re-scoped by #344 (design D8): the ranking change
+    is intended, so what is asserted is what is invariant — the conjunctive
+    membership (`@@` and the filters did not change) and the relative order
+    among body-only matches — while rank *values* and the position of any
+    title-matched row are exempt. The `any` block has no pre-change
+    counterpart and is outside the oracle."""
     bob = corpus["bob"]
     cases = {
         "user_scope": {"user_id": bob},
@@ -856,21 +889,42 @@ async def test_keyword_search_is_identical(sessionmaker, corpus, limit):
         "frontmatter": {"frontmatter": {"status": "open"}, "user_id": bob},
         "ownerless": {},
     }
-    cutoff_tie_seen = False
+    body_only_compared = 0
     for q in KEYWORD_QUERIES:
         for name, kw in cases.items():
             async with sessionmaker() as session:
-                old = await _old_full_text_search(session, q, limit=limit, **kw)
+                old = await _old_full_text_search(session, q, limit=500, **kw)
             async with sessionmaker() as session:
                 new = await full_text_search(session, q, limit=limit, **kw)
-            _assert_identical(
-                old, new, ident=lambda r: r["path"], key=lambda r: r["rank"],
-                limit=limit, same_item=lambda o, n: _fields_equal(o, n),
-            )
-            if len(new) == limit and len(new) > 1 and new[-1]["rank"] == new[-2]["rank"]:
-                cutoff_tie_seen = True
-    if limit < 200:
-        assert cutoff_tie_seen, "the corpus must put a rank tie at the cutoff"
+            new_all = [r for r in new if r["match"] == "all"]
+            # (a) conjunctive membership, where the limit cuts neither list.
+            if len(old) < limit:
+                assert {r["path"] for r in new_all} == {r["path"] for r in old}, (q, name)
+            else:
+                assert {r["path"] for r in new_all} <= {r["path"] for r in old}, (q, name)
+            # Every rendered field but rank is byte-equal per path.
+            by_old = {r["path"]: r for r in old}
+            for r in new_all:
+                _fields_equal(
+                    by_old[r["path"]], r,
+                    except_=("rank", "match", "snippet", "head", "matched_in",
+                             "matched_terms", "has_excerpt"),
+                )
+            # (b) body-only relative order equals the oracle's, up to ties.
+            body_only = [r for r in new_all if r.get("matched_in") == ["body"]]
+            if len(body_only) > 1:
+                old_order = [r["path"] for r in old if r["path"] in {b["path"] for b in body_only}]
+                old_rank = {r["path"]: r["rank"] for r in old}
+                positions = {p: i for i, p in enumerate(old_order)}
+                for earlier, later in zip(body_only, body_only[1:]):
+                    body_only_compared += 1
+                    # Ties are the permitted exception (order among equal
+                    # keys); across distinct oracle ranks the order must hold.
+                    if old_rank[earlier["path"]] != old_rank[later["path"]]:
+                        assert positions[earlier["path"]] < positions[later["path"]], (
+                            q, name, earlier["path"], later["path"]
+                        )
+    assert body_only_compared > 0, "the corpus must have body-only matches to compare"
 
 
 # ── list_notes / get_recent ─────────────────────────────────────────────────

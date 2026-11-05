@@ -187,6 +187,7 @@ def install(monkeypatch, db: FakeIndexDB, vault):
     monkeypatch.setattr(indexer, "acquire_generation_lock_unbounded", _noop)
     monkeypatch.setattr(indexer, "_assert_fts_generation_current", _noop)
     monkeypatch.setattr(indexer, "_update_links_for_changed", _noop)
+    monkeypatch.setattr(indexer, "_update_tasks_for_changed", _noop)
     monkeypatch.setattr(indexer, "write_tsvector_bounded", _noop)
     monkeypatch.setattr(indexer.settings, "index_stat_shortcut", True, raising=False)
 

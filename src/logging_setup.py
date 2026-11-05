@@ -72,6 +72,7 @@ import logging
 import sys
 import traceback
 from dataclasses import dataclass
+from urllib.parse import unquote
 
 # ── Bounds ──────────────────────────────────────────────────────────────────
 
@@ -122,6 +123,8 @@ EMITTER_CONTROL: frozenset[str] = frozenset(
 ALLOWED_FIELDS: dict[str, _FieldSpec] = {
     "reason": _S(str, 64),
     "outcome": _S(str, 16),
+    # `panel_oidc_link_set`'s closed `expect` / `bind` (#416 D14).
+    "mode": _S(str, 8),
     "route": _S(str, 200),
     "method": _S(str, 8),
     "status": _S(int),
@@ -170,6 +173,17 @@ ALLOWED_FIELDS: dict[str, _FieldSpec] = {
     "window_seconds": _S(int),
     "duration_ms": _S(int),
     "cleared_user_id": _S(bool),
+    # ── Client ID Metadata Documents and RFC 8707 (#357) ──
+    # Server-derived values, a provenance class of their own: computed from a
+    # parsed request value, neither read from a row nor caller text verbatim.
+    # None is ever a suppression subject. A CIMD client_id URL is never logged
+    # (it may carry anything); `cimd_host` and the 16-hex `cimd_ref` (SHA-256
+    # prefix of the submitted value) stand in for it.
+    "registration_kind": _S(str, 8),
+    "cimd_host": _S(str, 253),
+    "cimd_ref": _S(str, 16),
+    "resource_class": _S(str, 32),
+    "resource_host": _S(str, 253),
 }
 
 #: Sentinel for "this value did not survive its type check".
@@ -356,6 +370,16 @@ def installed_stream_handler() -> logging.Handler | None:
     return None
 
 
+class OIDCCallbackAccessFilter(logging.Filter):
+    """Uvicorn's access logger must never persist provider callback credentials."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple) and len(record.args) == 5:
+            client, method, target, version, status = record.args
+            if isinstance(target, str) and unquote(target.split("?", 1)[0]).rstrip("/") == "/admin/auth/oidc/callback":
+                record.args = (client, method, target.split("?", 1)[0], version, status)
+        return True
+
+
 def configure_logging(
     level: int | str | None = None, fmt: str | None = None
 ) -> logging.Handler | None:
@@ -376,6 +400,11 @@ def configure_logging(
         resolved_level = level if level is not None else settings.log_level
         resolved_fmt = fmt if fmt is not None else settings.log_format
 
+        access = logging.getLogger("uvicorn.access")
+        if not any(isinstance(f, OIDCCallbackAccessFilter) for f in access.filters):
+            access.addFilter(OIDCCallbackAccessFilter())
+        logging.getLogger("httpx2").setLevel(logging.WARNING)
+        logging.getLogger("httpcore2").setLevel(logging.WARNING)
         root = logging.getLogger()
         exempt = error_log.installed_handler()
         for handler in list(root.handlers):

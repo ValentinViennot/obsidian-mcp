@@ -74,12 +74,19 @@ async def run_async_migrations():
         validate_database_url_transport,
     )
 
+    from src.services.db_session import SESSION_TIMEZONE_SETTINGS
+
     url = get_url()
     validate_database_url_transport(url, settings.database_ssl_mode)
     connectable = create_async_engine(
         url,
         poolclass=pool.NullPool,
-        connect_args=database_ssl_connect_args(settings),
+        connect_args={
+            # The same session TimeZone as the application engine, so a data
+            # migration's `now()` / `date_trunc` means what the app means.
+            "server_settings": dict(SESSION_TIMEZONE_SETTINGS),
+            **database_ssl_connect_args(settings),
+        },
     )
     if settings.database_ssl_mode in STRICT_DB_MODES:
         install_strict_transport_listener(connectable)

@@ -714,7 +714,7 @@ class _UsagePageSession:
                      oauth_client_name=None, requests=1, last_seen=None),
             ])
         if "date_trunc" in sql:
-            return _PageResult([_Row(bucket=_Stamp(), cnt=12)])
+            return _PageResult([_Row(bucket=_dt.datetime(2026, 8, 29, 10, 0, tzinfo=_dt.timezone.utc), cnt=12)])
         return _PageResult([
             _Row(id=1, tool="read_note", duration_ms=12, created_at=_Stamp(),
                  actor_kind="api_key", actor_label="nightly",

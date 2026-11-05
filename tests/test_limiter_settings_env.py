@@ -84,7 +84,7 @@ def test_the_other_controls_still_apply_when_one_is_disabled(tmp_path):
         {"MCP_RATE_LIMIT_PER_MINUTE": "", "MCP_RATE_LIMIT_BURST": ""},
     )
     assert loaded.mcp_rate_limit_per_minute is None
-    assert loaded.mcp_write_rate_limit_per_minute == 60
+    assert loaded.mcp_write_rate_limit_per_minute == 120
     assert loaded.mcp_auth_failure_limit == 60
     assert loaded.default_daily_request_limit == 5000
 

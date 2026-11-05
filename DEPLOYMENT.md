@@ -13,7 +13,9 @@ together:
 3. Vault sync. Getting your Obsidian vault onto the VPS and keeping it
    in sync with your local edits. Nextcloud is the recommended path.
 4. Embeddings. OpenAI API for VPS deployments without GPUs (Ollama on
-   a CPU-only VPS is too slow to be usable).
+   a CPU-only VPS is too slow to be usable). With a GPU, Ollama runs
+   `bge-m3` (the default) or `qwen3-embedding:0.6b` (the reference
+   deployment's model); see the README's "Embedding model choice".
 5. TLS and reverse proxy. Caddy for the simplest path, Traefik if you
    already run it, or your own external proxy (Nginx Proxy Manager,
    nginx, …) if you already terminate TLS elsewhere.
@@ -703,7 +705,7 @@ docker compose exec postgres \
 ```
 
 You should see the tables: `api_keys`, `notes_metadata`,
-`note_embeddings`, `note_links`, `oauth_clients`,
+`note_embeddings`, `note_links`, `note_tasks`, `oauth_clients`,
 `oauth_codes`, `oauth_tokens`, `transfer_tokens`, `usage_logs`,
 `users`, plus `alembic_version`, all owned by `obsidian_mcp`, and
 `obsidian_mcp` listed with no attributes beyond login (in particular,
@@ -896,12 +898,81 @@ deployment; on a compose-file deployment the equivalents are plain
   failing indexer stays invisible (#308: 8.5 days of failed passes
   under a `200 ok`). The body carries counts only; the offending path
   is in the log and on `/admin/health`.
-- **Upgrades.** Check the upgrade note at the top of this guide first,
-  then pull, rebuild, and bring the stack up again; migrations
-  run on start. After a release that carries one, confirm the schema
-  agrees with the models:
+- **Upgrades.** Check the upgrade notes below first, then pull and
+  rebuild. **When the release carries a migration, stop the app before
+  migrating and start it after** —
+  `docker compose stop obsidian-mcp`, then
+  `docker compose run --rm obsidian-mcp alembic upgrade head`,
+  then `up -d` (the Makefile's `make deploy` does this by itself when
+  `alembic current` is behind `alembic heads`). A migration that rewrites
+  rows in place — 031 below and 035 are two — must not race an old-image process
+  that still writes them. After a release that carries one, confirm the
+  schema agrees with the models:
   `docker compose exec obsidian-mcp alembic check`
   should print "No new upgrade operations detected."
+
+  **Upgrading to `hybrid_search` (#354).** No migration and nothing
+  re-derived or re-embedded. The release adds a 28th tool, `hybrid_search`,
+  and one optional setting, `HYBRID_RRF_K` (default 60, 1–1000; an
+  out-of-range value refuses to start). `hybrid_search` joins the
+  `embedding` concurrency class beside `semantic_search`, so
+  `CLASS_MAPPING_VERSION` moves to 5 and starts a new readiness epoch for
+  `make concurrency-report`. The panel's search-analytics page gains a
+  `hybrid_search` query table. Rollback is a redeploy of the previous image:
+  the tool disappears from the listing, its usage rows stay (harmless), and
+  the mapping version moving back starts another epoch.
+
+  **Upgrading across migration 033 (change feed, #351).** 033 adds
+  `notes_metadata.content_changed_at`, backfilled in one UPDATE from each
+  note's `modified_at` (or `indexed_at` where that is NULL), and three
+  change-feed tables. Nothing is re-embedded and nothing is re-derived:
+  the extraction version stays 4. The feed starts with the first pass
+  after the upgrade, and nothing before 033 has events. The three feed
+  tables are **durable** and are dumped with their rows by `make db-backup`
+  and the Kubernetes backup Job. `get_changes` joins the `scan`
+  concurrency class, so `CLASS_MAPPING_VERSION` moves to 4 and starts a new
+  readiness epoch. There are four new settings, all with working defaults:
+  `CHANGE_FEED_RETENTION_DAYS`, `CHANGE_FEED_MAX_EVENTS_PER_SCOPE`,
+  `CHANGE_FEED_MAX_EVENTS_PER_PASS` and `CHANGE_FEED_LOCK_TIMEOUT_MS`
+  (README, Configuration). Rollback: the previous image reads none of these
+  objects, and `alembic downgrade 032` drops them, losing only the feed
+  history.
+
+  **Upgrading across migration 032 (task listing, #350).** 032 adds the
+  `note_tasks` table and two `notes_metadata` bits; it writes no row. The
+  extraction version moves to 4, so the first pass after the upgrade
+  re-derives every note once (the startup full-hash pass) and stores its
+  checkbox tasks for `list_tasks`. Nothing is re-embedded: version 4
+  shares version 3's embedding cleaner. Until that pass finishes,
+  `list_tasks` counts the notes not yet scanned in its header and
+  `move_note(rewrite_links=True)` returns `index_not_ready`. `list_tasks`
+  joins the `scan` concurrency class, so `CLASS_MAPPING_VERSION` moves to
+  3 and starts a new readiness epoch: `make concurrency-report` evidence
+  from before the upgrade does not carry over. **Rollback is
+  roll-forward:** a bare redeploy of the previous image re-extracts every
+  note and, having no version-4 cleaner, clears every note's embedding
+  certification; its embed pass then re-chunks every note and reuses every
+  stored vector (#281), so no provider calls are made, while
+  `semantic_search` marks those notes stale until it catches up. Rolling
+  forward again is one more re-derive. No new setting.
+
+  **Upgrading across migration 031 (keyword ranking, #344).** 031
+  rewrites every keyword vector so a note's title and frontmatter
+  `aliases` rank above its body; ranking is right the moment the new
+  version serves. Snippets (`keyword_search`'s `snippet:` line) come
+  from an excerpt that is stored only when a note's vector is written,
+  so notes indexed before 031 show `head:` or no second line, the result
+  header counts them, and startup logs the count. Run
+  `make rebuild-tsvectors` (or, on a compose-file deployment,
+  `docker compose -f docker-compose.simple.yml run --rm obsidian-mcp python -m scripts.rebuild_tsvectors`)
+  **once** after the upgrade; it stores an excerpt for every note,
+  touches no embeddings and makes no API calls. On Kubernetes use
+  `deploy/kubernetes/base/rebuild-tsvectors-job.example.yaml` with the
+  Deployment scaled to zero (the RWO vault volume), as the
+  [Kubernetes guide](docs/deployment-kubernetes.md#upgrades-and-migrations)
+  describes. Three optional settings arrived with it — `RANK_WEIGHTS`,
+  `KEYWORD_EXCERPT_CHARS`, `KEYWORD_SNIPPET_ROWS` — documented in the
+  README's Configuration table and `.env.example`.
 - **Backups.** `pg_dump` the database on a schedule; the vault itself is
   covered by whatever sync you chose in Step 4. Note that a soft delete
   moves files into `.trash/` inside the vault, so your sync sees them.
@@ -924,6 +995,61 @@ deployment; on a compose-file deployment the equivalents are plain
   container — `make deploy` and `make status` fail if a mount at
   `/app/backups` exists — and `.env` should be `0600` (`make init` sets it).
 
+  **What a dump contains.** This fork takes a full dump by default, including
+  `notes_metadata` and historical `note_embeddings`. Ordinary reindexing cannot
+  restore temporal vectors, so silently treating them as a disposable cache
+  would lose history. `BACKUP_FULL=0 make db-backup` explicitly opts into
+  schema-only data for the six index tables (`notes_metadata`, `note_embeddings`,
+  `note_links`, `note_tasks`, `indexer_runs`, `indexer_state`). That smaller dump
+  requires reindexing and an explicit historical backfill after restore.
+  Credentials, users, usage, quotas and change-feed records are always included.
+  The pre-migration dump is always full. `make db-restore` accepts either kind.
+
+  **Restore runbook.** `make db-restore FILE=<dump.sql.gz>` loads a dump
+  into an *empty* `obsidian_mcp` database: it verifies the whole file first
+  (`gzip -t`, pg_dump's end-of-dump marker) and loads it in one transaction
+  with `ON_ERROR_STOP`, so the database is fully restored or untouched.
+
+  1. Stop the app container so nothing writes during the load (`make down`,
+     or `docker compose -f <your compose file> stop obsidian-mcp`). Leave
+     PostgreSQL running.
+  2. Give the restore an empty database. On a fresh volume `make db-init`
+     creates it with the `vector` extension; on an existing one, as the
+     superuser: `DROP DATABASE obsidian_mcp; CREATE DATABASE obsidian_mcp
+     OWNER obsidian_mcp;` then `\c obsidian_mcp` and `CREATE EXTENSION
+     vector;` (the app role cannot create the extension itself).
+  3. `make db-restore FILE=<path>/backup_YYYYMMDD_HHMMSS.sql.gz`.
+  4. Start the app (`make up`). Migrations run on start and bring an older
+     dump up to the image's schema; `make db-check` must then print "No new
+     upgrade operations detected." — it does for a schema-only dump too,
+     because `--exclude-table-data` keeps every table's DDL, the `halfvec`
+     index and `alembic_version`.
+  5. **If the dump was taken with `BACKUP_FULL=0`, the index is empty and
+     the indexer rebuilds it; there is nothing to run by hand.** An empty
+     index over a non-empty vault is the ordinary first-start case, not the
+     refused one (the "empty root over an existing index" guard is the
+     inverse: a vault that *vanished* under a populated index). The startup
+     pass is a full-hash pass over every note — metadata, keyword vectors,
+     links — and the embed pass that follows it in the same tick sends every
+     chunk to the embedding provider. Both take time proportional to vault
+     size: the scan is minutes for a few thousand notes, the embed stage is
+     chunks × provider latency (minutes on a local Ollama, longer on a
+     metered API). With more than one active user the embed stage is also
+     budgeted per user per pass (`EMBED_CHUNK_BUDGET_PER_USER`,
+     `EMBED_TIME_BUDGET_SECONDS_PER_USER`), so a large multi-user rebuild
+     spans several `INDEX_INTERVAL_SECONDS` ticks. `indexer_state` is empty
+     too, so startup *adopts* the current embedding and keyword
+     configuration instead of refusing on a mismatch; `make
+     reset-embeddings` is only needed if you also changed
+     `EMBEDDING_DIMENSIONS` or the model at the same time. Meanwhile
+     `/health` reports the indexer (`status: "degraded"` only if a pass
+     actually fails) and the panel dashboard shows the pending count;
+     semantic search returns partial results until the embed pass finishes,
+     keyword search is complete after the first pass.
+  6. Take a `make db-backup` once the index is back, so `backups_log` has a
+     post-restore row and the Health page stops dating the last backup from
+     the dump you restored.
+
   **On the deploy that first ships this** (migration 021): `make deploy`
   takes its backup *before* it migrates — deliberately, because the backup
   is the only way back from a bad migration — so that one dump runs against
@@ -938,6 +1064,653 @@ deployment; on a compose-file deployment the equivalents are plain
 - **Dependency audit.** `make audit` (pip-audit) and `make trivy` (image
   CVE scan) work from a checkout regardless of which compose file runs
   the container.
+
+### Measuring search quality
+
+Any change to the search path (ranking, chunking, the embedding model or
+provider, query parsing, fusion, a reranker) is measured with `make
+search-eval` on judgments mined from your own usage log: a search followed,
+within two minutes, by a successful `read_note` of one of the paths it
+returned, by the same API key or OAuth grant. The design and every rule are
+in [search](docs/architecture/search.md#search-evaluation-harness-356).
+`make search-eval` with no arguments runs on a committed synthetic fixture
+and needs nothing; the real run is this path, from a checkout with
+`requirements-dev.txt` installed:
+
+1. **Export.** `make search-eval-export [DAYS=90] USER_ID=<your user id>`.
+   It runs one read-only transaction holding one `SELECT` through the same
+   channel as `make db-backup` (`DB_BACKEND=docker` or `cnpg`, set in
+   `Makefile.local`), and writes the `keyword_search`, `semantic_search`,
+   `hybrid_search` and `read_note` rows of the last `DAYS` days (1 to 365) to
+   `.search-eval/usage-export.jsonl` (`SEARCH_EVAL_DIR` to move it): a `0700`
+   directory, a `0600` file, git-ignored. **It is tenant data**: query text,
+   the paths agents read, owner ids. Never commit it, upload it or paste it
+   into an issue. On a multi-user deployment `USER_ID=` is required for a
+   report you will attach to a PR; an unfiltered export covers every user
+   and is for your private use only. `SEARCH_EVAL_DB_NAME` (default
+   `obsidian_mcp`, the name `make db-backup` dumps) names the database to
+   export from.
+2. **Back up with the derived tables.** `BACKUP_FULL=1 make db-backup`. The
+   fork defaults to a full dump; do not opt into `BACKUP_FULL=0`, because
+   replay needs the note and embedding rows.
+3. **Restore it into a scratch database**, never over the live one. For
+   example, on a throwaway pgvector container bound to loopback:
+
+   ```sh
+   docker run --rm -d --name omcp-eval -e POSTGRES_PASSWORD=<scratch password> \
+       -p 127.0.0.1:55499:5432 pgvector/pgvector:pg16
+   docker exec omcp-eval createuser -U postgres obsidian_mcp
+   docker exec omcp-eval createdb -U postgres eval_copy
+   gunzip -c <the backup>.sql.gz | docker exec -i omcp-eval psql -q -U postgres -d eval_copy
+   ```
+
+   `SEARCH_EVAL_DATABASE_URL` is then
+   `postgresql+asyncpg://postgres:<scratch password>@127.0.0.1:55499/eval_copy`.
+   It is the only replay target the harness documents; it never reads
+   `DATABASE_URL`.
+4. **Snapshot, before any candidate.**
+   `make search-eval-snapshot SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy>`
+   records which indexed notes each arm can reach. Taken after a candidate
+   was applied, it would hide that candidate's lost notes as drift; the
+   harness cannot check the order. An existing snapshot is never replaced unless
+   you pass `FORCE=1`.
+5. **Apply the candidate to the copy**, if it changes indexed data (a
+   migration, a re-chunk, a re-embed).
+6. **Score.**
+   `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy> ARMS="keyword semantic <candidate>" BASELINE=keyword`.
+   It mines the export (plus `.search-eval/manual.jsonl`, operator-written
+   judgments, when present), replays every arm against the copy and prints
+   a table; `report.json` lands next to the export. The built-in arms call
+   the server's own search services, so run it in an environment that
+   carries the server's search settings (`FTS_CONFIGS`, the embedding
+   provider settings, and a `SECRET_KEY`, which the settings module needs
+   to import). `MIN_QUERIES` (50) and `SEED` (0) are overridable.
+   `ARM_OPTS="key=value …"` passes one `--arm-opt` per pair to the replay;
+   every arm of the run sees the same options. The fusion arms of
+   `hybrid_search` (#354) use it: `ARMS="keyword semantic
+   scripts.search_eval_arms.hybrid:make_arm
+   scripts.search_eval_arms.hybrid:make_arm_alt" ARM_OPTS="hybrid_k=60
+   hybrid_alt_k=20"` scores two values of `HYBRID_RRF_K` in one report
+   (`make_arm` defaults `hybrid_k` to the setting; `make_arm_alt` refuses to
+   run without `hybrid_alt_k`). A hybrid arm fails the run if the embedding
+   provider is down during replay, because a keyword-only answer is not
+   evidence for the fusion.
+   The rerank arms (#367) are separate factories, so the incumbent
+   `semantic` arm stays unreranked in the same report: `ARMS="semantic
+   scripts.search_eval_arms.rerank:make_semantic_arm
+   scripts.search_eval_arms.rerank:make_hybrid_arm" BASELINE=semantic`,
+   run with `RERANK_URL` pointing at the reranker you mean to measure. Each
+   probes the reranker before the first query (a failed probe exits 64)
+   and fails the run on any answer that was not reranked, a timeout
+   included (a query whose search finds nothing is scored as empty and
+   counted per arm as `empty_candidates` in the manifest): raise `RERANK_TIMEOUT_MS` for replay if the reranker is slow,
+   and say so next to the report.
+   **A change with a mechanical bar adds the `gate` step.** After `make
+   search-eval` has written `.search-eval/report.json` with the incumbent
+   as `BASELINE`, run `python -m scripts.search_eval gate --report
+   .search-eval/report.json --arm <candidate arm> --metrics
+   recall@10,recall@20,recall@50,ndcg@10 --slices overall,class:identifier
+   --min-ci-lower -0.01 --out .search-eval/gate.md` (the metrics, slices
+   and bound are the change's own bar). It prints PASS or FAIL per
+   (metric × slice) and exits 0 (all pass), 1 (a cell's CI95 lower bound is
+   below the bound, or its interval is null) or 64. It exits 64, printing
+   nothing and writing no file, when the report is not `OK`, `attachable:
+   true` and `provenance.users == 1`. On a multi-user deployment, export
+   with `USER_ID=` first. The two paths are the scored `report.json` and
+   the gate's Markdown table `gate.md`, and the PR body carries only a
+   table from a successful run. With a `runfile:` baseline, also pass
+   `--baseline-report` with the source generation's `report.json`.
+   **Score the source generation before staging the runfile**, and do not
+   re-score it afterwards: the gate checks that file against the digest
+   `run` recorded when it staged the runfile.
+7. **Attach `report.json` to the PR only if it says `attachable: true`.** It
+   carries metrics, counts and hashes, no query text and no note paths. A
+   `CORPUS_LOSS` verdict means the candidate lost searchable notes for that
+   arm, and the run is not evidence. `INSUFFICIENT_DATA` means too few judged
+   queries for a verdict. A failed or running manifest means the run did not
+   finish: re-run it; `score` never falls back to an earlier run. There is no
+   pass/fail threshold: the reviewer reads the deltas against the baseline.
+
+Drop the scratch container afterwards (`docker rm -f omcp-eval`).
+
+#### Before and after a re-chunk or re-embed
+
+A change that alters what is embedded (the chunking format, the context
+prefix, the embedding model) needs the incumbent code on the pre-change copy
+for the baseline and the new code on the *same* copy after a re-embed. The
+harness's `runfile:` arms carry the baseline across:
+
+1. Steps 1–4 above: export, `BACKUP_FULL=1` backup, restore into a scratch
+   copy, snapshot.
+2. **Baseline generation**, from a checkout of the incumbent release:
+   `make search-eval … ARMS="keyword semantic"`. Keep that generation's
+   staged `semantic` arm file (`.search-eval/runs/<generation>/semantic.json`).
+   **The incumbent runs first, on a drained copy.** If the copy still holds
+   notes of an older chunking version (production had not finished the
+   previous transition when it was backed up), first run the *incumbent*
+   image over it as in step 3 until the drain query reads 0 at the
+   incumbent's version, then take the baseline. For chunking version 2
+   (#390), also record the **before distribution**: run the candidate
+   checkout's harness with `ARMS="semantic"` on that drained copy, before
+   re-embedding, and keep its `chunk_lengths` (its `legacy_chunked_notes` is
+   non-zero, as expected; that run is not the candidate).
+3. **Upgrade and re-embed the copy** with the candidate image, as a one-off
+   container: `DATABASE_URL` is the scratch copy, the vault is mounted
+   **read-only** at the path the copy's `users.vault_path` names, no port is
+   published, and the provider settings are production's. Its startup runs
+   the migrations and its indexer re-embeds. To finish in one sitting, set
+   `EMBED_TIME_BUDGET_SECONDS_PER_USER=0` and `EMBED_CHUNK_BUDGET_PER_USER=0`
+   **on that container only**. Wait until
+   `SELECT count(*) FROM notes_metadata WHERE embedded_content_hash IS DISTINCT FROM content_hash OR embedded_chunking_version IS DISTINCT FROM 2`
+   reads 0 (the literal is the candidate's `CHUNKING_VERSION`, 2 since #390),
+   then stop it. A residue that does not drain is notes whose bytes
+   changed since the backup: report it, do not chase it. Record
+   `SELECT count(*) FROM note_embeddings` and the pass durations in
+   `indexer_runs`; that is your production estimate. Also sum the
+   `(S submitted, R reused)` counts over the container's
+   `Embedding complete…` log lines: `S` is the provider work the transition
+   costs, `R` the vectors it reused.
+4. **Candidate generation**, from the candidate checkout:
+   `make search-eval … ARMS="keyword semantic runfile:<baseline semantic file>" BASELINE=runfile:<baseline semantic file>`.
+   Each semantic arm in `report.json` carries its `retrieval_fingerprint`
+   (the embedding settings, the chunking version and a digest of
+   `EMBEDDING_QUERY_INSTRUCTION`, never the text) and the copy's
+   `legacy_chunked_notes`, counted for the export's owner. That count must
+   be 0 for the report to be evidence. Since #390 it also carries
+   `chunk_lengths` (`chunks`, `p10`/`p50`/`p90`, `whole_short`, `under_min`,
+   `raw_over_window`), and `under_min` must be 0 too. The report's count is
+   scoped to the export's owner; the statement below is the same predicate
+   **tenant-wide** (every owner on the copy), so a non-zero value there with
+   a zero in the report is another tenant's chunks. It is exactly this
+   statement, with the effective minimum (200 at the default `CHUNK_SIZE`):
+   `SELECT count(*) FROM note_embeddings ne WHERE ne.valid_to IS NULL AND length(btrim(regexp_replace(ne.chunk_text, '[\t\n\v\f\r ]+', ' ', 'g'))) < 200 AND (SELECT count(*) FROM note_embeddings o WHERE o.note_id = ne.note_id AND o.valid_to IS NULL) > 1`
+5. **The release rule for a chunking change (#390).** For the candidate
+   arm's label, read
+   `deltas[<label>][<slice>][<metric>]["ci95"]` for `<slice>` in `overall`
+   and `class:prose` and `<metric>` in `recall@10` and `ndcg@10`. **Accept**
+   when all four have `ci95[1] >= 0` (the interval contains zero or lies
+   above it); **reject** when any has `ci95[1] < 0`. **Re-measure, never
+   accept,** when the `verdict` is `INSUFFICIENT_DATA` or `CORPUS_LOSS`, or
+   any of the four `ci95` is null.
+6. Attach `report.json` only if `attachable: true`, as above.
+
+### Calibrating search confidence
+
+`semantic_search` and `hybrid_search` put `confidence: ok | low` on every
+page (#389). `low` means no keyword note matched all the terms and the best
+similarity of the call's candidates is strictly below
+`SEARCH_LOW_CONFIDENCE_SIMILARITY`. The setting ships at **0, which is off**
+(every page reads `ok`). A false `low` on a good page pushes an agent away
+from the right notes, so the value is chosen from your own usage, not
+guessed. bge-m3's candidate is 0.50; another model (`qwen3-embedding:0.6b`
+included) needs its own number.
+
+1. **Accrue evidence at 0.** Run the release with the threshold at 0 for at
+   least **14 days and** until **each** tool has at least **200**
+   clicked-through pages (a page one of whose notes the agent then read).
+   Every page's usage row records `confidence`, `top_similarity` and, on
+   `hybrid_search`, `keyword_all`, whatever the threshold.
+2. **Tabulate a single-user export.**
+   `make search-eval-export USER_ID=<your user id>` (step 1 of "Measuring
+   search quality" above), then
+   `python -m scripts.search_eval mine --export .search-eval/usage-export.jsonl --out .search-eval`
+   (it writes `confidence-rows.jsonl` beside the judgments) and
+   `python -m scripts.search_eval confidence --data .search-eval --threshold 0.50`.
+   It reads only the mined files and connects to no database. It prints one
+   line per tool,
+   `<tool>: false-low <rate> (<n>/<m> clicked-through pages, <d> days) — PASS|FAIL|INSUFFICIENT_DATA at < 1/50`,
+   then counts per query class and the `top_similarity` deciles of clicked
+   and unclicked pages. Rows logged before the release carry no
+   `confidence` and are excluded; keyword-only pages are included.
+3. **Pick and accept.** Pick the threshold at the noise ceiling of the
+   unclicked distribution and re-run step 2 at that value. **Accept it only
+   if both lines read PASS**: under 1 in 50 clicked-through pages would
+   read `low`. Fewer than 14 days or 200 clicked-through pages (zero
+   included) is `INSUFFICIENT_DATA`, never a pass. One setting enables both
+   tools, so both lines must pass; a deployment that rarely uses one tool
+   cannot enable either until it does.
+4. **Set it** (`SEARCH_LOW_CONFIDENCE_SIMILARITY=<value>` in `.env`),
+   recreate the container, and re-run the tabulation after a further
+   period. Re-calibrate from step 1 whenever the embedding model changes.
+
+The output (`.search-eval/confidence-report.json` and the table) carries
+the mine run's `provenance` and `attachable`. **Only attachable output may
+leave `.search-eval/`**: a multi-user tabulation begins with `NOT
+ATTACHABLE (multi-user provenance)` and stays private. The reference
+deployment sets a non-zero value only after both lines pass. `mine` binds the rows to
+its report by digest, so `confidence` refuses (exit 64) when
+`confidence-rows.jsonl` and `mine-report.json` come from different `mine`
+runs — re-run `mine` instead of mixing files.
+
+### Reranker (optional)
+
+`semantic_search` and `hybrid_search` accept `rerank=true`, which asks a
+cross-encoder reranker to reorder the candidates the call already fetched
+(at most 50 notes). Each note is sent as the same text its vectors were
+embedded from — its title, heading path and tags, then the chunk — for its
+cosine-best chunk and up to three more of its already-fetched chunks, at most
+`RERANK_MAX_DOCUMENTS` documents per call (default 100), each cut to 2,048
+characters; a note scores the best of its documents. Nothing uses it until
+you set `RERANK_URL`, and the default setup does not. **It is not a recommended default**: on a laptop CPU
+scoring 10 documents takes several seconds, so 50 candidates time out at the
+1.5 s default on every call. Treat it as a GPU-only option, and measure it
+with the harness (above) on your own judgments before telling agents to use
+it. Before [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it
+scored one heading-less chunk per note, which demoted some notes both search
+arms ranked first; #402 sends the embedded text of up to four fetched chunks
+per note instead; its real-data quality gate ran on 2026-10-31 against the previous
+reranker documents and passed 4 of 6 reports (the owner waived one
+near-miss cell; see the archived `rerank-documents` design). Measured
+against `rerank=false` on the reference vault (see "Does `rerank=true`
+help?" below), it improves `semantic_search` and makes `hybrid_search`
+worse. The reranker receives the query and candidate note text, so give it the
+same trust as your embedding endpoint.
+
+One wire format is supported: the Jina-compatible `/v1/rerank` that
+`llama-server --reranking` serves (vLLM and Infinity serve it too). As an
+example only, with a `bge-reranker-v2-m3` GGUF of your choice:
+
+```sh
+llama-server --reranking -m <path to bge-reranker-v2-m3 GGUF> \
+    --host 127.0.0.1 --port 8081 -ngl 99
+```
+
+or the same in a container on the server's network. Then, in `.env`:
+
+```sh
+RERANK_URL=http://127.0.0.1:8081/v1/rerank
+# RERANK_TIMEOUT_MS=1500
+```
+
+A reranker on another host needs `https`, or `RERANK_ALLOW_PLAINTEXT=true`
+for plaintext (the embedding override does not cover it).
+
+**Reference setup.** Ollama has no rerank endpoint
+([ollama/ollama#3368](https://github.com/ollama/ollama/issues/3368)), so the
+reference deployment runs llama.cpp's `llama-server` from the
+`ghcr.io/ggml-org/llama.cpp:server-cuda12-*` image (pin a build) serving
+`bge-reranker-v2-m3` as a Q8_0 GGUF with `--reranking`, behind TLS, on an
+8 GiB Quadro P4000 it shares with Ollama:
+
+```sh
+RERANK_URL=https://<host>:<port>/v1/rerank
+RERANK_TIMEOUT_MS=20000
+```
+
+Measured on that card with nothing else running: 50 documents of ~410
+characters in 1.6 s, 50 documents of 2,000 characters in 7.3 s. Candidates
+are cut to 2,048 characters, so the 1,500 ms default is too short there;
+the setting accepts 100–30000 ms, and the sizing table below explains the
+reference value of 20,000 ms. An internal CA goes in
+`EMBEDDING_CA_FILE`, which is the reranker's trust anchor too.
+
+Restart, then check:
+
+- the log has one `Rerank transport:` line and `Reranker probe passed`;
+- `/health` reports `"rerank": "enabled"` (`disabled` means the probe
+  failed: the log has one CRITICAL naming the reason, and the server keeps
+  re-probing every 60 s, doubling up to 10 minutes, so a reranker that
+  starts after the server is picked up on its own);
+- `semantic_search(query, rerank=true)` says `reranked: true (candidates: N)`.
+
+**Size the timeout with the document budget.** Rerank time grows with the
+characters sent. Measured on an NVIDIA Quadro P4000 running
+`bge-reranker-v2-m3` (uncontended; about 75 µs per character):
+
+| documents × size | time |
+| --- | --- |
+| 50 × ~410 characters | 1.6 s (measured) |
+| 50 × ~2,000 characters | 7.3 s (measured) |
+| 100 × ~410 characters | ≈ 3.2 s (scaled) |
+| 100 × ~2,000 characters | ≈ 15 s (scaled) |
+| 24 × 2,000 characters | 3.2 s (measured 2026-11-01) |
+| 50 × 2,000 characters | 6.7 s (measured 2026-11-01) |
+| 68 × 2,000 characters | 9.1 s (measured 2026-11-01) |
+
+The 2026-11-01 rows were measured on the same P4000, uncontended, over a
+loopback port-forward, with 2,000-character documents and
+`bge-reranker-v2-m3` Q8_0 under llama.cpp: about 133 ms per document,
+consistent with the 75 µs per character above. A hybrid `rerank=true`
+call sends 67–68 documents on the reference vault, so it takes about
+9–10 s there uncontended. That is why the reference deployment runs
+`RERANK_TIMEOUT_MS=20000`, and why the 10,000 ms it ran before timed out
+on every hybrid rerank call.
+
+**Does `rerank=true` help? Measured 2026-11-01** on a snapshot of the
+reference vault, scoped to one user: 196 mined queries (66 identifier, 130
+prose), 390 judged paths, depth 50, the plain tool as `BASELINE`, paired
+bootstrap CI95, `RERANK_TIMEOUT_MS=20000`, `RERANK_MAX_DOCUMENTS=100`, no
+unreranked answer in either run, about 6.4–6.9 s per reranked query on the
+P4000. Overall, plain → reranked (Δ [CI95]):
+
+| metric | `semantic_search` | `hybrid_search` |
+| --- | --- | --- |
+| recall@10 | 0.505 → 0.582 (+0.077 [+0.037, +0.116]) | 0.654 → 0.628 (−0.026 [−0.085, +0.028]) |
+| recall@20 | 0.571 → 0.627 (+0.056 [+0.015, +0.095]) | 0.791 → 0.731 (−0.060 [−0.110, −0.013]) |
+| MRR | 0.383 → 0.433 (+0.050 [+0.005, +0.093]) | 0.533 → 0.465 (−0.068 [−0.120, −0.020]) |
+| nDCG@10 | 0.389 → 0.442 (+0.053 [+0.016, +0.090]) | 0.519 → 0.474 (−0.045 [−0.086, −0.005]) |
+
+On `semantic_search` the gains are of similar size in both classes
+(identifier MRR +0.084 [+0.007, +0.158], prose recall@10 +0.082 [+0.033,
++0.134]); recall@50 is unchanged by construction, because the same 50
+candidates are reordered. On `hybrid_search` reranking loses (prose
+recall@20 −0.069 [−0.130, −0.013]): plain hybrid is already the strongest
+ranking on this vault (nDCG@10 0.519, against reranked semantic's 0.442).
+The judgments are mined from what agents read after the existing tools'
+results, which favours the ordering they saw, so hybrid's loss may be
+somewhat overstated; it does not turn into a gain.
+
+So keep `rerank=false` as the default. `rerank=true` is worth its cost
+with `semantic_search` when the top few rows matter; do not use it with
+`hybrid_search`, which should stay a plain call. After a model or
+reranker change, re-run the same two reports: the arms
+`scripts.search_eval_arms.rerank:make_semantic_arm` and
+`scripts.search_eval_arms.rerank:make_hybrid_arm`, each against its plain
+tool as `BASELINE`, then the `gate` step with `--slices
+overall,class:identifier,class:prose`.
+
+Rule of thumb: `RERANK_TIMEOUT_MS ≥ RERANK_MAX_DOCUMENTS × average
+characters × per-character cost`, doubled when the GPU is shared with the
+embedding model (the indexer's batches slow it down). The 1,500 ms default is
+deliberately conservative and falls back on most calls on hardware like this;
+`RERANK_MAX_DOCUMENTS=50` restores the pre-#402 document count. The
+reference deployment runs `RERANK_TIMEOUT_MS=20000` since 2026-11-01, at
+the 100-document default (see the README's "Reranker reference setup").
+A value above `MCP_CONCURRENCY_WAIT_SECONDS` is valid **only while
+`MCP_CONCURRENCY_MODE` is `shadow` or `off`**.
+
+**The concurrency-mode rule.** A `rerank=true` call holds its `embedding`
+concurrency slot through the rerank exchange, up to `RERANK_TIMEOUT_MS`.
+With `MCP_CONCURRENCY_EMBEDDING=1`, under `queue` a concurrent
+`semantic_search` / `hybrid_search` waits `MCP_CONCURRENCY_WAIT_SECONDS` and
+is then admitted with an `overrun` mark, and under `enforce` it is refused
+with `slot_timeout` even though its embedding provider is healthy. So under
+`queue` or `enforce`, keep `RERANK_TIMEOUT_MS ≤ MCP_CONCURRENCY_WAIT_SECONDS
+× 1000` unless `make concurrency-report TARGET=<mode>` passes over evidence
+that includes `rerank=true` traffic. Re-check this before promoting the mode.
+
+A reranker that is slow, down or answering garbage never fails a search:
+the call returns the unreranked page marked `reranked: false (<reason>)`,
+and the usage row records `rerank_reason`. TEI's native `/rerank` and
+Cohere's API are not supported in this release, and there is no
+authentication header.
+
+**Upgrading to this release:** no migration and nothing to re-index. The
+argument is new and optional. Rolling back is a redeploy of the previous
+image; a client still sending `rerank` is then refused by the
+unknown-argument rule.
+
+## OAuth CIMD and the resource gate (#357)
+
+**Migration 036** adds `oauth_clients.client_id_metadata_url` (nullable) and
+the CHECK `ck_oauth_clients_cimd_shape`. There is no backfill and no rewrite,
+and it runs in seconds. Run `make test-schema` before merging, as for every
+migration, and `alembic check` must be clean afterwards. The downgrade
+(`alembic downgrade 035`) **refuses while any CIMD client row exists**. Delete
+those clients on the panel's OAuth page first; their grants go with them, and
+their users reconnect.
+
+**What changes on the first request.** The AS metadata advertises
+`client_id_metadata_document_supported: true`. On their next fresh connection
+Claude, Claude Code and ChatGPT send an `https` `client_id` instead of calling
+`/register`. Existing DCR grants are untouched. The rollback lever is
+`OAUTH_CIMD_ENABLED=false` plus a recreate (no rebuild). Clients then fall back
+to DCR, and CIMD grants keep refreshing.
+
+**Outbound access.** The server fetches each client's metadata document over
+`https` from the pod/container (Claude's documents are on `claude.ai`). The
+fetch uses the `import_from_url` SSRF policy, so an egress policy that blocks
+public HTTPS breaks CIMD. Clients then see `invalid_client`, and the log shows
+`oauth_authorize_refused reason=client_metadata.fetch_failed` or
+`client_metadata.ssrf_refused`.
+
+**Verifying a connection took the CIMD path.** Look for one record per approval:
+
+```bash
+kubectl logs deploy/obsidian-mcp | grep '"msg": "oauth_consent_granted"' \
+  | jq -c '{registration_kind, cimd_host, outcome}'
+# {"registration_kind":"cimd","cimd_host":"claude.ai","outcome":"created"}
+```
+
+A DCR registration shows `oauth_client_registered` with
+`registration_kind: dcr`. On a compose host use `docker logs obsidian-mcp`.
+
+**The 14-day `resource` gate (follow-up #404).** RFC 8707 `resource` is classified on every
+`/authorize` and `/token` request and never refused in this release. A later
+change may refuse a foreign value with `invalid_target`, but only after **14
+consecutive days with no `resource_class: unexpected`** on any record. The
+`unclassified_rate_limited` and `unclassified_malformed` classes are excluded.
+Count per day:
+
+```bash
+kubectl logs deploy/obsidian-mcp --since=24h \
+  | jq -r 'select(.resource_class != null) | [.resource_class, (.resource_host // "")] | @tsv' \
+  | sort | uniq -c
+```
+
+Any `unexpected` line names only the host the client sent. Record it in
+#404 before anything is enforced.
+
+## Upgrading across migration 035 (tags in keyword search, #391)
+
+Migration 035 puts a note's tags into its keyword vector, so
+`keyword_search` (and `hybrid_search`'s keyword arm) finds a note by a word it
+carries only as a tag — frontmatter `tags` or an inline `#tag`, and for a
+nested `#a/b` also `a` and `b`. The vector becomes `A(title) || A(aliases)
+|| B(tags) || D(body)`: a tag hit ranks below a title hit and above a body
+hit under the unchanged `RANK_WEIGHTS` default. `matched_in` gains `tags`.
+No new setting, no schema object, nothing re-embedded, no extraction-version
+bump.
+
+- **What it does.** Under the index generation lock, in SQL from the stored
+  `title`, `frontmatter` and `tags` columns (no file access), it adds the
+  tags part to every vector that has none yet and whose tags produce a word.
+  Untagged notes are not touched. It rewrites each tagged vector once:
+  measured at about 30–40 seconds for 4,265 synthetic notes of 1,800 words
+  with three tags each on a local PostgreSQL 16 (most of it the rewrite, the
+  rest the preflight); shorter notes take less. On Kubernetes that time is
+  added to the `Recreate` gap.
+- **Stop the app before migrating** (stop → migrate → start). An old-image
+  process that writes a vector after 035 commits writes it without tags, and
+  035 never runs again. `make deploy` stops the app by itself when a
+  migration is pending; Kubernetes `Recreate`s. If you migrate a compose
+  stack by hand and get this wrong, `make rebuild-tsvectors` repairs it.
+- **All or nothing, with a size preflight.** Before writing anything, 035
+  estimates every rewritten vector against PostgreSQL's 1 MiB tsvector limit
+  and aborts, naming the row ids, if any would exceed it; any error during
+  the rewrite also fails the whole migration naming the row id and SQLSTATE.
+  Nothing is committed, so the database is still at 034. **Under Kubernetes
+  `Recreate` an abort is downtime**: the old pod is already gone and the new
+  pod's `migrate` initContainer fails, so nothing serves until you revert the
+  image digest.
+- **Check before merging.** Run this read-only statement against the live
+  database (034) first. It reports counts and ids only. It shows one FTS
+  config (`english`); the multi-config form follows it.
+  `flagged` must be `0` before you upgrade.
+
+  ```sql
+  WITH tagged AS (
+    SELECT id, content_tsvector AS v, tags
+    FROM notes_metadata
+    WHERE content_tsvector IS NOT NULL AND cardinality(tags) > 0
+      AND length(ts_filter(content_tsvector, '{b}')) = 0
+  ), toks AS (
+    SELECT t.id, x.lexeme, sum(cardinality(x.positions)) AS npos
+    FROM tagged t
+    CROSS JOIN LATERAL unnest(t.tags) AS g(tag)
+    CROSS JOIN LATERAL (VALUES (translate(g.tag, chr(2) || chr(3), '')),
+                               (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
+    CROSS JOIN LATERAL unnest(to_tsvector('english', f.txt)) AS x
+    GROUP BY t.id, x.lexeme
+  ), b AS (
+    SELECT id, sum((octet_length(lexeme) + 1) / 2 * 2 + 2 + 2 * least(npos, 256)) AS bytes
+    FROM toks GROUP BY id
+  ), est AS (
+    SELECT t.id,
+      (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+         + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+       FROM unnest(ts_filter(t.v, '{a}')))
+    + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+         + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+       FROM unnest(ts_filter(t.v, '{d}')))
+    + b.bytes AS bytes
+      , length(ts_filter(t.v, '{a}')) = 0 AS d_only
+    FROM tagged t JOIN b USING (id)
+  )
+  SELECT count(*) AS tagged_rows,
+         count(*) FILTER (WHERE bytes > 1048511 OR d_only) AS flagged,
+         array_agg(id ORDER BY id) FILTER (WHERE bytes > 1048511 OR d_only) AS ids,
+         count(*) FILTER (WHERE d_only) AS d_only,
+         max(bytes) AS largest
+  FROM est;
+  ```
+
+  **With several FTS configs** (the stored fingerprint names them; for
+  example `english,simple`), use this form instead: one `to_tsvector(cfg,
+  txt)` branch per config, combined with **`UNION ALL`** and grouped by id
+  and lexeme afterwards. Plain `UNION` is wrong: it removes duplicate rows,
+  and the same tag word parsed under two configs gives two identical
+  `(id, lexeme, npos)` rows, so `UNION` counts it once while 035's head
+  holds it under both configs — an under-estimate that lets a near-limit row
+  pass (Codex impl r3: 1,048,060 under `UNION` against the preflight's
+  1,048,828).
+
+  ```sql
+  WITH tagged AS (
+    SELECT id, content_tsvector AS v, tags
+    FROM notes_metadata
+    WHERE content_tsvector IS NOT NULL AND cardinality(tags) > 0
+      AND length(ts_filter(content_tsvector, '{b}')) = 0
+  ), toks AS (
+    SELECT id, lexeme, sum(npos) AS npos FROM (
+      SELECT t.id, x.lexeme, cardinality(x.positions) AS npos
+      FROM tagged t
+      CROSS JOIN LATERAL unnest(t.tags) AS g(tag)
+      CROSS JOIN LATERAL (VALUES (translate(g.tag, chr(2) || chr(3), '')),
+                                 (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
+      CROSS JOIN LATERAL unnest(to_tsvector('english', f.txt)) AS x
+      UNION ALL
+      SELECT t.id, x.lexeme, cardinality(x.positions) AS npos
+      FROM tagged t
+      CROSS JOIN LATERAL unnest(t.tags) AS g(tag)
+      CROSS JOIN LATERAL (VALUES (translate(g.tag, chr(2) || chr(3), '')),
+                                 (replace(translate(g.tag, chr(2) || chr(3), ''), '/', ' '))) AS f(txt)
+      CROSS JOIN LATERAL unnest(to_tsvector('simple', f.txt)) AS x
+    ) AS per_config
+    GROUP BY id, lexeme
+  ), b AS (
+    SELECT id, sum((octet_length(lexeme) + 1) / 2 * 2 + 2 + 2 * least(npos, 256)) AS bytes
+    FROM toks GROUP BY id
+  ), est AS (
+    SELECT t.id,
+      (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+         + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+       FROM unnest(ts_filter(t.v, '{a}')))
+    + (SELECT coalesce(sum((octet_length(lexeme) + 1) / 2 * 2
+         + CASE WHEN cardinality(positions) > 0 THEN 2 + 2 * cardinality(positions) ELSE 0 END), 0)
+       FROM unnest(ts_filter(t.v, '{d}')))
+    + b.bytes AS bytes
+      , length(ts_filter(t.v, '{a}')) = 0 AS d_only
+    FROM tagged t JOIN b USING (id)
+  )
+  SELECT count(*) AS tagged_rows,
+         count(*) FILTER (WHERE bytes > 1048511 OR d_only) AS flagged,
+         array_agg(id ORDER BY id) FILTER (WHERE bytes > 1048511 OR d_only) AS ids,
+         count(*) FILTER (WHERE d_only) AS d_only,
+         max(bytes) AS largest
+  FROM est;
+  ```
+
+  The estimate counts the title part, the body part and the tags part
+  separately, as 035 does (a word in both a note's title and its body is
+  stored once but rebuilt twice), strips the U+0002/U+0003 characters
+  from tags as 035 does, and counts the tag words one tag at a time, so it
+  is never smaller than the tags part 035 builds. A row is flagged when its estimate is over the limit, **or** when its
+  vector has no title part at all (`d_only`: a note 031 left at the size
+  limit). 035 builds such a row's whole title-and-aliases head, which the
+  stored vector does not show, so the statement flags every one of them
+  rather than guess. A flag on a short note whose title is only stop words
+  (`The`) is harmless. Fix a flagged row before upgrading: shorten the note
+  (its body or its tags), or let the current image rewrite it through its
+  size retreat — edit the note, or run `make rebuild-tsvectors` — after which
+  it has a title part and the size check applies to it; then run the
+  statement again.
+- **If 035 fails anyway.** The database is still at 034: serve the previous
+  image (on Kubernetes, revert the digest), shorten the named note's body or
+  tags so that its vector is smaller, let the previous image re-index it,
+  and deploy again.
+- **Optional afterwards.** A tagged note that already had a title part keeps
+  its body positions shifted by the old head's length; matching and
+  single-part ranking are exact, and a cover spanning the tags and the body
+  scores marginally lower until the note is next written. `make
+  rebuild-tsvectors` makes every vector byte-exact; it is not required.
+- **Rollback.** `alembic downgrade 034` (with the new image) strips every tags
+  part, then deploy the previous image.
+- Afterwards, `alembic check` should print "No new upgrade operations
+  detected."
+
+## Upgrading to migration 034 (heading-aware chunks)
+
+Migration 034 adds five nullable columns (the chunk's heading path, section
+ordinal and context prefix on `note_embeddings`; the chunking version and an
+input digest on `notes_metadata`) and two CHECKs. It is metadata-only plus one
+constraint validation over the embedding table, which takes seconds. Nothing
+is backfilled.
+
+- **Startup does not refuse.** The stored embedding fingerprint is
+  unchanged, so there is no `make reset-embeddings`. The startup log gains an
+  `Embedding retrieval: {…}` line.
+- **The vault is re-embedded in the background.** Every note embedded before
+  034 is selected again, note by note, after any real edit, and the work is
+  held to `EMBED_TIME_BUDGET_SECONDS_PER_USER` / `EMBED_CHUNK_BUDGET_PER_USER`
+  per pass **in every mode, single-user included**. Heading-aware chunking
+  makes more, smaller chunks (expect roughly 1.3× to 2.5× the old count), so
+  on a vault of a few thousand notes and a GPU Ollama this is tens of minutes
+  of provider time spread over a few hours of passes. Measure it on a
+  restored copy first (above) if you want a number.
+- **What you see meanwhile.** Search keeps answering from the old vectors
+  until each note's new ones land. Old rows have previews but no `§`
+  locator. Every `semantic_search` / `find_related` response carries an
+  `index_transition: N notes not yet re-chunked; …` line until your notes have
+  drained, because ranking across the two generations is approximate. The
+  dashboard's pending count starts near your note count and falls each pass;
+  a budget stop logs one WARNING per tenant per pass and is not a run error.
+  `/health` stays `ok`; its `indexer.rechunk` field reads `"in_progress"`
+  and then `"complete"` (a state, never a count). Queries share Ollama with
+  the re-embed batches, so a search can wait up to one batch (2–3 s).
+- **Rollback.** Roll forward if you can. Otherwise run `alembic downgrade 033`
+  with the **new** image first: it deletes the heading-era vector rows and
+  un-certifies their notes (the old build would otherwise reuse vectors of
+  prefixed input as if they were the bare chunk's), then deploy the old
+  image, which re-embeds those notes. Until it does, they are missing from
+  semantic search.
+
+## Upgrading to chunking version 2 (#390, minimum chunk length)
+
+No migration and no new setting. **This is a second gradual re-embed of the
+whole vault, right after the 034 one above**: version 2 stops storing chunks
+shorter than 200 characters (a short section is grouped with its
+neighbours), cuts windows at a line or word start, and sends long whitespace
+runs collapsed. The minimum is a constant tied to the chunking version, not
+a setting, so every previously valid `CHUNK_SIZE` still starts (below 100 the
+minimum is half the window).
+
+- **Startup does not refuse**, and the startup `Embedding retrieval:` line
+  shows `"chunking_version":2`.
+- **What you see.** The same transition as 034's: every note is selected
+  again in the background under the per-tenant budgets; the
+  `index_transition: N notes not yet re-chunked; …` line returns on
+  `semantic_search`, `find_related` and `hybrid_search` until your notes
+  drain; `/health` reads `indexer.rechunk: "in_progress"` and then
+  `"complete"`; the dashboard's pending count jumps to about your note count
+  and falls each pass. Each pass logs
+  `Embedding complete: N notes, X chunks (S submitted, R reused)`: a section
+  that did not change keeps its vector, so expect fewer provider calls than
+  034's transition. Previews now start on a word, and a merged chunk's
+  preview can include an inner heading line.
+- **Rollback.** Deploy the previous image. There is no schema to undo, but
+  that build re-embeds every note stamped 2 in full (it reuses nothing
+  across the versions).
 
 ## Upgrading: split database roles
 
@@ -1113,3 +1886,111 @@ release works with either shape of cluster:
   vaults on the same container, see the **Multi-user mode** section in
   the [README](./README.md#multi-user-mode): bootstrap flow, inviting
   users, the admin role, and rollback are covered there.
+
+## Optional native browser SSO
+
+Multi-user deployments can sign existing users in to the panel, and to the
+MCP consent page, through an OpenID Connect provider. Shipping this code does
+not enable it: `OIDC_ENABLED` defaults to `false`, and with it off nothing
+changes. The full guide, including a click-by-click Keycloak walkthrough, is
+[docs/native-oidc.md](docs/native-oidc.md). What a deployment needs:
+
+1. **Users exist first.** There is no SSO bootstrap: `/admin/register` is 404
+   while OIDC is on. Register the first admin and create the other users with
+   OIDC off, and confirm a local admin password works.
+2. **A confidential client at the provider** with the exact redirect URI
+   `https://<MCP_HOSTNAME>/admin/auth/oidc/callback` (no wildcards),
+   authorization code flow with PKCE S256, and ID tokens signed RS256, PS256
+   or ES256. The provider's discovery, token and JWKS endpoints must be HTTPS
+   on the issuer's own host and port.
+3. **Egress** from the server to the issuer over HTTPS. On Kubernetes, add the
+   rule to the app's NetworkPolicy. Provider requests ignore `HTTP(S)_PROXY`.
+   For an issuer behind a private CA, mount the CA and set `OIDC_CA_FILE`.
+4. **Settings**, in `.env` (compose) or the ConfigMap/Secret (Kubernetes):
+
+   | Setting | Default | Notes |
+   | --- | --- | --- |
+   | `OIDC_ENABLED` | `false` | Requires `MULTI_USER_MODE=true` and an HTTPS `BASE_URL`/`MCP_HOSTNAME`; refused in sandbox mode. |
+   | `OIDC_ISSUER` | — | HTTPS; must equal discovery's `issuer` byte for byte; at most 2,048 characters. |
+   | `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | — | Both required. The secret belongs in the Secret, not the ConfigMap. |
+   | `OIDC_TOKEN_AUTH_METHOD` | `client_secret_basic` | Or `client_secret_post`. Refused at login if discovery lists methods without it. |
+   | `OIDC_REQUIRED_GROUP` | — | Optional. When set (at most 512 characters), the ID token's `groups` array must contain it exactly. |
+   | `OIDC_EXTRA_SCOPES` | — | Space-separated scope tokens after `openid email profile`, at most 8 of 64 characters; `offline_access` refuses startup. |
+   | `OIDC_DISPLAY_NAME` | `SSO` | Button label "Sign in with {name}", 1–40 printable characters. |
+   | `OIDC_CA_FILE` | — | PEM CA trusted for provider requests only (replaces certifi for them); empty or `off` means unset; refused if unreadable or holding no CA. |
+   | `LOCAL_LOGIN_ENABLED` | `true` | The password form. `false` hides it and refuses its POST. Multi-user mode needs this or OIDC. Turning it back on is the break-glass below. |
+   | `OIDC_SUBJECT_USER_IDS` | — | **Retired.** Any non-empty value refuses startup. See the upgrade below. |
+
+   All `OIDC_*` values are validated at startup (only when `OIDC_ENABLED=true`,
+   except the retired one) and never contact the provider, so a provider
+   outage cannot stop the server from starting.
+
+   The same validation runs in **every process that loads the settings**: the
+   migration step (`alembic upgrade head`, the Kubernetes `migrate`
+   initContainer), `alembic check` and one-off Jobs. Each needs the full OIDC
+   environment, `OIDC_CLIENT_SECRET` included, or it refuses to start. Keep
+   the secret in the Secret or `.env` that all of them load. If you inject it
+   separately (`secretKeyRef`), add it to the initContainer and to the Jobs
+   as well. Otherwise turning SSO on crash-loops the migration, and with
+   `Recreate` the server stays down. See
+   [native OIDC](docs/native-oidc.md#settings).
+5. **Link the accounts** in the panel (user edit page, **Single sign-on**:
+   Expect email or Bind subject), have each user sign in once, and complete one
+   MCP client's consent round trip through SSO.
+6. **Access logs:** suppress query strings on `/admin/auth/oidc/callback` in
+   the reverse proxy or ingress logs and in tracing. The query carries the
+   authorization code.
+
+If an external login gate (forward auth, basic auth) protects the panel today,
+keep it until SSO works end to end, then remove it. Do not remove a gate by
+switching `MULTI_USER_MODE` off: that removes the boundaries between users'
+vaults.
+
+### Turning password login off, and break-glass
+
+`LOCAL_LOGIN_ENABLED=false` is optional, and only safe once an admin is linked.
+After setting it, check the startup log: one CRITICAL line starting
+`LOCAL_LOGIN_ENABLED=false and no active admin is linked to single sign-on`
+means nobody can sign in as an administrator. The server still starts and
+`/mcp` keeps serving. While password login is off, the panel refuses any
+change that would leave no active admin linked under the configured issuer,
+and you cannot unlink yourself.
+
+When the provider is down, or nobody can sign in with SSO, re-enable the
+password form and sign in with a local admin password:
+
+- **Kubernetes:** set `LOCAL_LOGIN_ENABLED: "true"` in the ConfigMap (or
+  wherever the deployment sets it), apply it, then restart so the pod
+  re-reads its environment:
+
+  ```bash
+  kubectl -n <namespace> edit configmap <app-config>
+  kubectl -n <namespace> rollout restart deployment/<app>
+  kubectl -n <namespace> rollout status deployment/<app>
+  ```
+
+- **Compose:** set `LOCAL_LOGIN_ENABLED=true` in the deploy directory's
+  `.env`, then `docker compose up -d --force-recreate`.
+
+There is no bypass URL; recovery requires access to the deployment's
+configuration, by design. Keep multi-user mode on throughout.
+
+### Upgrading from `OIDC_SUBJECT_USER_IDS`
+
+The first SSO release kept subject-to-user mappings in
+`OIDC_SUBJECT_USER_IDS`. That setting is retired (#416) and a non-empty value
+refuses startup. In order:
+
+1. On the old release, confirm a local admin password works (reset one if
+   needed).
+2. Set `LOCAL_LOGIN_ENABLED=true`.
+3. Record the map's subject-to-user pairs, then remove `OIDC_SUBJECT_USER_IDS`.
+4. Deploy. Migration 037 runs.
+5. Sign in with the password and, for each former subject, open the user's
+   edit page and use **Single sign-on → Bind subject**.
+6. Verify an SSO sign-in per user and one `/authorize` consent round trip.
+7. Optionally set `LOCAL_LOGIN_ENABLED=false` again, once the startup log shows
+   no CRITICAL lockout line.
+
+The same sequence, with more detail, is in
+[docs/native-oidc.md](docs/native-oidc.md#upgrading-from-oidc_subject_user_ids).

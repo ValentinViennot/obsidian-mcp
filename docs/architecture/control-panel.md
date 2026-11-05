@@ -30,7 +30,7 @@
   object-src 'none'
   base-uri 'none'
   frame-ancestors 'none'
-  form-action 'self'        (the consent page: 'self' https:)
+  form-action 'self'        (the consent page: 'self' https: http://localhost:* http://127.0.0.1:*)
   ```
 
   Each source is there for something the templates do. `script-src` lists
@@ -174,6 +174,24 @@
   go is decided by the HTTPS-only registration rule and `authorize_post`'s
   exact-match re-validation, never by this header. `authorize_get` calls
   `mark_consent` before rendering; every other page keeps `'self'`.
+  **#357 adds `http://localhost:*` and `http://127.0.0.1:*`**
+  (`panel_csp.CONSENT_FORM_ACTION`, still a constant). A Client ID Metadata
+  Document client such as Claude Code receives its code on an RFC 8252
+  loopback callback on an ephemeral port, and the 302 to it is a
+  form-submission hop. Without the two sources the approve completes
+  server-side and the browser blocks the delivery. Where a code may go is
+  still decided server-side (`cimd.redirect_uri_allowed`: loopback http only
+  for those exact host literals, port-agnostic, path and query exact). CSP
+  host-source syntax cannot name an IPv6 literal, so a `[::1]` callback is
+  matched by the server but may be blocked here. No known client declares it
+  (L3 in [oauth and grants](oauth-and-grants.md)).
+
+- **The CIMD consent card (#357)** shows the client identifier URL's host as
+  the application, the full URL as the client ID, and "First approved".
+  The document's self-declared `client_name` is **not rendered** on the
+  consent page. The OAuth panel lists a CIMD row by host and URL, with the
+  name labelled "Self-described as". Both use existing utility classes, so
+  no `style=` and no handler are involved.
 
 - **`PANEL_CSP` is the rollback lever** (`enforce` | `report-only` | `off`,
   default `enforce`, boot-validated — an unknown value refuses startup).
@@ -559,6 +577,27 @@ how the panel says so.
   through the indexer's shared helper rather than calling `detect_and_publish`
   directly, so the "a detection failure must not abort the caller" handling is
   not re-implemented in a second place.
+
+## Times: UTC from the server, local in the browser, labelled when not
+
+Instants leave the server as ISO-8601 UTC and are rendered in the viewer's
+zone by `base.html`'s `time[data-localize]` script (request log, last seen).
+Where the panel shows a *UTC day* rather than an instant, it says so instead
+of localising it, because a local date on a UTC day names a calendar day the
+number does not count:
+
+- **Usage chart.** Buckets are cut in UTC (`date_trunc(…, 'UTC')`).
+  Hour buckets (24h window) are rendered in the viewer's zone from the
+  bucket's `instants` with the same `Intl.DateTimeFormat` approach — an hour is
+  an hour anywhere; in a half-hour zone they read `:30`, which is the truth.
+  Day buckets (7d/30d) stay UTC dates, the card header says "per UTC day" and
+  the tooltip "(UTC day)".
+- **"Requests Today (UTC)"** on the dashboard counts from UTC midnight —
+  `quotas.utc_day_start`, the same day the per-key limit counts and the keys
+  page calls "UTC day".
+- **The consent page** extends neither base and carries no localisation
+  script, so the client's registration date is the UTC date with a literal
+  "UTC".
 
 ## The usage page's outcome column
 
@@ -974,7 +1013,7 @@ The lifecycle, in one table — one implementation per phase:
 
 | Phase | Trigger | What happens | Where |
 | --- | --- | --- | --- |
-| **Mint** | login; bootstrap registration; the re-issue after a password change | **under the account guard**: re-read the user `FOR UPDATE` with `populate_existing=True`, require it to exist and be active, insert a row keyed on `sha256(sid)` with `expires_at = now + session_max_age` and `user_agent_hash`, **commit**, and only then write `sid` into the signed cookie | `start_session()`, three callers |
+| **Mint** | password/OIDC login; bootstrap registration; the re-issue after a password change | **under the account guard**: re-read the user `FOR UPDATE` with `populate_existing=True`, require it to exist and be active, insert a row keyed on `sha256(sid)` with `expires_at = now + session_max_age` and `user_agent_hash`, **commit**, and only then write `sid` into the signed cookie | `start_session()`, four callers |
 | **Validate** | every request that resolves a browser identity | the cookie must carry **both** `user_id` and `sid`; refused when the row is absent, revoked, expired, or `row.user_id` disagrees with the cookie's; then the existing user-exists / `is_active` / `session_version` checks. Every refusal clears the cookie **and records `panel_session_replay_refused`** with one of eight reasons | `get_active_session_user()`, reached from `require_user_panel`, `login_form`, `authorize_get`, `authorize_post` — the only four entry points |
 | **Touch** | a `GET`/`HEAD` whose row is more than `SESSION_TOUCH_INTERVAL_SECONDS` stale | `last_seen_at = now()` on the **request's own** session, committed in the dependency before the handler runs; skipped on every other method and on any failure | `touch_session()` |
 | **Revoke — one** | logout | `revoked_at` for that row, commit, cookie cleared | `logout` in `src/auth/routes.py` |
@@ -988,7 +1027,7 @@ The lifecycle, in one table — one implementation per phase:
   handed to the browser beside it would authenticate nothing, which is a hard
   logout loop on the very next request. Making `start_session` own its
   transaction makes "the row exists before the cookie leaves" a property of one
-  function rather than of three call sites' discipline.
+  function rather than of four call sites' discipline.
   `revoke_session` / `revoke_user_sessions` are the opposite by the same
   reasoning: every one of their callers holds the account guard, and the
   documented rule for that critical section is that nothing may commit between
@@ -1024,9 +1063,10 @@ The lifecycle, in one table — one implementation per phase:
   that only asked that question would insert a live row *after* the reset's
   sweep and copy the new version into the cookie — handing the **superseded**
   password a fully valid session and defeating both invalidators at once. The
-  three call sites each pass the generation they hold: `login_submit` the
+  call sites each pass the generation they hold: `login_submit` the
   version `verify_password` ran against, `register_submit` the row it just
-  created, `change_password` the bumped version it just committed. The same
+  created, `change_password` the bumped version it just committed, and the OIDC callback
+  the local account version resolved after provider verification. The same
   window is why the post-change re-issue, which runs in a *second* transaction,
   needs it too.
 
@@ -1322,3 +1362,139 @@ in both modes.
   raises: the local session is already gone by the time it is consulted, and a
   logout that has ended the session must not become a 500 because the provider
   is unreachable.
+
+## Optional native OIDC (#414, #416)
+
+`src/auth/oidc.py` is the protocol half: discovery, PKCE S256 authorization,
+the token exchange and ID-token validation (Authlib + joserfc, RS256 / PS256 /
+ES256 intersected with what discovery advertises, exact `iss`, singleton
+`aud`, `azp`, `nonce`, integer `exp`/`iat` with zero leeway, `sub` ≤ 255, the
+group check only when `OIDC_REQUIRED_GROUP` is set). It returns a
+`VerifiedIdentity(iss, sub, email, email_verified)` — **claims, never a user
+id**. Which local user that identity is, if any, is decided by
+`src/services/oidc_links.py` in the callback's database phase. Operator
+guide: [docs/native-oidc.md](../native-oidc.md). The server's own MCP OAuth
+(DCR, CIMD, grants, rotation) is untouched; OIDC changes only how a panel
+session is minted.
+
+- **The link is on the `users` row** (migration 037, see
+  [schema and migrations](schema-and-migrations.md#037-oidc-account-links-on-users-416)):
+  a bound triple `(oidc_issuer, native_oidc_subject, oidc_linked_at)` or a pending
+  one `(oidc_expected_issuer, oidc_expected_email, oidc_expected_set_at)`,
+  never both. `OIDC_SUBJECT_USER_IDS` is retired and refuses startup (two
+  sources of truth for one binding is a precedence rule nobody remembers under
+  pressure); the message's last sentence names the docs heading, so the two
+  must change together.
+
+- **Resolution order: `(iss, sub)` first, email only after it fails.**
+  `oidc_links.resolve` is unlocked SELECTs. A row bound to `(iss, sub)` is the
+  user and the email claim is not read — so `exchange()` never refuses on
+  email: anything but a string of ≤ 254 characters becomes `None`, a
+  non-matching sentinel, and `email_verified` is `True` only for the JSON
+  boolean. Only when nothing is bound is the email normalized (strip ASCII
+  whitespace, lower-case ASCII letters only, exactly one `@`, no whitespace or
+  control characters, 3–254 characters; no IDN/Unicode folding, which would be
+  a homograph surface) and matched against a pending expectation under the
+  same issuer set less than `PENDING_DAYS` (7, a module constant, not a
+  setting) ago by the database clock. Match + verified → `pending` (may bind);
+  match + unverified → `email_unverified`; anything else → `unlinked`. An
+  expired expectation is not deleted on the read path, it just stops matching.
+  `preferred_username` is never consulted (OIDC Core says not to rely on its
+  uniqueness).
+
+- **Bind and mint are one transaction.** `prepare_login` takes
+  `lock_account_guard` — the same key `_lock_admin_guard` and `start_session`
+  take, transaction-scoped and re-entrant, so the mint re-taking it is a
+  no-op — re-reads the row `FOR UPDATE` with `populate_existing=True`, and
+  re-checks everything `resolve` saw: active (else `account`, before any
+  write); on the bound branch still bound to `(iss, sub)` (an unlink may have
+  committed, else `unlinked`); on the pending branch still pending with the
+  same issuer and email, live, unbound, and no other row holding `(iss, sub)`
+  (else `unlinked` / `link_conflict`; a unique violation at flush is also
+  `link_conflict`). It writes the bind and `last_login_at`, flushes and
+  **does not commit**. `start_session(expected_session_version=<the locked
+  re-read's version>)` commits bind, stamp and session row together; on a
+  refused mint the route rolls back again explicitly. So a refused mint leaves
+  no binding and no `last_login_at` — the admin's intent and the first session
+  are one fact. All provider I/O happens before the first statement, so no
+  connection is held during it.
+
+- **Every refusal is one response.** `_oidc_refused` maps any reason outside
+  `security_events.OIDC_REFUSAL_REASONS` to `provider`, records
+  `panel_oidc_refused`, and renders the same login page and message (401; 503 +
+  `Retry-After: 60` for `capacity`). `unlinked` and `account` bodies are
+  identical apart from the CSRF token and nonce, so the page never confirms
+  that an identity resolves to a local user. The callback never consults or
+  charges the per-account failed-password budget (it is about password
+  guessing, and must not let a password sprayer lock someone out of SSO).
+
+- **The admin actions** are `POST /admin/users/{id}/oidc/{expect,bind,unlink}`
+  in `src/control_panel/users.py`, sharing `_oidc_link_action`: 404 while OIDC
+  is off; `require_admin_panel` + CSRF; `_lock_admin_guard`, then
+  **immediately** `_actor_still_privileged` (on failure `actor_snapshot`,
+  rollback, `_log_actor_revoked`, `_ACTOR_REVOKED_MSG` — the last-admin
+  guard's sequence above, because the wait for the lock is exactly when this
+  actor's demotion can commit); only then the target, the `oidc_links`
+  operation (which re-reads the target `FOR UPDATE` and writes inside a
+  SAVEPOINT, so a uniqueness violation is a `conflict` flash without aborting
+  the guarded transaction), the commit, and after it the flash and the event.
+  Expect and bind are refused on a bound row (`bound_already`): **a bound user
+  is never re-pointed without an explicit unlink.** Unlink clears all six
+  columns and calls `revoke_user_sessions` in the same transaction. Bind is
+  always under the *configured* issuer.
+
+- **D15, the last reachable administrator.** The last-admin guard counts
+  admins who exist; with `LOCAL_LOGIN_ENABLED=false` an admin not bound under
+  the configured issuer cannot reach the panel at all. So while password login
+  is off (`_reachable_admin_rule_applies`), unlink, the edit form's clearing of
+  `is_admin` or `is_active`, soft delete and permanent delete refuse any
+  outcome with zero rows `is_admin AND is_active AND oidc_issuer = <configured>
+  AND native_oidc_subject IS NOT NULL` (`oidc_links.reachable_admins_after`, which
+  excludes the target, so it gives the same answer before or after the
+  target's write). It runs inside the guard, after the actor re-check, in the
+  writing transaction, beside the existing last-active-admin check; unlink
+  evaluates it after the operation and before the commit, so a refusal rolls
+  the unlink and its session revocations back together. Self-unlink is refused
+  outright while password login is off. `tests/test_oidc_mutation_sites.py`
+  pins that these four sites (plus the first-login bind, bootstrap and create,
+  which only add) are the only `src/` writers of `is_admin`, `is_active`,
+  `native_oidc_subject` and the only `users` deleters, so a fifth site cannot skip the
+  rule. With password login on, the rule does not apply: the form reaches
+  every active admin. What the panel cannot see — a changed `OIDC_ISSUER`, an
+  account disabled at the provider, `LOCAL_LOGIN_ENABLED=false` set with
+  nobody bound — is reported by `_warn_oidc_lockout` in the lifespan: one
+  CRITICAL line, never a refusal (an outage of one login method must not
+  become an outage of `/mcp`); a failure of its own query is a WARNING.
+
+- **Templates, under the nonce CSP.** Every new block is inside
+  `{% if oidc_enabled %}`, so with OIDC off the login, users, user edit and
+  account pages are byte-identical to before (the `tests/golden/oidc_off/`
+  goldens). The login button is a GET link labelled "Sign in with
+  `OIDC_DISPLAY_NAME`" (autoescaped), so `form-action` is unaffected. The
+  user edit page's "Single sign-on" card shows not linked / pending (with
+  expiry) / expired / linked (subject truncated to 8 characters) / linked
+  under a previous issuer; the issuer itself is never rendered. Unlink uses
+  the existing `type="button"` + `data-confirm` listener. The users list has
+  an SSO column (`linked` / `pending` / `—`), and `/admin/account` a read-only
+  line; there is no self-service linking.
+
+- **Unchanged from #414.** State is 32 random bytes bound to the signed
+  session cookie and consumed from a bounded in-memory store (5 min, 1,024
+  slots, 60 starts/min/process; one worker required) before any network I/O;
+  nonce and PKCE verifier never reach a cookie. `next` passes `_safe_next` at
+  start and at redirect. Activation requires multi-user mode and forbids
+  sandbox mode; `/admin/register` is 404 under OIDC even on an empty table
+  (no SSO bootstrap: the first identity would race for admin). At least one
+  login method must stay enabled in multi-user mode. Provider-side
+  offboarding does not end app sessions or MCP credentials (L2); logout is
+  local (L3).
+
+## Fork compatibility at the November 2026 upstream merge
+
+`AUTH_MODE=pocketid` retains the existing signed-cookie protocol in
+`src/auth/pocketid.py` and its `users.oidc_subject` bindings. Native upstream
+OIDC remains opt-in through `OIDC_ENABLED=true`, with its separate
+`users.native_oidc_subject` identity and issuer/link-time constraints. Startup
+refuses enabling both modes. The one callback URL dispatches by the configured
+mode; no existing identity is implicitly adopted into the native mechanism.
+Migrating between modes requires explicit administrator linking.

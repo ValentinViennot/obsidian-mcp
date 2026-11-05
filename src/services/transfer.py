@@ -58,6 +58,7 @@ from src.oauth.grants import grant_deadline
 from src.oauth.scope import token_has_write
 from src.services import vault_fs, vault_overlap
 from src.services.vault import classify_bytes
+from src.services.note_hash import CanonicalNoteHasher
 
 logger = logging.getLogger(__name__)
 
@@ -1481,6 +1482,7 @@ async def _drain(
     max_bytes: int,
     deadline: float | datetime.datetime,
     idle_timeout: float,
+    note_hasher=None,
 ) -> tuple[int, str, bytes]:
     """Copy `chunks` to `fd`, counting, hashing and bounding as they arrive.
 
@@ -1523,6 +1525,8 @@ async def _drain(
         if len(head) < MIME_SNIFF_BYTES:
             head.extend(chunk[: MIME_SNIFF_BYTES - len(head)])
         digest.update(chunk)
+        if note_hasher is not None:
+            note_hasher.update(chunk)
         _write_all(fd, chunk)
 
     if _deadline_remaining(deadline) < 0:
@@ -1560,7 +1564,7 @@ async def stream_to_vault(
     precedence; the caller must hold **no database connection** across this
     call, because the wait can last the whole `slot_timeout` (#208).
 
-    Returns `{"size", "sha256", "mime"}`. Raises `TooLarge`, `Timeout`,
+    Returns `{"size", "sha256", "mime"}`, plus `note_hash` (the canonical note hash, `None` for non-UTF-8 bytes) for a `.md` path (#351). Raises `TooLarge`, `Timeout`,
     `QueueTimeout`, `PrePublishAborted`, or `vault_fs.Conflict` /
     `vault_fs.UnsafePath` — and in every case leaves no staged file and nothing
     at the target path.
@@ -1874,12 +1878,17 @@ async def _stream_locked(
             # descriptor, so it names the inode this call staged whatever
             # happens to the name afterwards.
             staged_st = os.fstat(staged_fd)
+            # The canonical note hash of a `.md` body (#351, D3), computed as
+            # the bytes stream past, so the change-feed event and the index
+            # pass agree on a CRLF or NUL note without a second read.
+            note_hasher = CanonicalNoteHasher() if str(row.path).endswith(".md") else None
             size, digest, head = await _drain(
                 chunks,
                 staged_fd,
                 max_bytes=max_bytes,
                 deadline=deadline,
                 idle_timeout=idle_timeout,
+                note_hasher=note_hasher,
             )
             # Publication links this very inode into place, so the 0600 it was
             # created with would become the published mode. Relax it to what a
@@ -1915,6 +1924,8 @@ async def _stream_locked(
 
         _kind, mime = classify_bytes(head, name)
         result = {"size": size, "sha256": digest, "mime": mime}
+        if note_hasher is not None:
+            result["note_hash"] = note_hasher.hexdigest()
 
         # `publish` succeeding is the point of no return, and it is recorded
         # through `_record` above rather than taken from the return value: the
@@ -2369,11 +2380,54 @@ class PinnedTransport(httpx.AsyncHTTPTransport):
         return await super().handle_async_request(request)
 
 
+_MAX_AGE_CEILING = 2**31 - 1
+
+
+@dataclass(frozen=True)
+class CacheDirective:
+    """The one piece of a response's `Cache-Control` a caller may see (#357).
+
+    Deliberately narrow: a parsed non-negative `max-age` (clamped) and whether
+    the response forbids reuse (`no-store` or `no-cache`). The raw header
+    string, and every other response header, never leave this module — a
+    caller that wants caching semantics gets semantics, not a header it could
+    log or forward.
+    """
+
+    max_age: int | None
+    no_store: bool
+
+
+def parse_cache_control(value: str | None) -> CacheDirective | None:
+    """`CacheDirective` from a `Cache-Control` value, or None when absent.
+
+    Unknown directives are ignored; a malformed or negative `max-age` is
+    treated as absent (the caller's default applies, never "cache forever").
+    """
+    if value is None:
+        return None
+    max_age: int | None = None
+    no_store = False
+    for part in value.split(","):
+        name, _, arg = part.strip().partition("=")
+        name = name.strip().lower()
+        if name in ("no-store", "no-cache"):
+            no_store = True
+        elif name == "max-age":
+            arg = arg.strip().strip('"')
+            if arg.isascii() and arg.isdigit():
+                max_age = min(int(arg), _MAX_AGE_CEILING)
+    return CacheDirective(max_age=max_age, no_store=no_store)
+
+
 @dataclass
 class FetchResult:
     chunks: AsyncIterator[bytes]
     final_url: str
     content_type: str | None
+    # Parsed caching semantics only (see `CacheDirective`); `import_from_url`
+    # ignores it. Defaulted so existing fakes that build a result keep working.
+    cache_control: CacheDirective | None = None
 
 
 @asynccontextmanager
@@ -2497,6 +2551,9 @@ async def _fetch_hops(
                 chunks=response.aiter_bytes(),
                 final_url=parts.url,
                 content_type=response.headers.get("content-type"),
+                cache_control=parse_cache_control(
+                    response.headers.get("cache-control")
+                ),
             )
             return
         finally:

@@ -19,9 +19,11 @@ from pathlib import Path
 from sqlalchemy import (
     String,
     bindparam,
+    case,
     delete,
     func,
     literal,
+    literal_column,
     null,
     or_,
     select,
@@ -30,13 +32,19 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 
-from src.config import MAX_CHUNKS_PER_NOTE, MAX_LINKS_PER_NOTE, settings
+from src.config import (
+    MAX_CHUNKS_PER_NOTE,
+    MAX_LINKS_PER_NOTE,
+    MAX_TASKS_PER_NOTE,
+    settings,
+)
 from src.database import async_session
 from src.models.db import (
     IndexerRun,
     NoteEmbedding,
     NoteLink,
     NoteMetadata,
+    NoteTask,
     OAuthClient,
     OAuthCode,
     OAuthToken,
@@ -48,13 +56,20 @@ from src.services.embeddings import (
     NoteEmbedOutcome,
     StaleCertification,
     certify_embedded,
-    chunk_text_bounded,
+    chunk_note_bounded,
     clean_at_version,
-    clean_for_embedding,
     embed_note,
+    legacy_vectors_sql,
+    vectors_not_current_sql,
 )
-from src.services.fts import index_tsvector_sql
-from src.services import empty_prune, indexer_health
+from src.services.fts import (
+    aliases_text,
+    excerpt_of,
+    index_tsvector_sql,
+    rehead_tsvector_sql,
+    tags_text,
+)
+from src.services import change_feed, empty_prune, indexer_health
 from src.services.rate_limits import flush_expired
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
@@ -77,6 +92,8 @@ from src.services.links import (
     resolve_target,
 )
 from src.oauth.grants import lock_account_guard
+from src.services.tasks import extract_tasks_bounded, frontmatter_line_offset
+from src.services.note_hash import canonical_note_text_strict, text_hash
 from src.services import git_history, vault_overlap
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
@@ -714,7 +731,10 @@ logger = logging.getLogger(__name__)
 
 
 def _content_hash(content: str) -> str:
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    """The note hash of already-canonical text: `note_hash.text_hash`, so the
+    pass's `content_hash` equals `canonical_note_hash` of the file's bytes
+    (#351, D3) — one definition shared with every change-feed event."""
+    return text_hash(content)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -757,19 +777,11 @@ def _content_hash(content: str) -> str:
 # CLEARS, so it can never suppress an invalidation another rule mandates — a
 # content change, a `file_path` change, a provider change, exclusion
 # reconciliation.
-# Version 3 is an **Obsidian-syntax** bump: `%%comments%%` are now excluded
-# from link extraction, tag extraction and the embedding text; the inline-tag
-# grammar no longer reads hex colours and issue numbers as tags and now reads
-# Unicode ones that it used to truncate; and `resolve_target` learned
-# frontmatter aliases, case-insensitive filenames and Obsidian's
-# shortest-path tie-break. All three are invisible to `content_hash`, so the
-# marker is what re-derives them. Unlike version 2 the *embedding* text does
-# move — but only for a note containing a comment, and
-# `_grammar_changed_the_embedding_text` compares per note, so the re-embed is
-# scoped to those notes rather than to the vault. No manual `make reindex` is
-# needed: the next pass sees every row's marker as stale, re-parses it,
-# re-tags it, re-links it, re-writes its keyword vector and re-stamps it.
-CURRENT_EXTRACTION_VERSION = 4
+# Fork version 3 adds Obsidian comments/tags/aliases; version 4 merges the
+# upstream graph grammar. Version 5 adds task extraction without changing
+# embedding text. The bump backfills note_tasks for existing fork version 4
+# rows, and TASKS_SINCE_EXTRACTION_VERSION uses this same marker.
+CURRENT_EXTRACTION_VERSION = 5
 
 
 def _grammar_changed_the_embedding_text(stamped_version: int, body: str) -> bool:
@@ -846,8 +858,15 @@ async def write_tsvector_bounded(
     while True:
         try:
             async with session.begin_nested():
+                # The excerpt is a prefix of exactly the text this attempt
+                # binds (#344, D4), so a retreat re-binds it with the body.
+                # The title, aliases and tags binds are the caller's and are
+                # never halved: the head is bounded by construction
+                # (`FTS_ALIASES_MAX_CHARS`, `FTS_TAGS_MAX_CHARS`).
+                attempt = content[:length]
                 result = await session.execute(
-                    statement, {**params, "content": content[:length]}
+                    statement,
+                    {**params, "content": attempt, "excerpt": excerpt_of(attempt)},
                 )
                 rowcount = result.rowcount
         except Exception as exc:
@@ -1964,18 +1983,28 @@ def read_note_at(
     that could describe a different file from the one that was hashed. Not the
     reason for the anchoring; a free consequence of it.
 
-    Text mode with the default universal-newline translation, exactly as the
-    `Path.read_text` it replaces — a binary read would leave `\\r\\n` intact and
-    silently change every CRLF note's `content_hash`, forcing a re-embed.
+    The text is `note_hash.canonical_note_text_strict` of the bytes read
+    (#351, D3): a strict UTF-8 decode, `\\r\\n` and lone `\\r` translated to
+    `\\n` exactly as the text-mode read it replaced (`Path.read_text`'s
+    universal newlines — a binary read that kept `\\r\\n` would silently change
+    every CRLF note's `content_hash` and force a re-embed), and U+0000
+    removed. The same function computes every change-feed event's hash, so a
+    tool's event and the pass's row agree on a CRLF or NUL note.
+    `tests/test_note_hash.py` pins it against the old text-mode read.
     """
     fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=parent_fd)
     try:
         stat = os.fstat(fd)
-        with open(fd, "r", encoding="utf-8", errors="strict", closefd=False) as handle:
-            text_ = handle.read()
+        with open(fd, "rb", closefd=False) as handle:
+            data = handle.read()
     finally:
         os.close(fd)
-    nul = text_.count("\x00")
+    # Raises `UnicodeDecodeError` on bytes that are not UTF-8, exactly as the
+    # strict text-mode read did; every caller's not-indexable branch keys on it.
+    text_ = canonical_note_text_strict(data)
+    # A 0x00 byte in UTF-8 is only ever U+0000, so the bytes' count is the
+    # number of characters the canonical text removed.
+    nul = data.count(b"\x00")
     if nul:
         logger.warning(
             "Removed %d NUL character(s) from %s before indexing; the file on "
@@ -1983,7 +2012,6 @@ def read_note_at(
             nul,
             _loggable_path(rel if rel is not None else name),
         )
-        text_ = text_.replace("\x00", "")
     return text_, stat
 
 
@@ -2281,6 +2309,7 @@ def _scan_vault(
     re_derive: bool,
     stop: threading.Event,
     facts: "RootFacts | None" = None,
+    keep_bodies: bool = False,
 ) -> ScanResult:
     """Walk, stat, read and hash the pinned root. **Runs on a worker thread.**
 
@@ -2371,9 +2400,11 @@ def _scan_vault(
                 read=True,
                 size=st.st_size,
                 mtime=st.st_mtime,
+                # A full-hash (backstop) pass keeps every body too: the
+                # provider-input digest backstop re-chunks it (#355, D3a).
                 raw=(
                     raw
-                    if _needs_body(rel, h, snapshot, re_derive, facts)
+                    if keep_bodies or _needs_body(rel, h, snapshot, re_derive, facts)
                     else None
                 ),
             )
@@ -2409,6 +2440,7 @@ async def _run_scan(
     force_read: bool,
     re_derive: bool,
     facts: "RootFacts | None" = None,
+    keep_bodies: bool = False,
 ) -> ScanResult:
     """`_scan_vault` in a worker thread, with stop-on-cancel.
 
@@ -2427,6 +2459,7 @@ async def _run_scan(
             re_derive=re_derive,
             stop=stop,
             facts=facts,
+            keep_bodies=keep_bodies,
         )
     )
     try:
@@ -2560,6 +2593,13 @@ async def _reconcile_provenance(
                 delete(NoteMetadata).where(NoteMetadata.user_id == user_id)
             )
             stamped = await _stamp_provenance(session, user_id, facts)
+            if stamped == 1:
+                # #351, D5: the previous root's events go with its rows —
+                # their paths name another root — the watermark rises so an
+                # old cursor reads `history_truncated`, and one `reset` starts
+                # this root's history. In this transaction (all or nothing),
+                # the feed lock last.
+                await change_feed.discard_scope(session, user_id)
             if stamped != 1:
                 # The stamp must land on exactly the row we locked. Zero rows
                 # means the record does not exist, and a delete standing beside
@@ -3011,6 +3051,9 @@ async def _index_vault_pinned(
     scan = await _run_scan(
         root_fd, snapshot, force_read=force_read, re_derive=re_derive,
         facts=facts if re_derive else None,
+        # The full-hash pass keeps every body for the input-digest backstop
+        # (#355, D3a) — a re-derive's memory shape, once per interval.
+        keep_bodies=backstop,
     )
     skips.extend(scan.skips)
     # Backstop-blocking failures (D12). From the scan: walk failures and read
@@ -3094,6 +3137,88 @@ async def _index_vault_pinned(
                 restarts,
                 retries,
             )
+
+
+def _input_digest_mismatches(rows, candidates: dict, exclude_patterns) -> list[int]:
+    """Ids of the certified rows whose stored input digest is NULL or differs
+    from what the current code would send for them (#355, D3a). Pure CPU —
+    runs off the loop, makes no provider call."""
+    from src.services.embeddings import input_digest, note_provider_inputs
+
+    stale: list[int] = []
+    for row in rows:
+        rel_path, text_in_hand, is_raw = candidates[row.id]
+        body = parse_frontmatter(text_in_hand)[1] if is_raw else text_in_hand
+        excluded = any(
+            fnmatch.fnmatch(row.file_path, pat) for pat in exclude_patterns
+        )
+        expected = input_digest(
+            note_provider_inputs(body, row.title, row.tags, excluded=excluded)
+        )
+        if row.embedded_input_digest != expected:
+            stale.append(row.id)
+    return stale
+
+
+async def _recheck_input_digests(
+    session, user_id: int | None, candidates: dict, log_suffix: str
+) -> None:
+    """Clear the certification of every note certified under the current
+    chunking version whose stored input digest no longer matches (D3a).
+
+    Bounds any invalidation path a title or tag writer missed to
+    `INDEX_FULL_HASH_INTERVAL_HOURS`. Owner-scoped like every write here.
+    """
+    from src.services.embeddings import CHUNKING_VERSION
+
+    owner = "user_id IS NULL" if user_id is None else "user_id = :uid"
+    # Strict `= :cv`, deliberately, not the reuse table's "any formatter-table
+    # version" (#390, D5): the digest is recomputed with the CURRENT code's
+    # inputs, so it is comparable only for a note certified under the current
+    # version. A version-1 note is not cleared here; it waits in the backlog
+    # (`IS DISTINCT FROM`) and stays fresh.
+    params: dict = {"ids": list(candidates), "cv": CHUNKING_VERSION}
+    if user_id is not None:
+        params["uid"] = user_id
+    rows = (
+        await session.execute(
+            text(
+                "SELECT id, file_path, title, tags, embedded_input_digest "
+                "FROM notes_metadata "
+                f"WHERE id = ANY(:ids) AND {owner} "
+                "AND embedded_content_hash IS NOT DISTINCT FROM content_hash "
+                "AND embedded_chunking_version = :cv"
+            ),
+            params,
+        )
+    ).fetchall()
+    if not rows:
+        return
+    stale = await asyncio.to_thread(
+        _input_digest_mismatches,
+        rows,
+        candidates,
+        list(settings.embedding_exclude_patterns or []),
+    )
+    if not stale:
+        return
+    clear: dict = {"ids": stale}
+    if user_id is not None:
+        clear["uid"] = user_id
+    await session.execute(
+        text(
+            "UPDATE notes_metadata SET embedded_content_hash = NULL "
+            f"WHERE id = ANY(:ids) AND {owner}"
+        ),
+        clear,
+    )
+    logger.warning(
+        "Full-hash pass%s: %d note(s) were certified for a provider input they "
+        "no longer have (stored input digest missing or different); their "
+        "certification is cleared and the embed pass re-embeds them.",
+        log_suffix,
+        len(stale),
+    )
 
 
 async def _index_vault_attempt(
@@ -3335,6 +3460,14 @@ async def _index_vault_attempt(
         # pass treats every note as changed and therefore holds the whole
         # vault's parsed bodies for the duration of the pass.
         path_to_content: dict[str, str] = {}
+        # Beside it, filled on the same branch (#350, D3): the number of line
+        # terminators in each buffered body's frontmatter block, so a task's
+        # line number counts from the file's first line.
+        path_to_line_offset: dict[str, int] = {}
+        # Notes whose provider-input digest a full-hash pass re-checks (#355,
+        # D3a): row id → (path, raw-or-body, is_raw). Filled on a backstop
+        # pass only, from bytes this pass already holds.
+        digest_candidates: dict[int, tuple[str, str, bool]] = {}
         for rel_path, found in scan.files.items():
             h = found.content_hash
             # A stale extraction marker makes a note changed even when its
@@ -3369,6 +3502,13 @@ async def _index_vault_attempt(
                         "hash": h,
                         **_stat_params(found.stat),
                     })
+                # The input-digest backstop (#355, D3a): a full-hash pass
+                # has every note's bytes in hand, so it can recompute what
+                # the embed pass would send for it, without a provider call.
+                if backstop and found.read and found.raw is not None:
+                    digest_candidates[locked_ids[rel_path]] = (
+                        rel_path, found.raw, True,
+                    )
                 continue
 
             if found.raw is None:
@@ -3426,7 +3566,13 @@ async def _index_vault_attempt(
                     withholding.append(entry)
                 continue
             path_to_content[rel_path] = content
+            path_to_line_offset[rel_path] = frontmatter_line_offset(raw, content)
             title = _note_title(frontmatter, found.name)
+            if backstop and rel_path in existing and existing[rel_path] == h:
+                # Re-upserted with unchanged bytes (a stale marker or a
+                # re-derive): its digest is re-checked after the upsert,
+                # against the title and tags this pass writes.
+                digest_candidates[locked_ids[rel_path]] = (rel_path, content, False)
 
             # Grammar-attributable embedding invalidation, scoped to notes
             # whose recognised spans actually moved. Only asked where it
@@ -3464,6 +3610,9 @@ async def _index_vault_attempt(
                 "extraction_version": CURRENT_EXTRACTION_VERSION,
                 "file_size": found.size,
                 "modified_at": datetime.fromtimestamp(git_times.get(rel_path, found.mtime), tz=timezone.utc),
+                # First observation uses filesystem time; subsequent content
+                # changes are stamped atomically by the upsert.
+                "content_changed_at": datetime.fromtimestamp(found.mtime, tz=timezone.utc),
                 **_stat_params(found.stat),
             })
 
@@ -3569,9 +3718,27 @@ async def _index_vault_attempt(
             # `embedded_content_hash = NULL` stays unconditional and is not the
             # grammar rule: it is the path-change invalidation (#127), which
             # applies to every move whatever the marker says.
+            # The title is **inside the keyword vector** since 031 (#344,
+            # D6), at weight A, so a move that rewrites `title` and keeps the
+            # vector would serve the old stem as a false positive and miss
+            # the new one for ever — #127 D3's class, one column over. The
+            # head is replaced from the same parsed entry; the body part and
+            # `body_excerpt` are untouched (the content did not change). This
+            # statement runs inside the pass transaction, which took the
+            # generation lock at its head and asserted the fingerprint.
+            # Bind names of the head's own: `:title` also assigns the varchar
+            # column below, and asyncpg refuses one parameter deduced as both
+            # `character varying` and `text` (AmbiguousParameterError).
+            # The tags part rides in the same head (#391, D6), bound from the
+            # same parsed entry as the `tags` column below; its own bind name,
+            # for the same asyncpg reason (`:tags` is `varchar[]`).
+            rehead_frag, rehead_params = rehead_tsvector_sql(
+                "head_title", "head_aliases", tags_bind="head_tags"
+            )
             move_upd_sql = (
                 "UPDATE notes_metadata "
                 "SET file_path = :new, title = :title, tags = :tags, "
+                f"content_tsvector = {rehead_frag}, "
                 "file_size = :size, modified_at = :mtime, indexed_at = now(), "
                 "extraction_version = :xver, "
                 "embedded_content_hash = NULL, "
@@ -3612,6 +3779,9 @@ async def _index_vault_attempt(
                 e = entry_by_path[new]
                 params: dict = {
                     "new": new, "old": old, "title": e["title"],
+                    "head_title": e["title"],
+                    "head_aliases": aliases_text(e["frontmatter"]),
+                    "head_tags": tags_text(e["tags"]), **rehead_params,
                     "tags": e["tags"], "xver": CURRENT_EXTRACTION_VERSION,
                     "size": e["file_size"], "mtime": e["modified_at"],
                     "stat_size": e["stat_size"],
@@ -3716,10 +3886,56 @@ async def _index_vault_attempt(
                         "stat_ctime_ns": stmt.excluded.stat_ctime_ns,
                         "stat_ino": stmt.excluded.stat_ino,
                         "indexed_at": text("now()"),
+                        # #351, D1: moved only when the stored hash differs
+                        # from the one this statement writes — compared in the
+                        # statement that overwrites it, so the stamp cannot
+                        # drift from the hash it describes. `now()` (this
+                        # pass's start), not the new mtime: a sync client that
+                        # preserves mtime would stamp a real edit in the past.
+                        # The only writer of this column.
+                        "content_changed_at": case(
+                            (
+                                NoteMetadata.content_hash.is_distinct_from(
+                                    stmt.excluded.content_hash
+                                ),
+                                func.now(),
+                            ),
+                            else_=NoteMetadata.content_changed_at,
+                        ),
                         # #311, D3: a rewrite of the row's derived state is
                         # not derived under any root until a re-deriving
                         # pass's tail marks it, in this same transaction.
                         "derived_under": null(),
+                        # #355, D3a: the title and tags are inside every
+                        # chunk's provider input (the context prefix), so a
+                        # rewrite that changes either — a re-derive, an
+                        # extraction-version re-upsert, a frontmatter edit —
+                        # clears the certification in this same statement and
+                        # the backlog re-selects the note. Unchanged title and
+                        # tags leave it alone, so a marker bump re-embeds
+                        # nothing on that account.
+                        "embedded_content_hash": case(
+                            (
+                                or_(
+                                    NoteMetadata.title.is_distinct_from(
+                                        stmt.excluded.title
+                                    ),
+                                    # NULL and `{}` build the same prefix (no
+                                    # tags line), so they compare equal.
+                                    func.coalesce(
+                                        NoteMetadata.tags,
+                                        literal_column("'{}'::varchar[]"),
+                                    ).is_distinct_from(
+                                        func.coalesce(
+                                            stmt.excluded.tags,
+                                            literal_column("'{}'::varchar[]"),
+                                        )
+                                    ),
+                                ),
+                                null(),
+                            ),
+                            else_=NoteMetadata.embedded_content_hash,
+                        ),
                     },
                 )
                 return stmt
@@ -3861,6 +4077,15 @@ async def _index_vault_attempt(
                 log_suffix,
             )
 
+        # The full-hash backstop for the provider-input certification (#355,
+        # D3a). After the upsert, so a re-upserted row is compared under the
+        # title and tags this pass just wrote; inside the pass transaction,
+        # which holds the generation lock, so no certification interleaves.
+        if digest_candidates:
+            await _recheck_input_digests(
+                session, user_id, digest_candidates, log_suffix
+            )
+
         # Update tsvectors for changed notes
         if to_upsert:
             paths = [n["file_path"] for n in to_upsert]
@@ -3871,21 +4096,39 @@ async def _index_vault_attempt(
             # mode. The tsvector expression is built from `settings.fts_configs`
             # (see `src/services/fts.py`) so index-time configs match the
             # query-time configs in `search.py`.
-            tsv_frag, tsv_params = index_tsvector_sql("content")
+            # `A(title) || A(aliases) || D(body)` and the excerpt in the same
+            # statement (#344, D1/D4): the title is the entry's (the shared
+            # rule), the aliases text the shared aliases rule over the same
+            # parsed frontmatter the row's JSONB was sanitised from.
+            # Since #391 the head carries `B(tags)` between the aliases and the
+            # body, bound from the same entry whose `tags` column the upsert
+            # above wrote in this transaction. `tags_text`, not `tags`: the
+            # bind must not collide with a `tags` column bind.
+            tsv_frag, tsv_params = index_tsvector_sql(
+                "content", "title", "aliases", tags_bind="tags_text"
+            )
             if user_id is None:
                 tsv_sql = f"""
                     UPDATE notes_metadata
-                    SET content_tsvector = {tsv_frag}
+                    SET content_tsvector = {tsv_frag},
+                        body_excerpt = :excerpt
                     WHERE file_path = :path
                       AND user_id IS NULL
                 """
             else:
                 tsv_sql = f"""
                     UPDATE notes_metadata
-                    SET content_tsvector = {tsv_frag}
+                    SET content_tsvector = {tsv_frag},
+                        body_excerpt = :excerpt
                     WHERE file_path = :path
                       AND user_id = :uid
                 """
+            head_by_path = {
+                n["file_path"]: (
+                    n["title"], aliases_text(n["frontmatter"]), tags_text(n["tags"])
+                )
+                for n in to_upsert
+            }
             for path in paths:
                 # Reuse the body parsed during the scan loop above instead of
                 # re-reading from disk; a concurrent delete between the passes
@@ -3900,7 +4143,11 @@ async def _index_vault_attempt(
                     underived.add(path)  # never marked (#311, D3)
                     continue
                 content = path_to_content[path]
-                params: dict = {"path": path, **tsv_params}
+                head_title, head_aliases, head_tags = head_by_path[path]
+                params: dict = {
+                    "path": path, "title": head_title, "aliases": head_aliases,
+                    "tags_text": head_tags, **tsv_params,
+                }
                 if user_id is not None:
                     params["uid"] = user_id
                 # Full body first, halving retreat per note, floor failure
@@ -3924,11 +4171,13 @@ async def _index_vault_attempt(
                         raise
 
                     async def _floor(content=content, params=params):
+                        floor_content = content[:TSVECTOR_CONTENT_FLOOR_CHARS]
                         await session.execute(
                             text(tsv_sql),
                             {
                                 **params,
-                                "content": content[:TSVECTOR_CONTENT_FLOOR_CHARS],
+                                "content": floor_content,
+                                "excerpt": excerpt_of(floor_content),
                             },
                         )
 
@@ -3981,10 +4230,13 @@ async def _index_vault_attempt(
             link_skips: list[str] = []
             # D3, site 4: each note's link inserts in their own savepoint.
             poisoned_links: list[tuple[str, str]] = []
-            await _update_links_for_changed(
+            changed_for_derivation = (
+                [n["file_path"] for n in to_upsert] + list(moved_new_paths)
+            )
+            link_paths_to_id = await _update_links_for_changed(
                 session,
                 vault,
-                [n["file_path"] for n in to_upsert] + list(moved_new_paths),
+                changed_for_derivation,
                 user_id=user_id,
                 path_to_content=path_to_content,
                 skips=link_skips,
@@ -3998,6 +4250,27 @@ async def _index_vault_attempt(
                 ])
             skips.extend(link_skips)
             withholding.extend(link_skips)
+
+            # ── Task rows for changed notes (#350, D4) ───────────────────
+            # The second per-note derivation, after the link rebuild, for the
+            # same changed list, in this transaction. Its missing-body and
+            # missing-id skips withhold exactly as the link rebuild's do; a
+            # task-derivation failure is isolated to that note's task rows
+            # (`tasks_failed`) and is never poison, never a skip. A third
+            # derivation (#351) is one more call after this one.
+            task_skips: list[str] = []
+            await _update_tasks_for_changed(
+                session,
+                changed_for_derivation,
+                user_id=user_id,
+                paths_to_id=link_paths_to_id,
+                bodies=path_to_content,
+                line_offsets=path_to_line_offset,
+                skips=task_skips,
+                skipped_paths=underived,
+            )
+            skips.extend(task_skips)
+            withholding.extend(task_skips)
 
         # ── Re-derive progress (#311, D3) ─────────────────────────────────
         # Mark every row this re-deriving pass fully derived — upserted or
@@ -4172,6 +4445,37 @@ async def _index_vault_attempt(
                 _format_skips(skips),
             )
 
+        # ── The change feed (#351, D5): the attempt's FINAL statement ─────
+        # Collected from this pass's own classification only — `existing`,
+        # `to_upsert`, the committed moves, the final `deleted_paths` — which
+        # no derivation stage mutates, and appended after every one of them
+        # (keyword vectors, links, tasks, the re-derive tail and its stamp).
+        # **Any future stage goes above this block**, so a `PoisonNote` it
+        # raises restarts the attempt before an event exists. The feed lock
+        # is the last lock this transaction takes. A failed append never
+        # fails the pass: it leaves one durable `note_event_gaps` row,
+        # committed with the pass (a plain INSERT that waits on nothing).
+        feed_events = _collect_feed_events(
+            locked=locked,
+            existing=existing,
+            to_upsert=to_upsert,
+            moves=moves,
+            moved_new_paths=moved_new_paths,
+            upsert_hash=upsert_hash,
+            deleted_paths=deleted_paths,
+            not_indexable_rows=not_indexable_rows,
+            not_indexable=scan.not_indexable,
+        )
+        if feed_events:
+            written = await change_feed.append_events(
+                session, user_id, feed_events,
+                source=change_feed.SOURCE_INDEX,
+                suppress=True,
+                max_items=settings.change_feed_max_events_per_pass,
+            )
+            if written < 0:
+                await change_feed.record_gap(session, user_id, -written)
+
         # Metadata hashes, keyword vectors, deletions, and link rows describe
         # one filesystem snapshot. Commit them together so a failure in a
         # later stage cannot leave a new hash paired with stale search data
@@ -4239,6 +4543,78 @@ async def _index_vault_attempt(
         walk_protected=len(protected),
         rederive_pending=rederive_pending,
     )
+
+
+def _collect_feed_events(
+    *,
+    locked: dict,
+    existing: dict,
+    to_upsert: list,
+    moves: list,
+    moved_new_paths: set,
+    upsert_hash: dict,
+    deleted_paths: set,
+    not_indexable_rows: set,
+    not_indexable: dict,
+) -> list:
+    """The pass's change-feed candidates (#351, design D5), in the fixed order
+    moves, deletions, creations, modifications, path order within each.
+
+    - `created`: inserted rows that are not move destinations;
+    - `modified`: upserts whose hash differs from the locked row's — the
+      same-hash marker and re-derive re-upserts are excluded, exactly the rows
+      whose `content_changed_at` did not move;
+    - `moved`: the committed id-preserving moves;
+    - `deleted`: every row this pass removes, `reason=removed` for an ordinary
+      prune, `not_indexable` for a present-but-not-indexable path,
+      `quarantined` for a quarantine removal;
+    - `created reason=not_indexable`: a path whose *content* cannot be indexed
+      and that has no row (suppressed under the lock once the feed already
+      says so). A path not indexable by its *name* cannot be stored in a feed
+      row either, so it has no event.
+
+    Nothing for protected (#309) or C5-deferred rows: this pass does not
+    change them. A scope with no rows at the attempt's start is a baseline:
+    one `reset` instead of a creation per note, and only when the pass
+    actually writes rows (an empty vault's every tick is not a reset).
+    """
+    if not locked:
+        if to_upsert:
+            return [change_feed.Event("reset")]
+        return []
+    moved = [
+        change_feed.Event("moved", path=new, from_path=old,
+                          content_hash=upsert_hash.get(new))
+        for old, new in sorted(moves, key=lambda m: m[1])
+        if new in moved_new_paths
+    ]
+    deleted = []
+    for p in sorted(deleted_paths):
+        if p in not_indexable_rows:
+            reason = (change_feed.REASON_QUARANTINED if not_indexable.get(p) == QUARANTINED
+                      else change_feed.REASON_NOT_INDEXABLE)
+        else:
+            reason = change_feed.REASON_REMOVED
+        deleted.append(change_feed.Event("deleted", path=p, reason=reason))
+    created, modified = [], []
+    for e in sorted(to_upsert, key=lambda e: e["file_path"]):
+        p, h = e["file_path"], e["content_hash"]
+        if p not in existing:
+            created.append(change_feed.Event("created", path=p, content_hash=h))
+        elif existing[p] != h:
+            modified.append(change_feed.Event("modified", path=p, content_hash=h))
+    for p in sorted(not_indexable):
+        if (p not in existing and not_indexable[p] == NOT_UTF8_CONTENT
+                and change_feed.is_note_path(p)):
+            created.append(change_feed.Event(
+                "created", path=p, reason=change_feed.REASON_NOT_INDEXABLE
+            ))
+    created.sort(key=lambda e: e.path)
+    events = moved + deleted + created + modified
+    return [e for e in events if e.kind == "reset" or (
+        change_feed.is_note_path(e.path)
+        and (e.from_path is None or change_feed.is_note_path(e.from_path))
+    )]
 
 
 async def _rederive_invariant(session, user_id: int, facts, *, lock: bool):
@@ -4413,6 +4789,10 @@ async def _update_links_for_changed(
     (`index-integrity`, "A capped note does not withhold the record").
 
     `vault` is retained in the signature and is deliberately unused for reads.
+
+    Returns the pass's `paths_to_id` map (this scope's `file_path -> id`,
+    read in this transaction after the upsert), which the task derivation
+    reuses (#350, D4) — or None when it returned early on poison.
     """
     bodies = path_to_content if path_to_content is not None else {}
     # Build vault_index once for the entire pass — scoped to this user when set.
@@ -4534,7 +4914,7 @@ async def _update_links_for_changed(
 
             if poisoned:
                 # The caller rolls this attempt back and restarts.
-                return
+                return None
 
             # The marker is derived state, exactly like the rows: set where
             # this pass capped, cleared where it did not, in the same
@@ -4651,6 +5031,215 @@ async def _update_links_for_changed(
             f"{where_extra}"
         )
         await session.execute(text(reresolve_sql), params)
+    return paths_to_id
+
+
+class _TaskExtractionFailed(Exception):
+    """The task extractor raised. Wrapped so the savepoint helper can tell an
+    extractor bug (a derivation failure, design D4) from a database error."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(type(cause).__name__)
+        self.cause = cause
+
+
+async def _task_savepoint(session, run) -> BaseException | None:
+    """Run `await run()` in a savepoint (#350, D4).
+
+    Returns the exception when it is a **derivation failure** — the extractor
+    raised (`_TaskExtractionFailed`) or a statement failed with a poison
+    SQLSTATE — and the savepoint rolled back cleanly; None on success.
+    Anything else re-raises, and so does a savepoint whose rollback itself
+    failed (the exception leaving the block is then not the body's), for the
+    reason `_savepoint_poison` gives (C4).
+    """
+    body_exc: BaseException | None = None
+    try:
+        async with session.begin_nested():
+            try:
+                await run()
+            except Exception as e:
+                body_exc = e
+                raise
+    except Exception as exc:
+        if exc is not body_exc:
+            raise
+        if isinstance(exc, _TaskExtractionFailed) or poison_sqlstate(exc) is not None:
+            return exc
+        raise
+    return None
+
+
+async def _update_tasks_for_changed(
+    session,
+    changed_paths: list[str],
+    *,
+    user_id: int | None = None,
+    paths_to_id: dict[str, int] | None,
+    bodies: dict[str, str],
+    line_offsets: dict[str, int],
+    skips: list[str],
+    skipped_paths: set[str] | None,
+) -> None:
+    """Re-derive `note_tasks` for every changed note (#350, design D4).
+
+    The second per-note derivation of the pass, called right after
+    `_update_links_for_changed` with the same changed list, in the pass's
+    transaction. It follows the composition rule in `src.services.tasks`:
+
+    - **No file read.** Bodies come from the scan's buffer (`bodies`), line
+      offsets from the parallel `line_offsets`. A changed path with no
+      buffered body or no row in `paths_to_id` is appended to `skips` and
+      `skipped_paths`, so a re-derive's record is withheld (#311), exactly
+      as the link rebuild records the same two cases.
+    - **Per note, in its own savepoint**: delete the note's task rows, insert
+      the extracted ones in batches of 1,000, clear `tasks_failed` and set or
+      clear `tasks_truncated` (one UPDATE, predicated on a value changing).
+    - **Failure isolation.** A derivation failure — the extractor raised, or
+      one of the note's statements failed with a poison SQLSTATE — rolls the
+      savepoint back and is retried once in a fresh one. If the retry fails
+      too, a third savepoint deletes the note's task rows and sets
+      `tasks_failed`, with one ERROR line (path, exception class, SQLSTATE —
+      never content). It is **not** poison: nothing is appended to a
+      `poisoned` list, no `PoisonNote` is raised, nothing is quarantined, and
+      it is not a skip. Any other database error propagates and fails the
+      pass with nothing committed.
+    - A note over `MAX_TASKS_PER_NOTE` keeps its first N tasks, has
+      `tasks_truncated` set and is logged at ERROR. Not a skip.
+    """
+    if not changed_paths:
+        return
+    if paths_to_id is None:
+        # The link rebuild returned no map (it only does so on poison, after
+        # which the caller restarts without reaching here). Read the same map
+        # it would have, in this transaction, rather than trust that.
+        stmt = select(NoteMetadata.file_path, NoteMetadata.id)
+        if user_id is None:
+            stmt = stmt.where(NoteMetadata.user_id.is_(None))
+        else:
+            stmt = stmt.where(NoteMetadata.user_id == user_id)
+        paths_to_id = {r.file_path: r.id for r in (await session.execute(stmt)).all()}
+
+    total_rows = 0
+    truncated_count = 0
+    failed_count = 0
+    for path in changed_paths:
+        note_id = paths_to_id.get(path)
+        if note_id is None:
+            skips.append(f"{path} (no index row for the task rebuild)")
+            if skipped_paths is not None:
+                skipped_paths.add(path)
+            continue
+        body = bodies.get(path)
+        offset = line_offsets.get(path)
+        if body is None or offset is None:
+            skips.append(f"{path} (no buffered body for the task rebuild)")
+            if skipped_paths is not None:
+                skipped_paths.add(path)
+            continue
+
+        outcome: dict = {}
+
+        async def _derive(note_id=note_id, body=body, offset=offset, outcome=outcome):
+            outcome.clear()
+            try:
+                # Off the loop, like `extract_links_bounded` (#180, D3).
+                extracted, truncated = await asyncio.to_thread(
+                    extract_tasks_bounded,
+                    body,
+                    line_offset=offset,
+                    max_tasks=MAX_TASKS_PER_NOTE,
+                )
+            except Exception as e:
+                raise _TaskExtractionFailed(e) from e
+            await session.execute(delete(NoteTask).where(NoteTask.note_id == note_id))
+            rows = [
+                {
+                    "note_id": note_id,
+                    "line": t.line,
+                    "status_char": t.status_char,
+                    "state": t.state,
+                    "text": t.text,
+                    "text_cut": t.text_cut,
+                    "due": t.due,
+                    "scheduled": t.scheduled,
+                    "start": t.start,
+                    "done_on": t.done_on,
+                    "priority": t.priority,
+                    "tags": t.tags,
+                    "tags_cut": t.tags_cut,
+                    "heading_path": t.heading_path,
+                }
+                for t in extracted
+            ]
+            extracted = []
+            for start in range(0, len(rows), 1000):
+                await session.execute(insert(NoteTask).values(rows[start:start + 1000]))
+            await session.execute(
+                update(NoteMetadata)
+                .where(
+                    NoteMetadata.id == note_id,
+                    or_(
+                        NoteMetadata.tasks_failed.is_(True),
+                        NoteMetadata.tasks_truncated.is_(not truncated),
+                    ),
+                )
+                .values(tasks_failed=False, tasks_truncated=truncated)
+            )
+            outcome["rows"] = len(rows)
+            outcome["truncated"] = truncated
+
+        first = await _task_savepoint(session, _derive)
+        if first is not None:
+            again = await _task_savepoint(session, _derive)
+            if again is not None:
+                async def _mark_failed(note_id=note_id):
+                    await session.execute(
+                        delete(NoteTask).where(NoteTask.note_id == note_id)
+                    )
+                    await session.execute(
+                        update(NoteMetadata)
+                        .where(NoteMetadata.id == note_id)
+                        .values(tasks_failed=True)
+                    )
+
+                async with session.begin_nested():
+                    await _mark_failed()
+                failed_count += 1
+                cause = again.cause if isinstance(again, _TaskExtractionFailed) else again
+                # Path, exception class and SQLSTATE only — never content and
+                # never the driver's message, which can quote the value.
+                logger.error(
+                    "Task derivation failed for %s%s (%s, SQLSTATE %s) on the "
+                    "attempt and on its retry: the note's task rows are absent "
+                    "and notes_metadata.tasks_failed is set, so `list_tasks` "
+                    "counts it as a note whose tasks could not be indexed. The "
+                    "note itself stays indexed; this is not a quarantine.",
+                    _loggable_path(path),
+                    f" (user_id={user_id})" if user_id is not None else "",
+                    type(cause).__name__,
+                    poison_sqlstate(cause) or "none",
+                )
+                continue
+        total_rows += outcome.get("rows", 0)
+        if outcome.get("truncated"):
+            truncated_count += 1
+            logger.error(
+                "Task extraction truncated for %s: the note holds more than "
+                "MAX_TASKS_PER_NOTE=%d checkbox lines; the first %d in "
+                "document order were stored and notes_metadata.tasks_truncated "
+                "was set, so `list_tasks` counts this note as capped. A "
+                "declared degradation, not a skip.",
+                _loggable_path(path),
+                MAX_TASKS_PER_NOTE,
+                outcome.get("rows", 0),
+            )
+
+    logger.info(
+        f"Re-extracted tasks for {len(changed_paths)} notes ({total_rows} task rows)"
+        + (f", {truncated_count} truncated at {MAX_TASKS_PER_NOTE}" if truncated_count else "")
+        + (f", {failed_count} failed" if failed_count else "")
+    )
 
 
 async def _alias_aware_vault_index(session, user_id: int | None) -> dict:
@@ -4790,11 +5379,14 @@ def _read_body_beneath(root_fd: int, rel_path: str) -> str | None:
     return parse_frontmatter(raw)[1]
 
 
-def _read_body_and_hash(root_fd: int, rel_path: str) -> tuple[str, str]:
-    """`(parsed body, content_hash)` of one note, for the keyword-vector
-    rebuild; runs on a worker thread. Raises what `read_note_beneath` raises."""
+def _read_body_and_hash(root_fd: int, rel_path: str) -> tuple[dict, str, str]:
+    """`(parsed frontmatter, parsed body, content_hash)` of one note, for the
+    keyword-vector rebuild; runs on a worker thread. Raises what
+    `read_note_beneath` raises. The frontmatter is what the rebuild derives
+    the title and aliases from — the head of the vector it writes (#344)."""
     raw, _stat = read_note_beneath(root_fd, rel_path)
-    return parse_frontmatter(raw)[1], _content_hash(raw)
+    frontmatter, body = parse_frontmatter(raw)
+    return frontmatter, body, _content_hash(raw)
 
 
 async def _link_backfill_pinned(
@@ -5091,11 +5683,14 @@ class EmbedBudget:
     user's pass has completed, so a tenant whose very first note exceeds the
     whole budget still advances by one note per pass instead of zero for ever.
 
-    **Only when the pass serves more than one scope.** With one active scope
-    there is no other tenant to be fair to, and a budget there would spread a
-    first index of a few thousand notes over several five-minute-spaced passes
-    for no benefit. That clause is what keeps the default deployment's
-    behaviour identical to today's.
+    **Only when the pass serves more than one scope — except for the
+    chunking-version segment** (#355, D4). With one active scope there is no
+    other tenant to be fair to, and a budget there would spread a first index
+    of a few thousand notes over several five-minute-spaced passes for no
+    benefit. The version-only segment is the exception: it is a re-embed of
+    the whole vault that nobody is waiting for, and unbudgeted it would hold
+    the indexer — and every real edit's keyword update — for an hour or more.
+    See `enter_version_only`.
 
     A stop is **not** a failure: it writes nothing to `indexer_runs.error` and
     logs once per user per pass, the same class of event as a pause. The
@@ -5112,6 +5707,38 @@ class EmbedBudget:
     started_at: float = field(default_factory=time.monotonic)
     #: One WARNING per user per pass, shared by the backlog loop and the sweep.
     announced: bool = False
+    #: Set when the backlog reached its version-only segment (#355, D4).
+    version_only_entered: bool = False
+    #: The segment switched enforcement on in a pass that was not budgeted.
+    enforced_for_version_only: bool = False
+
+    def enter_version_only(self) -> None:
+        """The backlog reached its chunking-version segment (#355, D4).
+
+        That segment is budgeted **whatever the number of active scopes**. In
+        a pass that was already budgeted (multi-scope) nothing changes: the
+        allowance spans both segments, as it always has. In an unbudgeted pass
+        enforcement starts here with a fresh allowance, so the at-least-one-
+        note rule and the note boundary apply to this segment exactly as they
+        do to a multi-scope pass, and real edits — which sort first — are
+        never charged against it.
+        """
+        if self.version_only_entered:
+            return
+        self.version_only_entered = True
+        if self.enforced:
+            return
+        self.enforced = True
+        self.enforced_for_version_only = True
+        self.chunks_submitted = 0
+        self.notes_completed = 0
+        self.started_at = time.monotonic()
+
+    def leave_version_only(self) -> None:
+        """Restore a single-scope pass's unbudgeted state for the sweep."""
+        if self.enforced_for_version_only:
+            self.enforced = False
+            self.enforced_for_version_only = False
 
     @property
     def active(self) -> bool:
@@ -5337,26 +5964,23 @@ async def _embed_vault_pinned(
         # it has to change: the certifying branch below sets or clears it from
         # `EmbedNoteResult.truncated`, and re-stamping an unchanged boolean on
         # every note of every pass would dirty every row for nothing.
-        if user_id is None:
-            sql = """
-                SELECT nm.id, nm.file_path, nm.content_hash, nm.chunks_truncated
-                FROM notes_metadata nm
-                WHERE nm.user_id IS NULL
-                  AND (nm.embedded_content_hash IS NULL
-                       OR nm.embedded_content_hash != nm.content_hash)
-                ORDER BY nm.modified_at DESC
-            """
-            params: dict = {}
-        else:
-            sql = """
-                SELECT nm.id, nm.file_path, nm.content_hash, nm.chunks_truncated
-                FROM notes_metadata nm
-                WHERE nm.user_id = :uid
-                  AND (nm.embedded_content_hash IS NULL
-                       OR nm.embedded_content_hash != nm.content_hash)
-                ORDER BY nm.modified_at DESC
-            """
-            params = {"uid": user_id}
+        #
+        # **The one "not current" predicate** (#355, D4): content-stale *or*
+        # embedded under another chunking version, shared with the dashboard
+        # and the progress endpoint. Content-stale notes come first, then
+        # version-only ones (`version_only`), each newest first, so a real
+        # edit is never queued behind the re-chunking backlog.
+        owner_clause = "nm.user_id IS NULL" if user_id is None else "nm.user_id = :uid"
+        sql = f"""
+            SELECT nm.id, nm.file_path, nm.content_hash, nm.chunks_truncated,
+                   (nm.embedded_content_hash IS NOT DISTINCT FROM nm.content_hash)
+                       AS version_only
+            FROM notes_metadata nm
+            WHERE {owner_clause}
+              AND {vectors_not_current_sql("nm")}
+            ORDER BY version_only, nm.modified_at DESC
+        """
+        params: dict = {} if user_id is None else {"uid": user_id}
         result = await session.execute(text(sql), params)
         unembedded = result.fetchall()
         budget = await _budget_for_pass(session, log_suffix)
@@ -5371,6 +5995,9 @@ async def _embed_vault_pinned(
         else:
             logger.info(f"Embedding {len(unembedded)} notes...{log_suffix}")
         total_chunks = 0
+        #: Of `total_chunks`, how many were sent to the provider; the rest
+        #: reused a stored vector (#390, design D8). Counts only.
+        total_submitted = 0
         skipped_excluded = 0
         # Notes this pass embedded and certified, plus the failures it
         # swallowed. `embedded` is incremented only after the per-note commit
@@ -5392,12 +6019,22 @@ async def _embed_vault_pinned(
             if _is_paused():
                 logger.info(f"Embedding pass paused, stopping early{log_suffix}")
                 break
+            # Version-only notes (#355, D4) are held to the budget **in every
+            # mode**, single-user included: without it the first pass after a
+            # chunking change would hold the indexer for the whole re-embed.
+            if getattr(row, "version_only", False):
+                budget.enter_version_only()
             # The budget sits beside the pause and is exactly as much of a
             # decision: between notes, never inside one, and never before this
             # user's pass has completed a note. A stop is not a failure and
             # moves neither counter.
             if budget.exhausted():
-                budget.stop(log_suffix, "the hash-mismatch backlog")
+                budget.stop(
+                    log_suffix,
+                    "the chunking-version backlog"
+                    if getattr(row, "version_only", False)
+                    else "the hash-mismatch backlog",
+                )
                 break
             try:
                 # Skip files matching exclude patterns. Drop any pre-existing
@@ -5431,7 +6068,8 @@ async def _embed_vault_pinned(
                     # generation change could invalidate, so there is nothing
                     # for the lock to protect.
                     await certify_embedded(
-                        session, row.id, row.content_hash, row.file_path
+                        session, row.id, row.content_hash, row.file_path,
+                        provider_inputs=[],
                     )
                     # **Unscoped by validity, deliberately** (migration 025).
                     # Everywhere else a delete of a note's vectors means "the
@@ -5549,6 +6187,7 @@ async def _embed_vault_pinned(
                     NoteEmbedOutcome.CERTIFIED_EMPTY,
                 ):
                     total_chunks += result.chunks_embedded
+                    total_submitted += result.chunks_submitted
                     # `CERTIFIED_EMPTY` leaves the note with no vectors at all,
                     # so its marker is cleared for the exclusion branch's
                     # reason; `EMBEDDED` sets it from what the chunker actually
@@ -5645,12 +6284,18 @@ async def _embed_vault_pinned(
         if unembedded:
             logger.info(
                 f"Embedding complete{log_suffix}: {len(unembedded)} notes, "
-                f"{total_chunks} chunks"
+                f"{total_chunks} chunks ({total_submitted} submitted, "
+                f"{total_chunks - total_submitted} reused)"
                 + (
                     f", {skipped_excluded} skipped by exclude patterns"
                     if skipped_excluded else ""
                 )
             )
+
+        # The version-only segment's enforcement ends with the backlog: the
+        # sweep below keeps the budget it had before #355 in a single-scope
+        # pass (unbudgeted), and its multi-scope behaviour is unchanged.
+        budget.leave_version_only()
 
         # The backlog only ever sees rows whose content changed. Editing
         # `EMBEDDING_EXCLUDE_PATTERNS` changes no content, so without this the
@@ -5661,7 +6306,37 @@ async def _embed_vault_pinned(
             outcome, budget,
         )
 
+        # `/health`'s non-volumetric `indexer.rechunk` (#355, D4): this
+        # scope's count under the one predicate, observed at the end of its
+        # embed stage and held in process memory. Never a failure, never in
+        # `status`; a failed count leaves the previous observation.
+        await _observe_rechunk(session, user_id, log_suffix)
+
     return outcome
+
+
+async def _observe_rechunk(session, user_id: int | None, log_suffix: str) -> None:
+    owner_clause = "nm.user_id IS NULL" if user_id is None else "nm.user_id = :uid"
+    params: dict = {} if user_id is None else {"uid": user_id}
+    try:
+        pending = (
+            await session.execute(
+                text(
+                    f"SELECT count(*) FROM notes_metadata nm "
+                    f"WHERE {owner_clause} AND {legacy_vectors_sql('nm')}"
+                ),
+                params,
+            )
+        ).scalar() or 0
+        await session.commit()
+    except Exception as e:  # noqa: BLE001 - bookkeeping must not fail the stage
+        logger.warning("Could not count notes pending re-chunking%s: %s", log_suffix, e)
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    indexer_health.record_rechunk(user_id, int(pending))
 
 
 async def _reconcile_exclusions(
@@ -5814,7 +6489,8 @@ async def _reconcile_exclusions(
                 # reason: no provider call, no vector written, and a claim that
                 # holds under every configuration.
                 await certify_embedded(
-                    session, row.id, row.content_hash, row.file_path
+                    session, row.id, row.content_hash, row.file_path,
+                    provider_inputs=[],
                 )
                 # Unscoped by validity for the backlog exclusion branch's
                 # reason (migration 025): an excluded note must not be
@@ -5855,14 +6531,14 @@ async def _reconcile_exclusions(
                 continue
 
             _, content = await asyncio.to_thread(parse_frontmatter, raw)
-            # The **bounded** chunker, so "this note produces no chunks" means
-            # the same thing here as it does in `embed_note`, and so the probe
-            # stops at the first chunk instead of chunking a 10 MiB note to
-            # find out it is non-empty.
-            cleaned = await asyncio.to_thread(clean_for_embedding, content)
+            # The **bounded** heading-aware chunker `embed_note` runs (#355),
+            # so "this note produces no chunks" means the same thing here as it
+            # does there — the zero-chunk invariant makes that the pre-034
+            # answer too — and the probe stops one chunk past the cap instead
+            # of chunking a 10 MiB note without bound.
             probe_chunks, _probe_truncated = await asyncio.to_thread(
-                chunk_text_bounded,
-                cleaned,
+                chunk_note_bounded,
+                content,
                 chunk_size=settings.chunk_size,
                 overlap=settings.chunk_overlap,
                 max_chunks=MAX_CHUNKS_PER_NOTE,
@@ -6860,7 +7536,9 @@ async def _rebuild_tsvectors_pinned(
             ),
         )
 
-    tsv_frag, tsv_params = index_tsvector_sql("content")
+    tsv_frag, tsv_params = index_tsvector_sql(
+        "content", "title", "aliases", tags_bind="tags_text"
+    )
     # ── The rebuild certifies what it writes ──────────────────────────────
     # It used to address the UPDATE by `id` alone, over a snapshot holding only
     # `(id, file_path)`, and to treat a read failure as a silent `continue`.
@@ -6887,8 +7565,11 @@ async def _rebuild_tsvectors_pinned(
     # four, requiring exactly one row. Anything else is staleness, and staleness
     # is re-read and retried against the fresh row — or aborts the whole
     # transaction. It is never committed around.
+    # The excerpt rides in the same certified UPDATE (#344, D4/D7): it is a
+    # prefix of exactly the bytes verified against the hash below.
     upd_sql = text(
-        f"UPDATE notes_metadata SET content_tsvector = {tsv_frag} "
+        f"UPDATE notes_metadata SET content_tsvector = {tsv_frag}, "
+        "body_excerpt = :excerpt "
         "WHERE id = :id AND user_id IS NOT DISTINCT FROM :uid "
         "  AND file_path = :path AND content_hash = :hash"
     )
@@ -6918,7 +7599,7 @@ async def _rebuild_tsvectors_pinned(
             try:
                 # The read, parse and hash off the loop (#278): the rebuild
                 # walks every row of the scope. The UPDATE stays here.
-                content, got_hash = await asyncio.to_thread(
+                frontmatter, content, got_hash = await asyncio.to_thread(
                     _read_body_and_hash, root_fd, path
                 )
             except (UnicodeDecodeError, OSError) as exc:
@@ -6930,10 +7611,23 @@ async def _rebuild_tsvectors_pinned(
                         "content_hash the rebuild selected"
                     )
                 else:
+                    # Title, aliases and tags from the bytes just verified —
+                    # the shared rules, so the head equals what the scan
+                    # writes for the same file (the hash matched, so the
+                    # stored title and tags already equal these). The tag
+                    # extraction runs over the whole body, so off the loop
+                    # like the read (#391, D6).
+                    rebuilt_tags = await asyncio.to_thread(
+                        extract_tags, content, frontmatter
+                    )
                     _used, rowcount = await write_tsvector_bounded(
                         session, upd_sql, content,
                         {"id": snapshot.id, "uid": owner, "path": path,
-                         "hash": chash, **tsv_params},
+                         "hash": chash,
+                         "title": _note_title(frontmatter, path.rsplit("/", 1)[-1]),
+                         "aliases": aliases_text(frontmatter),
+                         "tags_text": tags_text(rebuilt_tags),
+                         **tsv_params},
                         label=path,
                     )
                     if rowcount == 1:
@@ -7188,6 +7882,7 @@ async def cleanup_expired_tokens():
     # transaction that removed rows from them would have the sweep act on a
     # snapshot no other session has seen yet.
     await _expire_unused_oauth_clients()
+    await _expire_unreferenced_cimd_clients()
 
 
 #: How many never-used registrations one pass may delete. A bound, not a
@@ -7236,6 +7931,8 @@ async def _expire_unused_oauth_clients() -> int:
                     OAuthClient.last_used_at.is_(None),
                     OAuthClient.user_id.is_(None),
                     OAuthClient.created_at < cutoff,
+                    # Never a CIMD row (#357): those have their own rule.
+                    OAuthClient.client_id_metadata_url.is_(None),
                 )
                 # A stable order so a contended row is retried in the same
                 # place on the next pass rather than the batch reshuffling
@@ -7264,6 +7961,7 @@ async def _expire_unused_oauth_clients() -> int:
                     OAuthClient.last_used_at.is_(None),
                     OAuthClient.user_id.is_(None),
                     OAuthClient.created_at < cutoff,
+                    OAuthClient.client_id_metadata_url.is_(None),
                     # Any code row and any token row of any state — live,
                     # expired or revoked — disqualifies. A revoked token the
                     # operator can still see in the panel must never be
@@ -7297,6 +7995,82 @@ async def _expire_unused_oauth_clients() -> int:
         logger.info(
             "OAuth client cleanup: %d never-used registration(s) older than "
             "%d days removed",
+            deleted,
+            days,
+        )
+    return deleted
+
+
+async def _expire_unreferenced_cimd_clients() -> int:
+    """Delete synthetic CIMD client rows nothing references (#357, D9).
+
+    A CIMD row is a cache of a public document: it holds no secret and is
+    re-derived from the document at the user's next consent, so — unlike a
+    DCR registration (#194) — its owner is irrelevant. It qualifies when it
+    holds no code and no token row of any state and its use marker is older
+    than `OAUTH_CLIENT_UNUSED_EXPIRY_DAYS` (the same age and the same `null`
+    kill switch). Tokens are retained seven days past expiry, so a row is
+    never swept while any grant row references it. Same protocol as the DCR
+    sweep: `SKIP LOCKED` batch, in-lock re-read in a separate statement,
+    delete what still qualifies.
+    """
+    days = settings.oauth_client_unused_expiry_days
+    if days is None:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    async with async_session() as session:
+        candidates = (
+            await session.execute(
+                select(OAuthClient.client_id)
+                .where(
+                    OAuthClient.client_id_metadata_url.is_not(None),
+                    OAuthClient.last_used_at < cutoff,
+                    # In the candidate query too, not only the re-read: a
+                    # referenced row must never be selected or row-locked, or
+                    # a full batch of referenced rows would starve the sweep.
+                    ~select(OAuthCode.id)
+                    .where(OAuthCode.client_id == OAuthClient.client_id)
+                    .exists(),
+                    ~select(OAuthToken.id)
+                    .where(OAuthToken.client_id == OAuthClient.client_id)
+                    .exists(),
+                )
+                .order_by(OAuthClient.id)
+                .limit(OAUTH_CLIENT_EXPIRY_BATCH)
+                .with_for_update(skip_locked=True)
+            )
+        ).scalars().all()
+        if not candidates:
+            return 0
+        still_eligible = (
+            await session.execute(
+                select(OAuthClient.client_id).where(
+                    OAuthClient.client_id.in_(candidates),
+                    OAuthClient.client_id_metadata_url.is_not(None),
+                    OAuthClient.last_used_at < cutoff,
+                    ~select(OAuthCode.id)
+                    .where(OAuthCode.client_id == OAuthClient.client_id)
+                    .exists(),
+                    ~select(OAuthToken.id)
+                    .where(OAuthToken.client_id == OAuthClient.client_id)
+                    .exists(),
+                )
+            )
+        ).scalars().all()
+        if not still_eligible:
+            await session.commit()
+            return 0
+        result = await session.execute(
+            delete(OAuthClient).where(OAuthClient.client_id.in_(still_eligible))
+        )
+        deleted = result.rowcount
+        await session.commit()
+
+    if deleted:
+        logger.info(
+            "OAuth client cleanup: %d unreferenced Client ID Metadata Document "
+            "row(s) unused for %d days removed",
             deleted,
             days,
         )
@@ -7520,7 +8294,7 @@ async def _prewarm_once() -> tuple[float | None, float | None]:
         from src.services.embeddings import get_embedding
 
         start = time.monotonic()
-        await get_embedding("warmup")
+        await get_embedding("warmup", kind="query")
         embed_ms = (time.monotonic() - start) * 1000
 
     async with async_session() as session:
@@ -7944,6 +8718,12 @@ async def run_indexer_loop():
                 await cleanup_expired_tokens()
             except Exception as e:  # noqa: BLE001 - housekeeping, never fatal
                 logger.error(f"Expired-token cleanup failed: {e}")
+            # Change-feed retention (#351, D9), separately guarded so neither
+            # housekeeping failure masks the other, and never inside a pass.
+            try:
+                await change_feed.prune()
+            except Exception as e:  # noqa: BLE001 - housekeeping, never fatal
+                logger.error(f"Change-feed retention failed: {e}")
             # The refusal coalescer's standalone flush: any window that closed
             # since the last tick writes the row it owes, so a principal that
             # was refused in a burst and then went quiet still has its count

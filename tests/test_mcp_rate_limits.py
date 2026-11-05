@@ -207,7 +207,7 @@ def test_sustained_calls_under_the_rate_are_all_admitted(monkeypatch):
         rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
     )
     for _ in range(200):
-        clock.now += 0.6  # 100/min, under the configured 120/min
+        clock.now += 0.12  # 500/min, under the configured 600/min
         admitted, _retry = rate_limits.take(API_KEY_PRINCIPAL, refusals.SCOPE_PRINCIPAL)
         assert admitted
 
@@ -337,7 +337,8 @@ def test_an_admitted_call_still_meets_the_vault_gate(monkeypatch):
 
 
 def test_the_documented_gate_order_is_the_implemented_one():
-    """L2 → L3 → L4 → L5 → L6 → body, read off the decorator itself."""
+    """L2 → L3 → L4 → L5 → L6 → write gate (#358) → body, read off the
+    decorator itself."""
     source = inspect.getsource(tools._tracked)
     order = [
         source.index("_bucket_admission(write_class)"),
@@ -345,6 +346,8 @@ def test_the_documented_gate_order_is_the_implemented_one():
         source.index("_first_unencodable_argument(screened)"),
         source.index("_first_over_long_argument(screened"),
         source.index("await _quota_admission_error()"),
+        source.index("if tool_name in tool_permissions.WRITE_REQUIRED_TOOLS"),
+        source.index("await guard.__aenter__()"),
         source.index("result = await fn(*args, **kwargs)"),
     ]
     assert order == sorted(order)
@@ -1100,7 +1103,7 @@ def test_a_depleted_or_unflushed_entry_is_never_evicted(monkeypatch):
         rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
     )
     # A bucket slow enough that idling past the TTL does **not** refill it, so
-    # "depleted" and "idle" are separable facts. At the configured 120/min they
+    # "depleted" and "idle" are separable facts. At the configured 600/min they
     # never are, which is why the guard is stated as an invariant rather than
     # left to the arithmetic.
     monkeypatch.setattr(mcp_auth.settings, "mcp_rate_limit_per_minute", 1)

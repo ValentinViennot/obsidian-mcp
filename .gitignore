@@ -3,8 +3,8 @@ Makefile.local
 data/
 __pycache__/
 *.pyc
-.venv/
-venv/
+.venv
+venv
 .pytest_cache/
 .coverage
 coverage/
@@ -16,3 +16,5 @@ dist/
 .vscode/
 .claude/
 postgres.env
+# Real search-eval data (#356): tenant query text and note paths. Never commit.
+.search-eval/

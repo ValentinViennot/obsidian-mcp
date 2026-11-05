@@ -92,7 +92,7 @@
     <div class="card anim-1 u-margin-bottom-20px">
         <div class="card-header">
             <span class="card-title">Requests</span>
-            <span class="mono u-font-size-11px u-color-text-3">{{ window_label }}</span>
+            <span class="mono u-font-size-11px u-color-text-3">{{ window_label }}{% if chart_data.bucket == 'day' %} · per UTC day{% elif chart_data.bucket == 'hour' %} · per hour, your time{% endif %}</span>
         </div>
         <div class="card-body u-padding-top-18px u-padding-bottom-18px">
             <canvas id="usage-chart" height="60"></canvas>
@@ -227,10 +227,43 @@
 
     const ctx = document.getElementById('usage-chart').getContext('2d');
     const data = {{ chart_data | tojson }};
+    // Hour buckets are UTC instants rendered in the viewer's zone, like the
+    // request log's <time data-localize> cells (base.html). Day buckets stay
+    // UTC dates: they count a UTC day, and a local date on them would name a
+    // calendar day the bar does not count. `labels` is the UTC fallback.
+    const instants = data.instants || [];
+    const localHours = data.bucket === 'hour' && instants.length === data.labels.length;
+    const fmtHour = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
+    // The zone name tells apart the two occurrences of the repeated hour when
+    // daylight saving ends (01:00 EDT vs 01:00 EST); the axis adds it only to
+    // a label that would otherwise repeat.
+    const fmtHourZone = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short' });
+    const fmtHourFull = new Intl.DateTimeFormat(undefined, {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short',
+    });
+    function local(fmt, iso, fallback) {
+        const d = new Date(iso);
+        return isNaN(d) ? fallback : fmt.format(d);
+    }
+    let labels = data.labels;
+    if (localHours) {
+        labels = instants.map(function (iso, i) { return local(fmtHour, iso, data.labels[i] + ' UTC'); });
+        const seen = {};
+        labels.forEach(function (l) { seen[l] = (seen[l] || 0) + 1; });
+        labels = labels.map(function (l, i) { return seen[l] > 1 ? local(fmtHourZone, instants[i], l) : l; });
+    }
+    function tooltipTitle(items) {
+        const i = items.length ? items[0].dataIndex : -1;
+        if (i < 0) return '';
+        if (localHours) return local(fmtHourFull, instants[i], data.labels[i] + ' UTC');
+        if (data.bucket === 'day') return data.labels[i] + ' (UTC day)';
+        return data.labels[i];
+    }
     const chart = new Chart(ctx, {
         type: 'bar',
         data: {
-            labels: data.labels,
+            labels: labels,
             datasets: [{
                 label: 'Requests',
                 data: data.values,
@@ -254,6 +287,7 @@
                     padding: 10,
                     titleFont: { family: "'DM Sans', sans-serif", size: 12 },
                     bodyFont:  { family: "'JetBrains Mono', monospace", size: 11 },
+                    callbacks: { title: tooltipTitle },
                 }
             },
             scales: {

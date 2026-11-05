@@ -240,7 +240,11 @@ async def test_re_resolution_precedes_the_locked_invariant_read_and_the_stamp(
     from test_issue_91_indexed_root import FakeSession, install, make_vault
 
     vault = make_vault(tmp_path, "vault", {"a.md": "a\n"})
-    session = FakeSession(provenance=(None, None, None), existing={}, note_ids={})
+    # `note_ids` names the upserted row, as the real index does: the task
+    # rebuild (#350) records a changed path with no index row as a skip.
+    session = FakeSession(
+        provenance=(None, None, None), existing={}, note_ids={"a.md": 1}
+    )
     install(monkeypatch, session, vault)
     calls: list[str] = []
     real_reresolve = indexer._reresolve_scope_links

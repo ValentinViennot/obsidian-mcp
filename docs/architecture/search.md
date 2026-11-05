@@ -19,7 +19,11 @@
   plan change would otherwise change *which* tied rows survive the LIMIT.
   Index usage is the expected plan for rare terms on a production-sized
   corpus, not a guarantee; a tiny table or a very common term may legitimately
-  seq-scan.
+  seq-scan. Since #344 and #391 (migrations 031/035) the vector is
+  `A(title) || A(aliases) || B(tags) || D(body)` — a tag hit ranks below a
+  title hit and above a body hit — ranking is `ts_rank_cd(RANK_WEIGHTS, …)`, an under-filled page is filled
+  from a disjunction derived from PostgreSQL's own parse, and each row
+  carries a page-bounded snippet — see the section below.
 - Vector search via a pgvector HNSW **expression** index over
   `(embedding::halfvec(D)) halfvec_cosine_ops` (`m=16, ef_construction=64`,
   *D* = `EMBEDDING_DIMENSIONS`, built only when *D* ≤ 2000; migration 027,
@@ -28,6 +32,718 @@
   below. `semantic_search` sets `hnsw.ef_search=80` per query and dedupes per
   note in Python after a 5x overfetch. See "Filtered vector search" below —
   the `SET LOCAL`s are load-bearing for *correctness*, not just speed.
+
+## Keyword ranking, the disjunctive fill and the snippet (#344)
+
+`keyword_search("<exact two-word title of an existing note>")` returned ten
+rows without that note, live, on 2026-10-28. Three causes, three changes.
+
+**The vector weights the title and aliases above the tags, and the tags
+above the body.** Every writer builds `content_tsvector` through
+`fts.index_tsvector_sql` as *title parts for every config, then aliases
+parts, then tags parts, then the content parts* (configs in sorted order —
+the fingerprint's order, so the migrations and the writers agree byte for
+byte) — `setweight(…, 'A')` on the first two, `setweight(…, 'B')` on the
+tags (#391, below), the pre-031 `to_tsvector(cfg, body)` fragment byte for
+byte on the last, so a pre-031 vector is exactly the body part of a post-031
+one. Ranking is `ts_rank_cd(RANK_WEIGHTS, vector, query)` with the array bound
+as `float4[]` (a setting, default `{0.02, 0.2, 0.4, 1.0}` for `D, C, B, A`,
+never interpolated; each entry finite and in `[1e-6, 1]` — a smaller positive
+value binds as float4 zero, and PostgreSQL refuses one above 1). `calc_rank_cd` scores one term per cover,
+`len(cover) / Σ(1/weight)`: an adjacent two-word title cover is `2/(1+1) =
+1.0`, a body cover `2/(50+50) = 0.02`. Measured: the issue's shape — a title
+`Quarterly Review` against a hub repeating the phrase thirty times — scores
+`1.0` against `3.725` under PostgreSQL's default array (the hub wins) and
+`1.0` against `0.745` under ours (the title wins; the crossover is near forty
+adjacent repetitions, fifty for a one-word title — L8). The array moves only
+title-versus-tags-versus-body competition (a tag cover scores `B = 0.4`,
+twenty body covers): body-only order is identical under any uniform
+`D`, which the identity suite pins. Normalisation flags were rejected (flag 1
+still loses the issue's case; flag 2 makes every short note beat every long
+one) and would re-rank body-only matches.
+
+**Conjunction first, disjunction to fill — derived from PostgreSQL's parse.**
+The conjunctive statement is the pre-#344 one plus `id` in the projection and
+the weights in the rank (the GIN plan `test_keyword_plan.py` pins is
+unchanged); its rows are `match: all`. When it returns fewer than `limit`
+rows, the service asks PostgreSQL for `websearch_to_tsquery(cfg, :q)::text`
+per config — a no-table statement — and `fts.parse_conjunction` reads that
+output grammar, **never the caller's string**: a *plain conjunction* has no
+`|` and no parenthesis and splits on `&` into units that are a negated lexeme
+or a `<->`/`<N>` phrase chain. Per config: a plain conjunction with ≥ 2
+positive units is *eligible* and contributes `(u1 | … | uk) & !n1 …` built
+from the verbatim tokens and cast with the `tsquery` input function (which
+does not re-stem — `'running'::tsquery` stays `'running'`, measured); an
+ineligible config (an `OR`, a negated phrase `!( 'a' <-> 'b' )`, a single
+word, stop words only) contributes its **own unchanged AND expression**. The
+OR over configs of those forms is implied by the OR over configs of the AND
+parses, so the fallback is a superset of the conjunction by construction,
+whatever mix of eligible and ineligible configs a query yields — the case
+that forced this (Codex r1 #3) is `english,simple` on `the running`: english
+parses to `'run'`, simple to `'the' & 'running'`, and `runs fast` matches the
+conjunction only through english. The fallback statement is the conjunctive
+one with the fallback tsquery, `AND NOT (v @@ <and query>)` (the conjunctive
+block was not full, so that excludes exactly its rows), the same filters,
+`rank DESC, file_path ASC`, `LIMIT limit − n`; its rows are `match: any`,
+appended after every `all` row and never interleaved (their rank is against
+a different query — L1). **Every statement of the call reads one
+snapshot**: the transaction opens with `SET TRANSACTION ISOLATION LEVEL
+REPEATABLE READ, READ ONLY` before the `SET LOCAL`, because the fallback's
+`NOT (v @@ <and query>)` excludes exactly the conjunctive block only when
+both statements see the same rows — at READ COMMITTED an index commit
+between them could drop a note from both blocks for that call (Codex C-1).
+`SET TRANSACTION` is legal only before the first snapshot-taking statement;
+`SET LOCAL` takes none, and `search_notes_impl` hands over a session with
+nothing run. Read-only REPEATABLE READ raises no serialization failure. The
+superset property is asserted over a generated
+query corpus under `english` and `english,simple`. Telemetry: `fallback`
+(`ran | skipped | not_needed`) and `any_rows` in `usage_logs.params`.
+
+**"Nothing run" includes the connection's own setup (2026-10-30).** Under a
+strict `DATABASE_SSL_MODE` the D3b listener (`_verify_new_connection` in
+`src/services/transport_security.py`) runs its `pg_stat_ssl` probe through
+the adapted asyncpg cursor on every **new** pooled connection; that cursor
+autobegins a driver transaction, and a pool `connect` event is followed by no
+reset. So the first session on each new connection inherited an open
+transaction with the probe already run in it, and its `SET TRANSACTION` was
+refused with `ActiveSQLTransactionError` — in `keyword_search`,
+`hybrid_search`, `list_tasks` and the change feed alike. It was intermittent
+because only a brand-new connection carries it: a reused one was rolled back
+on return, so it showed up when parallel calls grew the pool (or after an
+overflow connection was discarded) and not on a retry. The rule now: the
+listener rolls the probe back before the connection is handed out, and
+nothing that runs on a connection before a session's first statement may
+leave a transaction open (`test_a_new_strict_mode_connection_opens_no_transaction`).
+
+`matched_terms` is per config: for each config whose parse is a plain
+conjunction of ≤ 32 units, the count of its positive units present in the
+vector over that count; the row renders the pair with the greatest ratio
+(ties: the greater total, then config order) — `1/1` for the `runs fast` row
+above, not `0/2`.
+
+**The snippet comes from a stored excerpt, over the page only.** The body is
+not stored anywhere usable (`chunk_text` is embed-time, masked, capped and
+stale under #200; a per-result file read is what this document already
+declined), so migration 031 adds `notes_metadata.body_excerpt`: the first
+`KEYWORD_EXCERPT_CHARS` (20,000) characters of exactly the prefix the vector's
+successful attempt bound, written in the same UPDATE, preserved by moves,
+sentinel-free, deferred with raiseload, **never projected** — `ts_headline`
+reads it server-side. The snippet statement names the ids of the first
+`KEYWORD_SNIPPET_ROWS` (20) rows of the assembled page, whatever `limit` is,
+and projects one headline per config (`MaxFragments=2, MaxWords=18,
+MinWords=6`, U+0002/U+0003 as `StartSel`/`StopSel`, rendered `«»`),
+`matched_in` from `ts_filter(v, '{a}') @@ q` / `ts_filter(v, '{d}') @@ q`, and
+the per-config `matched_terms` counts (the parse statement therefore runs
+whenever snippets are on, even on a full page). A headline counts as the
+row's snippet **only when the body part itself matched** — with no full
+cover `ts_headline` still marks single query words, so a title-only match
+whose body holds one of the words would otherwise show a highlight that is
+not the match. A second statement supplies the `head:` text
+(`ts_headline(fts_configs[0], …, 'MaxFragments=0, MinWords=18,
+MaxWords=24')` with the same sentinels, stripped from the result — never
+PostgreSQL's default `<b>`, which a note may contain literally; in fragment
+mode a no-cover headline is only `MinWords` words, measured) for every other
+row with an excerpt: a title/alias-only match, a split match (rendered
+`matched_in: title+body`), or a match beyond the excerpt (L3). Nothing fabricated: `head:` is text the index holds for that
+note, labelled as not the matching span. Rows beyond the cap carry no
+`snippet`/`head` key and the header says `snippets: first N`; a row with a
+NULL excerpt (indexed before 031) carries neither, the header counts such
+rows always, including zero, and the footer names `make rebuild-tsvectors`.
+`snippet:` and `head:` are **rendered on one line** — every whitespace run,
+line breaks included, becomes one space — because `ts_headline` keeps the
+excerpt's newlines and markdown, and a note body could otherwise print a
+line that reads as another server-authored result row (Codex C-2). A
+literal `«`/`»` in a note still collides with the rendered markers
+(accepted: the stored markers are U+0002/U+0003, stripped from excerpts).
+Cost is a function of the row cap, the excerpt cap and the config count —
+never of `limit` — recorded as `snippet_ms`; the integration suite gates the
+worst case (twenty distinct 20,000-character excerpts, `english,simple`,
+head rows included) under 300 ms on the throwaway container, after Codex
+measured ≈ 452 ms / 891 ms for a `limit`-bound design. That gate is at the
+defaults; the cost grows roughly linearly with both settings, whose maxima
+are about 25× the measured work.
+
+**What is invariant, and what the oracle checks.** The projection identity
+suite can no longer claim byte identity for `keyword_search` — `rank` is a
+pre-change field and every body-only rank scales, and title-versus-body order
+changes on purpose — so its keyword case asserts what is: conjunctive
+membership equals the oracle's (`@@` and the filters did not change), body-only
+relative order equals the oracle's up to ties, rank values and title-matched
+rows' positions are exempt, and the new contract is asserted by its own
+tests.
+
+**031 and the move paths** are described in [schema and
+migrations](schema-and-migrations.md#031-notes_metadatabody_excerpt-and-the-in-sql-re-head-344)
+and [indexing and embeddings](indexing-and-embeddings.md): the migration
+re-heads every vector in SQL under the generation lock with the stored
+fingerprint's configs and skips rows already headed (`rehead` keeps relative
+positions, not absolute ones); its downgrade strips every `A` lexeme; both
+move paths re-head under the lock with the fingerprint re-read; and `make
+deploy` stops the app before a pending migration so an old-image move cannot
+leave a stale title at weight `A`.
+
+Accepted limitations (the change's design, L1–L12): ranks stay
+uninterpretable and an `any` row's rank is against a different query (the
+renderer prints `rank` with three significant digits, `:.3g`, since #380 —
+a body-only cover is ~1e-4 under the default weights and `.3f` showed a page
+of `0.000` ties under one `any` row's `2.66`);
+phrase adjacency across the head/body boundary; `head:` for a match beyond
+the excerpt or in the title only; pre-031 rows have no excerpt until edited
+or rebuilt; no fallback when no config is eligible; `matched_terms` omitted
+past 32 units; U+0002/U+0003 removed from excerpts; the weight array is a
+heuristic (#356 measures it); a 54000 row stays
+unweighted after 031 until written again; repeated re-heads shift body
+positions; snippets for the first `KEYWORD_SNIPPET_ROWS` rows only. (The
+former "no hybrid fusion (#354)" limitation is closed by `hybrid_search`,
+below.)
+
+## Tags in the keyword vector (#391)
+
+`hybrid_search("HOA siding complaint")` ranked the HOA note second, carried
+by its semantic arm alone: `HOA` was only in the note's tags, and no
+`tsvector` held tags. Since migration 035 the vector is **`A(title) ||
+A(aliases) || B(tags) || D(body)`** per config — title parts, aliases parts,
+**tags parts**, content parts, configs sorted — from the one builder in
+`src/services/fts.py`. Every builder takes a required keyword `tags_bind`;
+every writer under `src/` passes a bind name and only migration 031's call
+passes `None` (its fragment is pinned byte-identical to the pre-#391 text),
+which an AST test enforces. Weight `C` is unused.
+
+- **The tags text** is `fts.tags_text(tags)` over the list
+  `vault.extract_tags` returns — exactly `notes_metadata.tags`, so the vector
+  and the `tags` filter, `get_tags` and every displayed row agree. One line
+  per tag: the tag, then, for a nested tag, each non-empty `/`-segment
+  (`ctx/phone` → `ctx/phone ctx phone`), because PostgreSQL parses
+  `ctx/phone` as one `file` token and `@@ websearch_to_tsquery('phone')` was
+  false (measured). Both forms, because `websearch_to_tsquery('ctx/phone')`
+  is `'ctx/phone'`, which only the full form matches. NUL/U+0002/U+0003
+  removed, cut at `FTS_TAGS_MAX_CHARS` (2,048, a constant) on a whole line.
+- **Placement between the head and the body**, not at the tail: positions
+  saturate at 16,383, so a tail on a long note puts every tag word at one
+  position, and a cover joining a tag with the body's first words (the
+  issue's own query) would span the whole body. An empty tags part shifts
+  nothing (`A(t) || B('') || D(b) = A(t) || D(b)`, measured), so an untagged
+  note's vector is byte-equal under the old and new builder.
+- **Rank**: `RANK_WEIGHTS` is unchanged; its third slot (`B`) is already
+  `0.4`. A single-word cover scores 1.0 in the title, 0.4 in the tags and
+  0.02 per body cover — one tag cover equals twenty body covers (L2).
+- **`matched_in`** comes from six flags in the snippet statement,
+  `ts_filter(v, W) @@ q` for `{a}`, `{b}`, `{d}`, `{a,b}`, `{a,d}`, `{b,d}`
+  (`search.MATCHED_IN_FLAGS`, `matched_in_from_flags`): every single part
+  that alone matches, in the order `title` (title or aliases), `tags`,
+  `body`, rendered comma-joined; else the first matching pair `title+tags`,
+  `title+body`, `tags+body`; else `title+tags+body`. Eleven values:
+  `title`, `tags`, `body`, `title,tags`, `title,body`, `tags,body`,
+  `title,tags,body`, `title+tags`, `title+body`, `tags+body`,
+  `title+tags+body`. Every pre-#391 value keeps its meaning for a note with
+  no tag hit. The worst-case snippet latency gate now includes tags-only
+  rows (five title-only and five tags-only head rows of twenty) and stays
+  under 300 ms.
+- **The snippet rule is unchanged** — a headline only when the body part
+  matched — so a tags-only or `tags+body` match renders `head:` (tags are not
+  in `body_excerpt`). A note with an **empty body** stores an empty excerpt;
+  its computed head is the empty string, and the row renders **no second
+  line** and is not counted as a row without an excerpt. The service's
+  `head` is `None` when no head was computed and a string when one was; the
+  renderer decides by `is None`, never by truthiness.
+- **Writers**: the incremental pass (the same entry whose `tags` the upsert
+  wrote), the indexer move-pair (the entry parsed for the new path), the
+  rebuild (`extract_tags` over the verified bytes), `move_note` (the
+  destination read's body and frontmatter; when that read or parse fails,
+  the caller's **own** row's stored `tags`, owner-predicated, in the same
+  statement as the stored frontmatter) and migration 035 (stored `tags`). A
+  tag edit changes the content hash, so the note is re-upserted and its
+  vector rewritten in the same pass; no extraction-version bump.
+- **`hybrid_search`** inherits everything through `keyword_arm_rows` /
+  `keyword_snippets`; the only visible difference is the new `matched_in`
+  values in `keyword_rank (…)`. The longest value grew from `title+body` to
+  `title+tags+body` (five characters), so the pinned bounds moved:
+  `HYBRID_ROW_STRUCTURE_MAX` 340 → 345 (with #389's 405-character header the
+  floor sum is 995, the 40–45 cut still guaranteed at `rerank=false`) and
+  `HYBRID_RERANK_ROW_STRUCTURE_MAX` 362 → 367, where the cut-form sum
+  `444 + 367 + 25 + 25 + 75 + 75 + 5 = 1,016` exceeds 1,000 and that worst
+  case continues to the labelled omitted form (≤ 997). The per-case sums,
+  re-measured with both #389 and #391, are under "Bounds (D5)" below.
+- **The identity oracle** additionally exempts rows with a *tag
+  contribution* — any lexeme of any config's parse of the query, positive or
+  negated, present in `ts_filter(v, '{b}')` — and keeps (a) conjunctive
+  membership and (b) body-only order over every other row.
+
+**035** re-heads every tagged vector in SQL (see [schema and
+migrations](schema-and-migrations.md#035-tags-in-the-keyword-vector-391)):
+a read-only size preflight, then an all-or-nothing rewrite, skipping a row
+that already carries a `B` lexeme and a row whose tags produce none.
+
+Accepted limitations (the change's design, L1–L10): a tagged row that already
+had a head is not byte-exact after 035 (body positions shift by the old
+head's length; matching and single-part scores are invariant — `make
+rebuild-tsvectors` makes it exact); one tag cover equals twenty body covers
+(L2); phrase adjacency crosses the aliases/tags and tags/body boundaries and
+consecutive tag lines (L3); tags past 2,048 characters of tags text are
+filterable but not searchable (L4); a parent segment matches every child,
+`ctx` finds every `ctx/*` note (L5, Obsidian's semantics); 035 uses the
+stored tags, so a row last upserted under an older extractor keeps those
+until re-upserted (L6); a tag that stems to nothing contributes no lexeme,
+and tags are stemmed like the body (L8); `matched_in` names the first
+minimal split, not every one (L9); a hand-migrated compose stack that lets
+the old image write after 035 leaves untagged vectors until `make
+rebuild-tsvectors` (L10).
+
+## Hybrid search (#354)
+
+(With `rerank=true` the fused candidates are reranked on per-chunk documents
+built from the semantic arm's fetched rows — the partition, the allocation
+and the winner's preview over the keyword snippet are in "Reranking (#367)",
+"The documents since #402".)
+
+`hybrid_search(query, limit=10, folder?, tags?, frontmatter?)` is a **third
+peer**, not a replacement and not a "primary" tool. The one measured
+pgvector + tsvector reciprocal-rank-fusion study (2026-10-22, 94 passages,
+60 queries) is the reason it exists and the reason it is only a peer: Hit@1
+was 41/60 vector-only, 36/60 keyword-only and 46/60 fused (MRR@10 0.782 /
+0.662 / 0.826); exact identifiers went from 2/12 to 9/12, paraphrases *down*
+from 15/24 to 13/24, and Hit@5 did not move (55 → 55). Fusion fixes ranking
+more than recall, and it can hurt paraphrases because the weak lexical list
+gets an equal vote. So all three search descriptions carry one routing
+sentence — identifiers, code symbols, titles or known phrases →
+`keyword_search`; conceptual or paraphrased → `semantic_search`; unsure →
+`hybrid_search` — and none ranks itself or another above the rest. The
+instructions' 512-character lead names all three with their one-word use;
+the `content_hash` clause and `precondition_required` moved to paragraph two
+to make room.
+
+**Service shape (D1).** `src/services/hybrid.py` is an orchestrator over two
+**arm cores** extracted from the existing services without changing them:
+`search.keyword_arm_rows` (the conjunctive block, PostgreSQL's parse, the
+disjunctive fill) plus `search.keyword_snippets`, and
+`embeddings.semantic_arm_rows` (the ordered statement, the zero-row exact
+re-run, the full-precision re-sort, the per-note dedupe, the stale/truncated
+annotation). Neither core issues `SET TRANSACTION`, a `SET LOCAL` or
+telemetry; `full_text_search` and `semantic_search` are their unchanged
+wrappers, so the projection-identity, keyword-ranking and recall suites run
+unmodified. The only addition is `keyword_arm_rows(with_excerpt_flag=True)`,
+hybrid-only, which projects `(body_excerpt IS NULL) AS no_excerpt` on both
+ranking statements — a boolean, never the excerpt — so the header's
+`without excerpt` covers rows past the snippet cap; `full_text_search`
+passes false and its statements (and the GIN plan `test_keyword_plan.py`
+pins) are byte-identical.
+
+**One session, one snapshot, the embedding first (D2).** The query is
+embedded before any statement, so no pooled connection is held during the
+provider call. Then, on one session: `SET TRANSACTION ISOLATION LEVEL
+REPEATABLE READ, READ ONLY` (legal only before the first snapshot-taking
+statement); `SET LOCAL random_page_cost = 1.1`, `hnsw.ef_search = 80`,
+`hnsw.iterative_scan = 'relaxed_order'` (every setting before the first data
+statement); the keyword arm (the snapshot is taken here); the semantic arm;
+after an exact re-run, **`SET LOCAL enable_indexscan = on` before anything
+else** — the snippet statements look rows up by id and must not inherit a
+disabled index scan, which `semantic_search` never had to care about because
+it closes its session straight after; fusion; the snippets. A concurrent
+index commit between the arms is therefore in neither arm of that call. The
+integration suite pins all of it, including a hook between the arms that
+commits a matching note on another connection.
+
+**Fusion (D3).** Each arm is taken to `HYBRID_ARM_DEPTH` (50): 50 keyword
+rows (`all` first, then the `any` fill, in today's order), and a 50-chunk
+semantic overfetch deduped per note. Ranks are 1-based positions. Over note
+paths (unique within the owner scope, which both arms filter by the same
+`apply_note_filters`), `score = Σ 1/(k + rank)` with `k = HYBRID_RRF_K`
+(default 60, 1–1000, a setting, never a call argument). Ties: score DESC,
+then the smaller of the note's arm ranks, then path — no arm wins a tie for
+being that arm. The page is the first `limit` (1–50). **RRF is over each
+arm's top 50, not the full rankings** (L3): a note at rank 51 in both
+(`2/111`) is not a candidate even though it would beat a semantic-only rank
+1 (`1/61`); the header's always-present `arm_depth: keyword n/50, semantic
+c/50 chunks` says when an arm was full.
+
+**Degradation (D4).** Any exception from the embedding call — and only that
+call — makes the semantic arm unavailable: `ProviderInputTooLarge` →
+`provider_input_rejected`, anything else → `provider_error`. One WARNING
+with the exception's **class name only** (a provider message can echo the
+query). The call returns the keyword arm alone, scored by its keyword term,
+marked `arms: keyword-only (semantic unavailable: <code>)` in the header and
+on the zero-result line, with a fixed footer and `arms: "keyword_only"` /
+`semantic_unavailable` in the usage row — **no `error` marker**: it is a
+real, honestly labelled result, and it stays minable. A database error in
+either arm fails the call; there is no semantic-only mode.
+
+**Rendering (D6).** One line per row: a fixed-key object
+`{"title","path","tags","preview_kind","preview"}` whose every value is a
+`change_feed.quote` literal (the `get_changes` rule: `"` and `\`, C0/C1,
+DEL, U+2028/U+2029 escaped), then the separator `"} — `, then the server
+fields — `score` (`.4g`), `semantic_rank` (with similarity) or `-`,
+`keyword_rank` (with `match` and `matched_in`) or `-`, `explain` (the
+`1/(k+rank)` terms, or `…, semantic only` / `…, keyword only`), `stale: true`
+/ `embedding_truncated: true` when true, and any abbreviation labels.
+`preview` is always last, so the object always ends with an unescaped `"}`
+no literal can contain: a note can forge neither a row nor a field on its own
+row (`_one_line` stopped forged *rows*, not forged *fields*). The preview is
+the better-ranked arm's (`snippet` or `head`; `chunk`, at most 200
+characters, or `stale_notice` for a stale row); on equal ranks the keyword
+highlight if there is one, else the chunk; the other arm's when the chosen
+one has none. The echoed query is a literal too.
+
+**The response bound (D7)** is on **rendered** length (`\u00XX` is six
+characters). The query echo is the longest whole-character prefix rendering
+to ≤ 64 (`query_cut` when shorter). The header (≤ 405 since the #389
+`confidence` token; 400 before), the keyword-only
+footer (71) and the cap footer (≤ 75) are reserved; rows are appended while
+each fits and the first that does not ends the page (whole-row drop, the
+omitted count in the footer, `shown:` in the header). A first row that does
+not fit is abbreviated in order — `tags omitted`, `preview omitted`,
+`title_cut`, `path_cut` (each the shortest whole-character prefix rendering
+to ≥ 40, i.e. 40–45; a value ≤ 45 is not cut), then the empty omitted forms
+— then, last (#389), `explain omitted` in place of the `explain` field (its
+terms follow from the ranks and `rrf_k`) — and marked `abbreviated`. The
+cut-form structure is ≤ 345 (340 before #391, whose longest `matched_in` is
+`title+tags+body`), so the floor is
+405 + 345 + 45 + 45 + 75 + 75 + 5 = 995 ≤ 1,000.
+
+**Telemetry and class (D5, D7).** `embed_ms`, `db_ms`, `exact_fallback`,
+`fallback`, `any_rows`, `snippet_ms`, `arms`, `semantic_unavailable`,
+`keyword_rows`, `semantic_rows`, `overlap`, `rrf_k`, and since #389
+`keyword_all`, `confidence` and `top_similarity`; `result_count` /
+`result_paths` are recorded by the tool **from the rendered rows**, so the
+harness credits only what the caller saw. Concurrency class `embedding`,
+shared with `semantic_search` (one provider, one slot); `CLASS_MAPPING_VERSION`
+5.
+
+**Measuring it (D9).** `scripts/search_eval_arms/hybrid.py` replays the
+production service: `make_arm` (`--arm-opt hybrid_k=…`, default the
+setting) and `make_arm_alt` (`hybrid_alt_k`, required — the run exits 64
+without it), membership `keyword_or_semantic`, so one report can hold two
+values of k. A keyword-only answer during replay fails the run.
+
+Accepted limitations (the change's design, L1–L13): equal votes can demote a
+strong single-arm hit (the paraphrase regression is expected on
+`class:prose`; the single-arm tools are the remedy); RRF discards score
+magnitude; RRF is over each arm's top 50 (L3 above); 50 chunks can be
+crowded by a verbose note; during an outage the answer is the keyword
+ranking, labelled; snippets, `matched_in` and the excerpt detail cover the
+first `KEYWORD_SNIPPET_ROWS` keyword rows only; the score compares only
+within one page; staleness has `semantic_search`'s declared bound;
+`keyword_search` and `semantic_search` still render paths and titles raw
+(the semantic chunk preview, in all three vector tools, is one line since
+#355: `_preview_line` collapses whitespace and escapes controls, closing
+#385); k = 60 is
+unvalidated on this corpus until a harness report; `--arm-opt` is
+run-global, so three or more values of k need separate generations; a
+literal `«`/`»` in a note collides with the highlight markers; an
+abbreviated first row shows only 40–45 rendered characters of its title and
+path.
+
+## Reranking (#367)
+
+`semantic_search` and `hybrid_search` take `rerank: bool = false`, always in
+the schema. With `rerank=true` an operator-configured cross-encoder
+(`RERANK_URL`) reorders the candidates the call already fetched. It is
+**opt-in and unmeasured by default**: Ollama has no rerank endpoint, a laptop
+CPU takes about 6 s for 10 documents (so 50 candidates time out at the
+1.5 s default on every call), and a small GPU is plausibly sub-second for
+50 but nobody has measured it here. Anthropic's contextual-retrieval study
+saw top-20 retrieval failure fall 2.9% → 1.9% from reranking on top of
+hybrid retrieval; that is somebody else's corpus. The eval gate below is how
+a deployment learns whether it helps on its own.
+
+**One wire format (D2).** The Jina-compatible `/v1/rerank` that
+`llama-server --reranking` serves (vLLM, Infinity, Jina's API too):
+`{"model", "query", "documents", "top_n"}` in, `{"results": [{"index",
+"relevance_score"}]}` out. A response is accepted only when it is a 2xx of at
+most 1 MiB that parses as an object whose `results` holds exactly `n`
+objects, each with a non-bool integer `index` in `[0, n)` (the indices a
+permutation) and a finite non-bool numeric `relevance_score`. Scores are
+mapped by `index`, never by position. TEI's native `/rerank` and Cohere v2
+are not supported (L1).
+
+**The client (D3)** is `transport_security.rerank_http_client`, a sibling of
+`embedding_http_client` with the same policy (`trust_env=False`, no
+redirects, the `EMBEDDING_CA_FILE` context else certifi) and a pool of two
+connections, which bounds the work in flight on the reranker in every
+concurrency mode. One per process, rebuilt per event loop, closed at
+shutdown. One wall-clock deadline (`RERANK_TIMEOUT_MS`) covers the pool
+wait, connect, write and a raw body read under the 1 MiB cap (asked for
+uncompressed; a compressed body fails closed). No retry.
+
+**Candidates (D4, D6).** For `semantic_search` the candidates come from one
+service, `embeddings.semantic_candidates`, which the tool and the harness arms
+call: the call's unchanged overfetch statement (under `rerank=true` it projects
+`embed_prefix` and `embedded_chunking_version` more, nothing else), re-sorted
+and deduped as always, **before** truncation to `limit`, capped at 50 notes.
+Because `limit ≤ 50`, every note of the unreranked page is a candidate, so
+reranking can only reorder that page and promote notes from deeper ranks. For
+`hybrid_search` the candidates are the first 50 fused rows; the excerpt for a
+stale or keyword-only candidate is `left(body_excerpt, 2048)`, read by one
+statement **inside the hybrid snapshot**, under the owner predicate, after the
+snippet statements and only when such a candidate exists (by path: the
+semantic arm's rows carry no id). A keyword-only hybrid call still reranks and
+says both `arms: keyword-only (…)` and `reranked: …`. *Before #402* the scored
+unit was one document per note, `title + "\n\n" + text` with the
+best-distance chunk (or the stale title / the excerpt); what replaced it:
+
+**The documents since #402 (rerank-documents).** Live, the reranker demoted
+notes both arms ranked first: it was sent `title + chunk` for one chunk per
+note, the cosine-best, without the heading (#355 keeps heading lines out of
+`chunk_text`). Replayed against bge-reranker-v2-m3, one note's cosine-best
+chunk scored −8.87 while another of its chunks scored −0.62, and +0.33 with
+the heading path prepended. So:
+
+- **The document is the embedding input**, rebuilt from stored columns:
+  `embed_prefix + "\n\n" + EMBEDDED_TEXT_FORMATTERS[stamp](chunk_text)`, cut
+  to 2,048 (the ≤ 300-character prefix always survives). A NULL or unknown
+  stamp sends the title alone; a pre-034 row (NULL prefix) sends `title +
+  chunk`; a stale note sends its title (semantic) or title + excerpt
+  (hybrid); a keyword-only hybrid candidate sends title + excerpt. The
+  rerank=true overfetch projects exactly `embed_prefix` and
+  `embedded_chunking_version` more (the `rerank=false` statement is
+  unchanged; `find_related` never projects them).
+- **The allocation** (`rerank.allocate_documents`, pure, deterministic):
+  every candidate note (the unchanged ≤ 50) gets its primary document first,
+  so the candidate set and `candidates: N` are the incumbent's; then the
+  candidates' other already-fetched chunks in `(distance, file_path,
+  chunk_index)` order, at most 4 documents per note, while fewer than
+  `RERANK_MAX_DOCUMENTS` (default 100, 50–200) are allocated. Bound:
+  documents ≤ min(budget, 4 · candidates); hybrid's 50 candidates send ≤ 50
+  primaries + ≤ 50 secondaries (the arm fetched 50 rows). No extra statement
+  or retrieval: every chunk document is a row of the one overfetch.
+- **Per-note maximum.** One exchange over the flattened documents (the
+  validation counts documents, so a result per note is `count_mismatch`); a
+  note's `rerank_score` is its best document's score, the first maximal
+  document wins a tie (the primary), order `(−score, unreranked position)`.
+- **Preview and locator follow the score.** On a reranked row whose winner is
+  a chunk, the preview and `§` are that chunk's (on `hybrid_search` for any
+  chunk winner, the primary included, over the keyword snippet; on
+  `semantic_search` the primary is already the preview). A winner without a
+  recorded section shows no `§` — the cosine-best locator is never reused.
+  Title or excerpt winners and every fallback page keep the incumbent
+  selection, so the fallback baseline is unchanged.
+- **Latency.** P4000, uncontended, ~75 µs per character: 50 × ~410 chars
+  1.6 s, 50 × ~2,000 7.3 s (measured); 100 × ~410 ≈ 3.2 s, 100 × ~2,000
+  ≈ 15 s (scaled). Size `RERANK_TIMEOUT_MS` (now up to 30,000) with
+  `RERANK_MAX_DOCUMENTS`; the slot-hold rule under `queue`/`enforce` is in
+  DEPLOYMENT.md and rate-limits.md. `rerank_documents` is on the usage row.
+- The harness keeps the pre-#402 builder frozen as the baseline arms
+  `make_semantic_arm_incumbent` / `make_hybrid_arm_incumbent`; the gate runs
+  each pair at `--depth 10`, `20` and `50`, because the depth-50 report alone
+  cannot see crowding or max bias at the limits agents use.
+  `scripts/rerank_allocation_report.py` is the read-only, numbers-only
+  measurement of which of a named note's fetched chunks are allocated.
+
+**Order and all or nothing (D5, D7).** Reranked order is `rerank_score`
+DESC, then the unreranked position ASC; the page is its first `limit` rows,
+every other field keeps its unreranked value. Either every candidate has a
+validated score, or none is used and the page is the **capped unreranked
+baseline** with `reranked: false (<code>)`, the first applicable of
+`not_configured`, `probe_skipped`, `probe_failed`, `no_candidates` (none of
+these sends a request), `timeout`, `transport_error`, `http_error` (3xx
+included), `oversize_response`, `malformed_response`, `count_mismatch`,
+`bad_index`, `non_finite_score`. Any other exception is
+`malformed_response`; cancellation propagates. **The rerank step never
+fails a search.** One WARNING per code per 60 s, with a suppressed count and
+the exception class, never the URL, response text or note text.
+
+**The probe, the state and `/health` (D8).** With `RERANK_URL` set and
+sandbox mode off, the lifespan probes before the first root snapshot: the
+fixed query against one relevant and one irrelevant document, sent in
+**both orders**, scores mapped by index, the relevant one strictly higher
+in each, under 10 s for the pair. That defeats a position-only scorer
+(`probe_wrong_order`) and a constant one (`probe_tie`). A pass enables
+reranking (one INFO); a failure disables it (exactly one CRITICAL naming the
+code) and **the server starts anyway**. A background task re-probes after
+60 s, doubling to 10 minutes (each attempt under `RERANK_TIMEOUT_MS`,
+failures at DEBUG), holds no database connection or lock, and is cancelled
+at shutdown; `enabled` is never revoked (per-call failures show up in the
+usage rows). `/health` reports `rerank: enabled | disabled | absent` and
+nothing else: no URL, host, code or count, no effect on `status`, always 200.
+
+**Rendering (D9).** `rerank=false` is byte-identical to the render before
+#367 on both tools (pinned against origin/main). `rerank=true`, reranked or
+not, always uses hybrid's quoted-object encoding: `semantic_search` rows are
+`- {"title","path","tags","preview_kind","preview"} — similarity: … —
+rerank_score: … — stale: true — embedding_truncated: true`, with
+`rerank_score` (`.4g`) only when reranked; `hybrid_search(rerank=true)`
+appends `rerank_score` after its own server fields. The header carries the
+token on every path (after `arms:` on hybrid), the zero-result line
+included; the semantic header always carries the stale/truncated counts and
+`shown`. The legacy prose degradation footer is not repeated in this
+encoding (the counts and row markers carry it). The response is bounded on
+rendered length by hybrid's rules; when the cap drops rows, the footer is
+`Response cap: N omitted — more: true; narrow with limit= or folder=.` (L14:
+the quoted encoding can show fewer rows than the legacy page). Pinned
+worst cases at 1,000: semantic header ≤ 199 (185 before the #389
+`confidence` token), abbreviated structure ≤ 235; hybrid header ≤ 444 (431
+before #389) and structure ≤ 367 (362 before #391's longest `matched_in`,
+`title+tags+body`) with a 20–25 character title/path cut floor on
+`rerank=true` pages. Before #389 and #391 that summed 431 + 362 + 25 + 25 +
+75 + 75 + 5 = 998; with both the cut form sums to 444 + 367 + 25 + 25 + 75 +
+75 + 5 = 1,016 (the keyword-only case measures 1,008), so that case falls
+through to the labelled omitted form (≤ 997, measured 989): the bound
+holds, the 20–25 cut is not guaranteed there (#389 L6). The both-arms
+rerank=true case with the transition line measures 1,026 cut, 1,007
+omitted and 988 at the last rung, `explain omitted`.
+Since #355 both tools' `rerank=true` pages carry the `index_transition:`
+line directly after the header and the `§` locator as a server field after
+the separator (after `rerank_score`), exactly as their `rerank=false`
+pages; the line is reserved in the budget, and an abbreviated first row
+drops the locator with `section omitted`. On a both-arms hybrid page the
+line (≤ 127 characters) makes the cut form sum 1,004 at the worst case
+(1,026 with the #389 token and #391's longest `matched_in`), so that case
+falls through to the labelled omitted form (1,007) and then to `explain
+omitted` (988):
+the 1,000 bound holds, the 20–25 cut is not guaranteed there. The
+`rerank=false` byte-identity baseline is the search-confidence page since
+#389: the pre-#389 page plus ` — confidence: ok` before the header's
+closing `:` (or `low` and the hint line), pinned in
+`tests/test_semantic_rerank.py` against the render of the tree before it.
+
+**Telemetry and concurrency (D10, D11).** `params.rerank` is the argument;
+a `rerank=true` row adds `reranked`, `rerank_reason` (false only),
+`rerank_ms` (when a request was sent) and `rerank_candidates`, and its
+`result_paths` are the rendered rows in final order. `reranked: false` is
+not an error marker. Both tools stay in the `embedding` class, the slot is
+held through the exchange (at most `RERANK_TIMEOUT_MS` longer), and the
+database session is **closed before the request is sent**: no pooled
+connection is held during the hop (the checkout-peak test pins it).
+
+**The eval gate.** A rerank change is a search-path change (for a rerank
+document change, the incumbent-builder arms are the `BASELINE`, at depths 10,
+20 and 50):
+`make search-eval-snapshot`, then `make search-eval ...
+ARMS="semantic scripts.search_eval_arms.rerank:make_semantic_arm
+scripts.search_eval_arms.rerank:make_hybrid_arm" BASELINE=semantic` with
+`RERANK_URL` set to the reranker the deployment would use. No quality claim
+is made without that report on real hardware.
+
+Accepted limitations (the change's design): L1 one wire format; L2 a note is
+judged on its best-distance chunk only (retired by #402: the best of up to
+four allocated chunks; rerank-documents' own L1–L11 — depth only from fetched
+and allocated rows, max bias toward multi-document notes, stored-prefix
+staleness within one pass, the 2,048 cut, `similarity` from the cosine-best
+chunk, the hybrid snippet replaced on a chunk winner, the 50 budget leaving no
+depth, the 1.5 s default, the `enforce` slot refusal, the unknown stamp sent
+as its title — are in that change's design); L3 the 2,048-character cut; L4 a
+stale semantic candidate is scored on its title (hybrid: its excerpt); L5
+the probe catches a mis-wired endpoint, not a weak model; L6 re-enabling
+can lag recovery by up to 10 minutes, and a failure after a passed probe is
+per call only; L7 the extended slot hold mixes into queue-mode readiness
+evidence; L8 the miner's query identity ignores `rerank`; L9 the
+`rerank=false` semantic render keeps its raw title, path and preview; L10
+no separate trust anchor (and none at all for a private-CA reranker while
+the embedding URL is plain `http`); L11 replay fails on any timeout, so a
+slow reranker needs a larger `RERANK_TIMEOUT_MS` for replay; L12 no auth
+header; L13 the reranker sees the caller's note text; L14 a capped
+`rerank=true` page can show fewer rows than the `rerank=false` page, always
+disclosed by the footer.
+
+## Confidence (#389)
+
+`semantic_search` and `hybrid_search` always return a full page: the semantic
+arm returns its nearest neighbours however distant they are. Before #389
+nothing on the page said when that list was noise — `hybrid_search("xqzvplorth")`
+returned five `arms: both` rows at similarity 0.36–0.49 with no warning. Every
+**page** of both tools now carries one header token, `confidence: ok` or
+`confidence: low`. Nothing is filtered, reordered or added to a row.
+
+**The rule (D1)**, one pure function in `src/services/search_confidence.py`:
+`low` ⇔ `SEARCH_LOW_CONFIDENCE_SIMILARITY > 0` ∧ `keyword_all == 0` ∧
+(`top_similarity` is none ∨ `top_similarity < T`). `keyword_all` is the
+`match: all` keyword note count: a disjunctive `match: any` fill on one common
+word is filler, not evidence (`xqzvplorth notes` reads `low`).
+`semantic_search` has no keyword arm and passes 0. The boundary is strict (a
+similarity exactly at `T` reads `ok`) and 0 is a hard off, so a negative
+cosine cannot fire it.
+
+**`top_similarity` is the call's actual candidate set, before rerank and the
+cap**, with no new statement and no service return-type change:
+`semantic_search` reads the first row of the ordered, deduplicated list it
+already fetched (`results[0]`, or `candidates[0]` before the rerank hop —
+the `max(5 × limit, 50)`-chunk overfetch, so a larger `limit` can flip the
+token at the margin, L12); `hybrid_search` takes the max over its semantic
+arm's deduped notes (the 50-chunk overfetch, independent of `limit`) into
+`HybridResult.top_similarity`. Both are fixed before rerank, so `rerank=true`
+and `rerank=false` carry the same value (D6). Filters are part of the
+question: a folder scope holding only weak matches reads `low`.
+`keyword_search` (lexical evidence, no similarity) and `find_related`
+(note-to-note similarity) carry no token.
+
+**Placement (D3).** Hybrid: after `arms:` and, on `rerank=true`, after
+`reranked:` — on every page, the zero-result line and the keyword-only path
+included. Semantic `rerank=false`: `… — S stale, T truncated — confidence:
+ok:` and `No semantic results for '…' (embeddings may still be building) —
+confidence: …`; `rerank=true`: after the counts, before `reranked:`. **A
+refusal is not a page**: `semantic_search`'s provider-input rejection and
+every pre-body refusal carry no token, no hint and no usage key. The token is
+server text in the header line, which no note text precedes.
+
+**The hint (D4)** is one fixed line per tool after the header and the
+`index_transition:` line (on a zero-result page after both, and before
+hybrid's keyword-only footer). It never begins with `- ` and says "try",
+never "ignore". It is **conditional**: the renderer renders the page without
+it, then with it reserved, and keeps it only if the shown paths and every row
+line are byte-identical; otherwise it is withdrawn before the abbreviation
+ladder or a row drop could change anything. So the hint never costs a row
+(L7: on a tightly capped page it is often withdrawn; the token stays). The
+legacy `semantic_search(rerank=false)` page has no character budget, so its
+hint is unconditional. Both hints are at most 140 characters (semantic 132,
+hybrid 140).
+
+**The token is a header token like `arm_depth` (L14).** It is part of every
+page's base budget with no compaction: on a capped page whose last row fitted
+before #389 with fewer than 17–18 characters to spare, that row is now
+omitted, and the existing cap footer states the count (`more: true` on
+`rerank=true`). Under the default 40,000-character cap that needs a page
+within 18 characters of the cap.
+
+**Bounds (D5)**, re-measured and pinned for both `confidence: ok` and the
+low-plus-`any` case (no `all` row, 50 `any` rows — `all 0` is one character
+shorter than `all 50`, `low` one longer than `ok`, so the two headers are
+equal): hybrid header 405 (`rerank=false`) and 444 (`rerank=true`),
+`semantic_search(rerank=true)` header 199, floor arithmetic
+405 + 345 + 45 + 45 + 75 + 75 + 5 = 995 (340 and 990 before #391's longest
+`matched_in`, `title+tags+body`). Measured worst cases at the floor
+(8,192-control query, `HYBRID_RRF_K=1000`, the ten-digit transition line
+where both arms ran, `matched_in: title+tags+body`; each five more than
+#389 measured with `title,body`): keyword-only `rerank=false` cut form 981;
+keyword-only `rerank=true` cut 1,008 → omitted 989; both arms
+`rerank=false` cut 999; both arms `rerank=true` omitted 1,007 → `explain
+omitted` 988. These are the structural sums the tests pin; a page actually
+rendered from the worst-case fixtures fits in an earlier form (the sum mixes
+the fallback token with a `rerank_score`, and the reserved header's
+full-page counts with the shown header's), so the new rung is a guarantee
+for the arithmetic, exercised directly by the tests.
+
+**The threshold ships at 0 (D2).** The asymmetry is the reason for a
+calibration rather than a guess: a false `low` pushes an agent away from the
+right notes, a missing `low` is merely the behaviour before #389. Live
+bge-m3 numbers (2026-10-30, mid-rechunk): gibberish best similarity
+0.36–0.49, real paraphrases 0.61–0.67 — evidence for a **candidate** value of
+0.50, not a calibration, and none of the probes was a short identifier with
+no all-terms match, which is the false-`low` case that matters.
+`SEARCH_LOW_CONFIDENCE_SIMILARITY` is a float in [0, 1], non-finite refused,
+read at startup, never an argument. `ok` at 0 means "not judged". It changes
+no ranking, so it is **not part of `retrieval_fingerprint()`** — but it is
+model-dependent (OpenAI `text-embedding-3-*` cosines run well below bge-m3's)
+and must be re-chosen whenever the embedding model in the fingerprint
+changes. It is tuned with the harness's `confidence` tabulation
+(DEPLOYMENT.md, "Calibrating search confidence"): both tools' lines must PASS.
+
+**Usage keys (D7).** On every page of both tools, whatever the threshold:
+`confidence`, `top_similarity` (three decimals, when a candidate existed)
+and, on `hybrid_search`, `keyword_all`. None is an `error` marker; refusals
+record none. The search-eval export carries the three keys, and `mine`
+writes them per search row into `confidence-rows.jsonl`.
+
+Accepted limitations (the change's design): L1 the candidate 0.50 rests on a
+handful of probes; L2 an all-terms match can be lexical coincidence; L3
+`semantic_search` judges on similarity alone (a topic covered only in short
+or foreign-language notes can read `low`); L4 one global threshold; L5 a
+stale best row counts; L6 at the 1,000 floor the 20–25 `rerank=true` cut is
+not guaranteed on two worst cases; L7 the hint is often withdrawn on a tight
+page; L8 the keyword-only empty page's hint names a similarity that was
+never measured; L9 the false-low rate is not in the search-eval report; L10
+old shallow runfiles get null recall@50; L11 `confidence` is not part of the
+miner's query identity; L12 `limit` can flip `semantic_search`'s token at
+the margin; L13 the miner has two query classes; L14 the token can cost a
+boundary row; L15 one setting enables both tools.
 
 ## Filtered vector search — the SET LOCALs are correctness, not tuning
 
@@ -79,8 +795,11 @@ Consequences that are easy to undo by accident:
   fixed at `max(5 × limit, 50)` for both paths, so a verbose note can still
   crowd out others after dedupe — the baseline shares that property.
 - Recall is bounded by `hnsw.max_scan_tuples` (20,000) and
-  `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault is under the cap;
-  those are the next knobs, not `ef_search`.
+  `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault was under the
+  cap; heading-aware chunking (#355) is expected to take it to roughly 22k–42k
+  chunks, past it. Re-run `tests/integration/test_search_recall.py` at the
+  re-embedded count; if filtered recall drops, `max_scan_tuples` is the knob,
+  not `ef_search`.
 
 ## The `halfvec` index: half precision picks candidates, full precision ranks them (#283)
 
@@ -274,29 +993,113 @@ note, search *before* the pass and observe the row is **not** marked, then searc
 after the pass and observe that it is. Writing the test that way is what keeps
 the residual from being re-described as a guarantee later.
 
+## The section locator and the one-line preview (#355)
+
+**The locator.** Both vector statements project `heading_path` and
+`section_ordinal` (never `embed_prefix`, never the vector), and the service
+result gains `section: {"path": [...], "ordinal": n} | None`. The renderer
+(`_section_locator` in `tools.py`) appends, after the degradation suffix,
+` · § "Parent/Child" (#7)` for an ordinal ≥ 1 or ` · § (top of note)` for
+section 0. The joined path is **one JSON string literal**
+(`change_feed.quote`: C0/C1 controls, DEL, U+2028/U+2029 escaped), so a
+heading cannot close the quote and the `(#7)` after it is server-authored; a
+forged `(#3)` inside a heading stays inside the quotes. Over 160 characters
+the outer components are dropped behind `…/`, keeping the innermost heading.
+`read_note(path, section="#7")` resolves the same ordinal over the same bytes
+(the chunker uses the section-addressing scanner). Since #390 the ordinal is
+the **deepest** section whose `read_note(section="#N")` body contains the
+chunk, so a chunk merged across headings names the parent (or the top of the
+note), and the follow-up still contains it.
+
+**What a chunk is (#390, chunking version 2).** The windowing no longer cuts
+fixed 2,048-character slices: a window ends on a line or word start within
+`min(200, W // 10)` of its limit, and no stored chunk is shorter than
+`min(200, W // 2)` collapsed characters except the single chunk of a note that
+short. Short sections are grouped with their neighbours, so a merged chunk's
+preview can show an inner heading line (collapsed to one line by
+`_preview_line`, so it cannot forge a row), and previews start on a word. The
+reason is ranking: a 25-character chunk's provider input is mostly its
+300-character breadcrumb prefix, so its vector is the note's topic and it
+outranked real passages for any query about that topic. Ranking-time
+down-weighting was declined — it would keep the degenerate vectors stored
+and add a score transform hybrid, the reranker and the harness would all have
+to know about. See [indexing and embeddings](indexing-and-embeddings.md).
+
+**Withheld on stale and pre-034 rows.** `section` is `None` when the row is
+stale — `#N` is positional, and an ordinal recorded for content the index knows
+is superseded may name another section — and when `heading_path` is NULL (a
+legacy row). Such a line is byte-identical to the pre-#355 line. A fresh row
+edited on disk but not yet scanned keeps its locator (L3, the existing bound);
+`read_note` returns the `heading` so the agent can check.
+
+**One-line previews from the uncut chunk.** The service no longer cuts at 500;
+`_preview_line(text, 200)` collapses every maximal `str.isspace()` run (CR, LF,
+tab, U+2028/U+2029 included) to one space, trims, escapes the remaining
+C0/DEL/C1 controls as `\uXXXX`, then cuts at 200, and each tool keeps its own
+ellipsis. So a chunk holding `\n- **Forged** (`x.md`) — similarity: 0.999`
+cannot print a line that reads as a server row, and 600 leading spaces cannot
+eat the preview. It is not `_one_line`, which escapes nothing.
+
+**The transition line.** While any note in the caller's owner scope has
+`embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION`, every
+`semantic_search` and `find_related` response carries, directly after its
+header and on the empty path too, `index_transition: N notes not yet
+re-chunked; cross-generation ranking is approximate, re-run after the backlog
+drains`. N is `rechunk_pending_count`, owner-scoped (total mapping), read in
+the **same `REPEATABLE READ, READ ONLY` transaction** as the vector query —
+`semantic_search` opens it with `SET TRANSACTION` as its first statement when
+handed a session with no transaction open, `find_related_impl` as its first
+statement. Absent at zero. Only notes that **hold vectors** of another
+generation count (`legacy_vectors_sql` / `_expr`), so a note created since the
+last embed pass — in the backlog, with no vectors yet — does not raise the
+line, while a legacy note whose certification a tag edit cleared still does.
+The query (and `find_related`'s source path) is echoed in the header as one
+escaped line (`_header_scalar`), so a multiline query cannot push the line
+down or forge one above it.
+
+**`hybrid_search` gives the same warning (#354 × #355).** Its semantic arm
+(`semantic_arm_rows`, `kind="query"`) carries the locator columns, and when
+that arm ran the service reads `rechunk_pending_count` in the call's one
+snapshot (step 7b); the renderer puts the same `index_transition:` line
+directly after the header, on the empty path too. A semantic-arm row carries
+the locator as a server field after the separator (`§ "…" (#N)` /
+`§ (top of note)`), dropped with `section omitted` in an abbreviated row, and
+its chunk preview is `_preview_line` of the uncut chunk. The 1,000-character
+floor still holds: the line appears only with both arms, so the keyword-only
+footer (75) is absent, and the abbreviation continues into the omitted forms
+when it must (each drops at least 40 rendered characters of title or path).
+`test_the_worst_case_at_the_minimum_cap_with_a_transition_and_a_locator`
+renders the worst case — longest header, a ten-digit count, a six-component
+locator — at the floor.
+
 ## Read paths project what they render (#280)
 
-Six read statements select an explicit column list instead of whole entities:
+Seven read statements select an explicit column list instead of whole entities:
 
 | Path | Projected columns |
 | --- | --- |
-| `semantic_search` | `ne.note_id, ne.chunk_index, ne.chunk_text, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` (the `find_related_stmt` shape) |
-| `keyword_search` | `nm.file_path, nm.title, nm.tags, rank` |
+| `semantic_search` | `ne.note_id, ne.chunk_index, ne.chunk_text, ne.heading_path, ne.section_ordinal, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` |
+| `find_related_stmt` | `ne.note_id, ne.chunk_text, ne.heading_path, ne.section_ordinal, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` — a different shape: no `chunk_index`, because its dedupe keeps the nearest chunk per note by distance alone |
+| `keyword_search` | `nm.id, nm.file_path, nm.title, nm.tags, rank` (both ranking blocks); the snippet statement projects `id`, one `ts_headline` per config, the two `matched_in` flags, `has_excerpt` and the `matched_terms` counts — `body_excerpt` is read inside `ts_headline` and never projected |
 | `list_notes` | `file_path, file_size, modified_at` |
 | `get_recent` / `find_orphans` | `file_path, title, tags, modified_at` |
 | `get_neighborhood` hydration | `id, file_path, title, tags` |
 
 None of them ships `notes_metadata.content_tsvector` (the largest TOASTed
-column, which the planner does not cost), `note_embeddings.embedding` or
-`notes_metadata.frontmatter`. `ts_rank_cd` and `@@` still read the tsvector
-*server-side*; what is gone is shipping and hydrating it. **No predicate, no
-`SET LOCAL`, no overfetch and no exact-fallback condition changed.** The
-staleness fields (`content_hash`, `embedded_content_hash`) and
+column, which the planner does not cost), `notes_metadata.body_excerpt`,
+`note_embeddings.embedding`, `note_embeddings.embed_prefix` (embedded input,
+never rendered; #355) or `notes_metadata.frontmatter`. The two vector
+statements project `heading_path` and `section_ordinal` because the locator
+renders them (#355). `ts_rank_cd`,
+`@@` and `ts_headline` still read the tsvector and the excerpt *server-side*;
+what is gone is shipping and hydrating them. **No predicate, no `SET LOCAL`,
+no overfetch and no exact-fallback condition of the vector paths changed.**
+The staleness fields (`content_hash`, `embedded_content_hash`) and
 `chunks_truncated` are still selected wherever they are rendered. A new read
 path should follow the same rule: select the columns it renders.
 
-**`content_tsvector` is deferred with raiseload** (D5):
-`mapped_column(TSVECTOR, deferred=True, deferred_raiseload=True)`. A
+**`content_tsvector` and `body_excerpt` are deferred with raiseload** (D5,
+#344): `mapped_column(…, deferred=True, deferred_raiseload=True)`. A
 whole-entity `select(NoteMetadata)` (the path lookups in the graph tools, the
 indexer's per-note loads) no longer carries it, and code that reads
 `.content_tsvector` from a loaded entity raises `InvalidRequestError` instead
@@ -326,11 +1129,13 @@ stay last. `semantic_search`'s in-Python re-sort keys on
 on `file_path`. Before this, an exact tie was resolved by whatever row the sort
 saw first.
 
-**What "identical" means for this change.** The results are the same as the
-pre-change implementation: the same result set, the same order, every field
-other than `similarity` byte-equal, and `similarity` within 1e-5. There are
-exactly three permitted exceptions, and all of them are confined to exact ties
-of the sort key (`modified_at`, `rank` or distance):
+**What "identical" means for this change.** For the vector, listing and graph
+paths the results are the same as the pre-change implementation: the same
+result set, the same order, every field other than `similarity` byte-equal,
+and `similarity` within 1e-5. (`keyword_search`'s clause was narrowed by #344
+— see "What is invariant" above.) There are exactly three permitted
+exceptions, and all of them are confined to exact ties of the sort key
+(`modified_at`, `rank` or distance):
 
 1. **membership at a tied cutoff**: when more rows share the boundary key than
    fit under the limit, which of them are returned may differ;
@@ -423,11 +1228,24 @@ Recorded numbers on that corpus: rare-term keyword query 228 buffers with the
 hint vs 29,071 sequential; common-term 57,799 either way (seq scan is the right
 plan there, so it is recorded, not asserted).
 
+These benchmarks prove the index does not lose candidates against an exact
+scan; they cannot say whether the notes returned are the ones an agent
+needed. Their relevance counterpart is the
+[search evaluation harness](#search-evaluation-harness-356) below.
+
 ## Per-phase search timing
 
 `usage_logs.params` carries `embed_ms` + `db_ms` + `exact_fallback` for
-`semantic_search`, and `db_ms` + `exact_fallback` for `find_related` (it makes
-no embedding call). A single whole-call `duration_ms` could not separate the
+`semantic_search`, `db_ms` + `exact_fallback` for `find_related` (it makes
+no embedding call), and `fallback` + `any_rows` + `snippet_ms` for
+`keyword_search` (#344), and for `hybrid_search` (#354) `embed_ms`, `db_ms`,
+`exact_fallback`, `fallback`, `any_rows`, `snippet_ms` plus `arms`,
+`semantic_unavailable` (keyword-only only), `keyword_rows`, `semantic_rows`,
+`overlap` and `rrf_k`. A `semantic_search` or `hybrid_search` call with
+`rerank=true` (#367) adds `reranked`, `rerank_reason` (only when false),
+`rerank_ms` (only when a request was sent) and `rerank_candidates`, with
+`embed_ms + db_ms + rerank_ms ≤ duration_ms`; `rerank=false` adds none of
+the four. A single whole-call `duration_ms` could not separate the
 two independent cold paths — provider eviction and HNSW page cache — so the
 last regression had to be diagnosed with hand-run probes against the live DB.
 
@@ -452,8 +1270,11 @@ The same holder carries what a search *returned*, which is what
 `/admin/search-analytics` reads. Three keys, written by
 `timing.record_results` / `timing.record_source_path` in the place where each
 tool's result set is final — `full_text_search` (`src/services/search.py`),
-`semantic_search` (`src/services/embeddings.py`), and `find_related_impl`
-itself, after its dedupe and truncation to `limit`, so the telemetry names what
+`semantic_search` (`src/services/embeddings.py`), `hybrid_search_impl`
+(from the rows it actually rendered, after the response bound; #354), both
+tools' `rerank=true` paths (once, from the rendered rows in their final,
+reranked order; `semantic_candidates` records nothing; #367), and
+`find_related_impl` itself, after its dedupe and truncation to `limit`, so the telemetry names what
 the caller was handed and not what the overfetch scanned.
 
 - **`result_count`** — an int, always, and the **full** count. Not the number
@@ -495,3 +1316,325 @@ Reading side: `src/services/search_analytics.py` and
 keys on `(usage_logs.user_id, path)` with `IS NOT DISTINCT FROM` — is written
 down there and in [usage attribution](usage-attribution.md).
 
+## Search evaluation harness (#356)
+
+Retrieval quality is measured offline, on judgments mined from the
+operator's own `usage_logs`, by `scripts/search_eval/` (`python -m
+scripts.search_eval mine | snapshot | run | score`, wrapped by `make
+search-eval-export`, `make search-eval-snapshot` and `make search-eval`;
+`confidence` since #389).
+It reads only what the "Search result telemetry (#161)" contract above
+already writes, and changes no search tool, no telemetry key, no panel and
+no schema. The step-by-step operator path is DEPLOYMENT.md, "Measuring
+search quality"; this section is the why.
+
+**What a judgment is.** A usable `read_note` row for path *p* by principal
+*P* credits `(query, p)` only when a usable `keyword_search` /
+`semantic_search` / `hybrid_search` (#354; a keyword-only hybrid row carries
+no `error` and is usable) row by the same *P* is strictly earlier, inside the
+window (`R.created_at - W < S.created_at < R.created_at`, W = 120 s by
+default), and its logged `result_paths` contains *p* by exact string
+equality. When several searches qualify, only the **latest** is credited
+(ties broken by row id), so one read credits at most one search; a read
+that credits nothing is counted as `unattributed_reads`.
+
+- **The principal is the credential principal the rate limiter uses**:
+  `(user_id, "api_key", key_id)` when `key_id` is set, otherwise
+  `(user_id, "oauth", grant_id)` when `oauth_token_id` resolves to a token
+  row carrying a `grant_id` (the export joins `oauth_tokens` for it). Any
+  other row is excluded as `unresolved_principal` and **never** merged under
+  `actor_ref`: one `client_id` covers many independently revocable grants,
+  and merging them would credit one agent's read to another agent's search.
+- **Usable** means `params.error` absent or null and `params.over_quota` not
+  true (the Python mirror of `search_analytics.analysable_sql`; an
+  integration test pins the equivalence). A usable search also carries a
+  `result_paths` array of strings and a non-empty query the 200-character
+  param cap did not truncate (length 201 ending in `…`, which cannot be
+  replayed faithfully); a usable read carries a non-truncated `path`. Every
+  exclusion is counted by reason in `mine-report.json`.
+- **A query** is `(user_id, whitespace-normalized text, canonical JSON of
+  {folder, tags, frontmatter})`, its id the first 16 hex digits of that
+  tuple's sha256. Searches sharing it fold into one query; its relevant set
+  is the union of credited paths (grade 1), its **pool** the union of every
+  logged `result_paths`. `sources` is a set: an operator-written judgment
+  with the same identity merges in, and a query in both `mined` and `manual`
+  is scored in both slices and counted once in `n_both_sources`. A class,
+  `identifier` or `prose`, comes from a table-tested heuristic in
+  `classify.py`; a manual judgment's explicit class overrides it.
+
+**Read-only, and its limit.** The export (`scripts/search_eval_export.sql`)
+is one `BEGIN TRANSACTION READ ONLY` / one `SELECT` / `COMMIT`, run by psql
+through `docker/db-exec.sh`, the channel `make db-backup` uses; a test parses
+the file and fails on any added statement, and the integration gate runs the
+real Make target through a `DB_EXEC` shim. Replay connects only to
+`SEARCH_EVAL_DATABASE_URL` (or `--database-url`), never `DATABASE_URL`, and
+the documented target is a disposable copy restored from a `BACKUP_FULL=1`
+dump. **The built-in `keyword` and `semantic` arms write nothing** (they call
+the services directly, never through `_tracked`, and an integration test
+reads `pg_stat_user_tables` before and after). **An imported arm runs with
+whatever the replay URL permits**: it can open its own engine or `SET
+TRANSACTION READ WRITE`, so the restored copy is what protects data. Every
+replay connection sets `default_transaction_read_only=on` and `run` asserts
+`SHOW transaction_read_only = on` first; that is a backstop against an
+accidental write through the supplied sessions (25006, and the run fails),
+not a guarantee about every arm.
+
+**The snapshot, drift and corpus loss.** `make search-eval-snapshot` records,
+on the restored copy **before any candidate is applied**, every
+`notes_metadata` row per owner (NULL-safe) with its searchable membership:
+
+| membership | definition |
+|---|---|
+| `metadata` | the `notes_metadata` row exists |
+| `keyword` | `notes_metadata.content_tsvector IS NOT NULL` |
+| `semantic` | at least one `note_embeddings` row with `note_id = notes_metadata.id` |
+| `keyword_and_semantic` | both `keyword` and `semantic` |
+| `keyword_or_semantic` | either (a union-retrieving arm such as `hybrid_search`, #354); corpus loss is **per constituent**: losing any constituent the snapshot marked present is loss, even if the other still reaches the note |
+
+`embedded_content_hash` is not part of `semantic`: under #200 a stale vector
+is annotated and still returned (the snapshot records `stale_vector` for
+information). Two absences are kept apart:
+
+- **Vault drift**: a judged path absent from the snapshot was renamed or
+  deleted before any candidate. It leaves the qrels (`dropped_paths`), and a
+  query left empty is dropped (`dropped_queries`).
+- **Candidate corpus loss**: a judged path the snapshot marks searchable under
+  an arm's membership, but the replay database does not. It **stays relevant
+  and counts as a miss**, is reported as that arm's `corpus_loss`, and any
+  loss makes the verdict `CORPUS_LOSS` (exit 2): the run is not evidence. A
+  path not searchable under the membership even in the snapshot is
+  `unsearchable_before`, a miss for baseline and candidate alike, never loss.
+  The replay corpus never shrinks the qrels.
+
+Worked examples: Q has relevant {A.md, B.md} and the incumbent returns both.
+A candidate whose derivation deletes B.md's `notes_metadata` row returns only
+A.md: recall@10 0.5, `corpus_loss: 1`, exit 2. A re-embedding pass that deletes
+B.md's `note_embeddings` and then fails leaves the row and its tsvector: the
+`semantic` arm (and any `semantic`, `keyword_and_semantic` or
+`keyword_or_semantic` candidate) gets `corpus_loss: 1`, the `keyword` arm
+none. A note that was keyword-only in the snapshot is `unsearchable_before`
+for a `keyword_and_semantic` arm but loss for a `keyword_or_semantic` one if
+the candidate clears its tsvector: the AND membership would have certified a
+lost note the production hybrid reaches (Codex spec round 1, #354).
+
+**Arms and generations.** An arm is an async `(EvalQuery, depth) -> list[str]`
+built by a factory from an `ArmContext` (read-only session factory, replay
+corpus, `--arm-opt` options). Built-ins are `keyword`, `semantic` and the
+fixture-only `fixture-lexical` / `fixture-title`. A follow-up adds a
+candidate as `<module>:<factory>` (declaring `factory.membership`, or the run
+exits 64), e.g. #354's RRF fusion as
+`ARMS="keyword semantic scripts.search_eval_arms.hybrid:make_arm scripts.search_eval_arms.hybrid:make_arm_alt"
+ARM_OPTS="hybrid_k=60 hybrid_alt_k=20"` with membership `keyword_or_semantic`
+(two factories because `--arm-opt` is one dict for the whole run; a factory
+may declare `required_options`, refused with exit 64 before the generation
+is reserved); #367's reranker as `scripts.search_eval_arms.rerank:make_semantic_arm`
+(membership `semantic`) and `make_hybrid_arm` (`keyword_or_semantic`), whose
+async `factory.preflight` probes the reranker before the generation is
+reserved (exit 64 on failure) and which fail the run on any unreranked
+answer except `no_candidates`, an empty answer counted per arm as
+`empty_candidates` in the manifest (see "Reranking (#367)"); #355's heading-aware chunking as the
+built-in arms replayed on a copy re-chunked after the snapshot; or #367's
+embedding-model trial as `runfile:<path>`, a staged arm file the harness's
+own `run` wrote on a re-embedded copy with the same qrels, snapshot and
+selection hashes, published by a complete manifest. Every `run` is a
+**generation**: its `runs/<generation>/` directory is reserved by an exclusive `mkdir` (a reused or concurrent id is exit 64, and the directory survives any failure), and `runs/manifest.json` is written `running` before any factory
+executes, rewritten `failed` (the failing arm and the exception type only, since a
+message can quote query text; the message goes to stderr; exit 1) on any exception or any answer that is not a
+list of strings, and `complete` with every staged file's sha256 only after
+every arm answered every selected query. `score` reads only that manifest,
+never an earlier generation, and exits 64 unless it is complete and its
+selected-qid hash, qrels hash, snapshot hash and file hashes all match. A
+`runfile:` arm's missing queries are the one tolerated omission, scored empty
+and counted as `missing_queries`. Answers are deduplicated to first rank and
+truncated to `--depth` (50 since #389: the tools' largest `limit` and
+`hybrid_search`'s arm depth, so recall@50 is the ceiling of one page; 20
+before), and ranked exactly as returned. Each arm's staged meta and report
+entry carry `staged_depth`: the generation's depth, or for a `runfile:` arm
+the minimum of that and the source file's own recorded `depth` (its
+`staged_depth` when shallower), which the run validates — a missing,
+non-integer or non-positive source depth is exit 64 before anything is
+reserved. Scoring reports every recall@k with k above an arm's
+`staged_depth` as null, with a null delta and interval (L10 of #389: an old
+shallow runfile gets a null recall@50 and must be re-run for a delta).
+
+**Metrics** (`metrics.py`, standard library only, E1): binary gains over
+`dedup(run)`; recall@k = |relevant ∩ top k| / |relevant|, reported at k =
+5, 10, 20 and 50 (the last two since #389: an agent investigating reads past
+rank ten); reciprocal rank =
+1 / rank of the first relevant item (MRR its mean); nDCG@10 = DCG / IDCG,
+DCG = Σ rel_i / log2(i + 1), IDCG over min(|relevant|, 10) items; `novel@10`
+= the mean share of an arm's top ten outside the query's pool, i.e. results
+nobody could have judged. With `--baseline`, per metric and per slice
+(overall, `class:*`, `source:*`), the per-query deltas (candidate minus
+baseline, reported sorted, without query ids), their mean, and a percentile
+bootstrap 95 % interval on the mean: 1,000 resamples with replacement from
+`random.Random(seed)` over the deltas in qid order, linear-interpolated
+2.5th / 97.5th percentiles. The interval is reported and never gates.
+
+**The report and the gate.** `report.json` (`schema_version` 3, current
+since the gate step; 2 was #389's output and is historical, refused by
+`gate`) holds the metrics, counts (per
+class, per source, `n_both_sources`, drift, `ownerless_queries`), each arm's
+label, options, membership, `corpus_loss`, `unsearchable_before` and
+`missing_queries`, the window, the seed, the qrels / snapshot / selection
+hashes, the generation, `provenance`, `attachable` and `commit_sha`, and
+**no query text and no note path**; `score` checks the serialized report for
+both before writing it. `stable_projection` drops `UNSTABLE_KEYS`
+(`commit_sha`, `generated_at`, `generation`), which is what the committed
+golden file `tests/fixtures/search_eval/expected-report.json` is compared
+with; `commit_sha` is asserted separately against `git rev-parse HEAD`.
+Exit codes: 0 `OK`, 2 `INSUFFICIENT_DATA` (fewer than `--min-queries`,
+default 50) or `CORPUS_LOSS`, 64 usage error or an incomplete or mismatched
+run, 1 anything else. **`score` has no metric threshold** (E2): the report
+is for the reviewer to judge, with the incumbent as `--baseline`. A change
+that needs a mechanical bar uses the `gate` step below. The golden
+was regenerated once by #389 (the new metric keys, `staged_depth`, depth 50,
+`schema_version` 2), and once by the gate step (`schema_version` 3,
+`deltas_baseline`; a `runfile:` arm also carries `source_generation` and
+`source_report_sha256`).
+
+**The gate step.** `python -m scripts.search_eval gate --report R --arm A
+--metrics m,… --slices s,… --min-ci-lower X --out F [--baseline-report B]`
+reads a scored report's `deltas` for arm A against the report's baseline,
+and prints one line per (metric × slice) cell: the delta mean, the paired
+bootstrap CI95, and PASS or FAIL. A cell FAILs when its CI95 lower bound is
+below X, or when its interval is null. The same table goes to F as
+Markdown for the PR body. Exit codes: 0 all pass, 1 any cell fails, 64 on
+a usage error. The step imports nothing from `src`. It was built for
+the first real-data evaluation run (2026-10-31).
+Two rules hold, both verified by Codex:
+
+- **The tenant boundary is checked first.** The report, and for a
+  `runfile:` baseline the staging generation's report (`--baseline-report`,
+  then required), must each have verdict `OK`, `attachable: true` and
+  `provenance.users == 1`. Otherwise the step exits 64 with no cell and no
+  PASS/FAIL printed, and F is neither created nor replaced.
+- **The baseline is bound to its evidence.**
+  - The report's `baseline` must equal its `deltas_baseline` (the arm every
+    delta was computed against) and occur exactly once in its `arms`.
+  - A `runfile:<label>@<generation>` baseline's report must be **that**
+    generation's report, with the same qrels, snapshot and selection hashes
+    as the candidate report and an arm `<label>`.
+  - Its file's sha256 must equal the `source_report_sha256` that `run`
+    recorded on the runfile arm when it staged it. `run` records that
+    digest only when the source data directory's `report.json` scores the
+    source generation; otherwise it records null and the gate refuses.
+
+  Without these rules, an unrelated or relabeled safe report could vouch
+  for a multi-user runfile. An operator who forges both files and the
+  digest can still pass (accepted: the trusted-operator model).
+
+**The confidence tabulation (#389).** `python -m scripts.search_eval
+confidence --data DIR --threshold T` reads `confidence-rows.jsonl` (one line
+per non-refusal `semantic_search` / `hybrid_search` row with a resolved
+principal — a query the 200-character telemetry cap cut is kept, unlike for
+replay, and clicks are attributed over these rows plus the replay-usable
+searches: `tool`, `class`,
+`confidence` when the usage row recorded one, `created_at` in UTC epoch
+microseconds, `top_similarity`, `keyword_all`, `clicked` — no text, no path)
+and `mine-report.json`, connects to no database, and prints one
+`<tool>: false-low <rate> (<n>/<m> clicked-through pages, <d> days) —
+PASS|FAIL|INSUFFICIENT_DATA at < 1/50` line per tool, then per-class counts
+and the `top_similarity` deciles of clicked and unclicked pages. A row is
+post-change exactly when it carries `confidence`; earlier rows are counted
+as excluded and contribute to no rate and no span. A keyword-only page (null
+`top_similarity`) is included, so a clicked-through keyword-only `low` is a
+false low. A tool's line is `INSUFFICIENT_DATA` under 14 days of post-change
+rows (by `created_at`) or under 200 clicked-through pages (zero included),
+otherwise PASS exactly when the rate is below 1/50 (the span is judged
+unrounded); there is no aggregate. `mine` publishes the rows first and the
+report last with the rows' SHA-256 and count, and the tabulation refuses
+(exit 64) a pair that does not match, so one run's rows never tabulate under
+another run's provenance.
+`confidence-report.json` (counts and rates, checked by `assert_no_leak`)
+carries the mine run's `provenance` and `attachable`, and a non-attachable
+table begins with the `NOT ATTACHABLE` line; only attachable output leaves
+`.search-eval/`. The rule is restated in `scripts/search_eval/confidence.py`
+because the harness imports nothing from `src`.
+
+**Provenance: only a single-tenant report is attachable** (D10). Removing
+text, paths and ids does not make a multi-user report safe to publish:
+counts and per-slice metrics are themselves tenant data, and whoever knows
+tenant A's share can subtract it and learn about tenant B. `provenance.users`
+is `1` when the export ran with `USER_ID=` (every row carries the same
+`user_filter` and that `user_id`, or `mine --user-id` filtered it), or when
+the deployment has at most one user and the export at most one distinct
+`user_id`; anything else, including an empty export, is `"multi"`.
+Under a user filter, another owner's manual judgment is excluded and counted (`manual_excluded_other_owner`), and a manual judgment for an owner outside the evidence makes the provenance `"multi"`. `attachable` is `provenance.users == 1`. A non-attachable report is still
+written for the operator's private use, and its table starts with `NOT
+ATTACHABLE (multi-user provenance)`. Only an attachable report may be
+attached to a PR.
+
+Accepted limitations:
+
+- **L1** Incumbent bias: only notes the live tools showed can be judged; read recall drops alongside `novel@10`.
+- **L2** A read is not relevance: grade 1 means "the agent chose to read it".
+- **L3** Queries and read paths over 200 characters are truncated in the log and excluded.
+- **L4** Exact path match only: a read spelled differently from the result row does not pair (undercounts, never mis-credits).
+- **L5** Vault drift drops a renamed note's judgments; they are not followed to the new path.
+- **L6** The principal is the key or grant: two sessions sharing one can cross-credit; deleted credentials' rows are excluded (`unresolved_principal`).
+- **L6a** The snapshot-before-candidate ordering is operator discipline; the snapshot hash in every report is the control.
+- **L7** The 120 s window is a heuristic: a slow read is lost, a coincidental one credited.
+- **L7a** The defaults (`--min-queries` 50, 90-day export, 120 s window) are unvalidated until the first real export (task 8.4).
+- **L8** Replay is not bit-reproducible (approximate HNSW, provider drift): compare arms within one report.
+- **L10** Rows before #161 have no `result_paths`; rows before typed body outcomes may show a failed read without `error`.
+- **L11** A deleted user's rows are ownerless (`user_id` NULL) and replay against the ownerless slice; counted as `ownerless_queries`.
+- **L12** Small samples: the bootstrap interval shows the uncertainty, and `INSUFFICIENT_DATA` stops a 12-query verdict looking like a result.
+- **L13** `SEARCH_EVAL_DATA` may point outside `SEARCH_EVAL_DIR`; nothing checks it is git-ignored (same directory by convention; 0700/0600 still apply).
+- **L14** A truncated query holding a NUL or lone surrogate escapes `is_truncated` (#310 escaping grows it past 201 characters); implausible, not handled.
+- **L15** A symlinked `SEARCH_EVAL_DIR` is not refused (writes use unpredictable `O_EXCL` temp files); a planted symlink in the operator's own 0700 directory means the account is already compromised.
+- **L16** `score` trusts the field types of a complete manifest the harness wrote; a hand-edited one with mismatched types fails with exit 1, not 64.
+
+**Semantic arms record what shaped their vectors (#355).** A database-backed
+arm whose membership includes `semantic` stages `retrieval_fingerprint` (the
+stored embedding fingerprint's fields, `chunking_version` and the instruction
+digest) and `legacy_chunked_notes` — the replay copy's notes **of the export's
+owner** (`IS NOT DISTINCT FROM`, so the ownerless scope is covered; all owners
+only for a `"multi"`, non-attachable report) that hold vector rows and whose
+`embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION`, by one read-only
+`SELECT`, null on a pre-034 copy — in its meta and its `report.json` entry. A
+`runfile:` arm carries its meta's values or null; fixture arms gain no key, so
+the committed golden fixture is unchanged. `SEARCH_LOW_CONFIDENCE_SIMILARITY`
+(#389) is deliberately not in the fingerprint — it ranks nothing — but it is
+model-dependent and is re-calibrated whenever the fingerprint's model
+changes. A re-chunk comparison is evidence
+only when the candidate arm's `legacy_chunked_notes` is 0 (DEPLOYMENT.md,
+"Before and after a re-chunk or re-embed").
+
+**And the chunk-length distribution (#390).** The same arms stage
+`chunk_lengths`: `{chunks, p10, p50, p90, whole_short, under_min,
+raw_over_window}` over the owner's stored chunks, by one read-only `SELECT`
+under the same owner predicate, null for an empty set or a pre-034 copy.
+Every length is the chunker's `clen` through its SQL twin
+(`embeddings.CLEN_SQL`); `whole_short` counts chunks below the effective
+minimum in a one-chunk note (L7), `under_min` those in a note with more than
+one chunk — **0 for a conforming chunker**, and `scripts/search_eval/db.
+UNDER_MIN_SQL` is the exact statement the recipe runs — and
+`raw_over_window` chunks longer than one window raw (L3, observation only).
+A re-chunk to version 2 is evidence only with `under_min: 0` as well.
+
+## Change-feed lines and the listing windows (#351)
+
+**Event lines are JSON-quoted, not `_one_line`d.** A filename may legally
+contain a newline, and folding whitespace would change a path's identity, so
+every note- or user-controlled string on a `get_changes` line (`path`,
+`from_path`, `actor_label`) is a JSON string literal with C0/C1 controls,
+DEL, U+2028 and U+2029 escaped (`change_feed.quote`). The path stays exact
+and recoverable and the line stays single, so a note named
+`a.md\n- ev:999 … deleted "Important.md"` cannot forge a row (offline test).
+Everything else on the line is server-authored; a line shows the actor kind,
+label, tool and `(you)`, never a principal reference, key id or prefix,
+`client_id`, grant id, user id, the surrogate event id or a tool argument.
+
+**`get_recent` / `list_notes` windows.** `since` (inclusive), `until`
+(exclusive) and `order_by` (`mtime`, the default, or `content_changed`) apply
+to one column, with NULLs excluded; one parser
+(`change_feed.parse_utc_bound`) takes a UTC date (the whole day) or an ISO
+8601 datetime with an explicit offset and refuses a naive datetime and a
+`get_changes` cursor. Paging is a keyset over `(column DESC, file_path ASC)`
+— `col < t OR (col = t AND file_path > p)` — so a tie group larger than a
+page is reachable; the opaque cursor shares `list_tasks`' envelope and owner
+discriminator, plus the order and a filter digest, and is refused for any
+other call. The `more: cursor=…` footer appears only when the call used one
+of the four parameters: a call with none issues the pre-#351 statement and
+returns its exact bytes.

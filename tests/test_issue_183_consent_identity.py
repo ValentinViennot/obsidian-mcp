@@ -39,7 +39,7 @@ import asyncio
 import html as html_mod
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import FastAPI
@@ -294,7 +294,28 @@ def test_the_client_identifier_and_registration_date_are_rendered():
     text = _text(html)
 
     assert _element(html, "identity-value mono") == "a3f19c7e5b2d4081a3f19c7e5b2d4081"
-    assert "2026-03-14" in text
+    # The date names its zone: this page carries no localisation script.
+    assert "Registered 2026-03-14 UTC" in text
+
+
+def test_the_registration_date_is_the_utc_date_whatever_the_value_zone():
+    """23:30 on the 14th at +05:30 is 18:00 UTC on the 14th; 02:00 on the 15th
+    at +05:30 is 20:30 UTC on the 14th. Both render the UTC date."""
+    ist = timezone(timedelta(hours=5, minutes=30))
+    client = _FakeClient(
+        ["https://example.test/cb"],
+        created_at=datetime(2026, 3, 15, 2, 0, tzinfo=ist),
+    )
+    text = _text(_render("https://example.test/cb", client=client))
+    assert "Registered 2026-03-14 UTC" in text
+    assert "2026-03-15" not in text
+
+
+def test_an_unknown_registration_date_carries_no_zone():
+    client = _FakeClient(["https://example.test/cb"], created_at=None)
+    text = _text(_render("https://example.test/cb", client=client))
+    assert "Registered unknown" in text
+    assert "unknown UTC" not in text
 
 
 def test_userinfo_cannot_disguise_the_destination():

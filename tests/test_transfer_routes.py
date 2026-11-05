@@ -1387,7 +1387,7 @@ def write_bucket(monkeypatch):
     """A narrow write bucket on a clock the test drives.
 
     Narrow because the per-IP `BYTES_LIMIT` on this route is 10/minute while
-    the shipped write burst is 15: a burst driven over HTTP at the configured
+    the shipped write burst is 30: a burst driven over HTTP at the configured
     numbers would be refused by slowapi first and prove nothing about *this*
     control. Two tokens refilling at one a second makes the third redemption
     the interesting one and the refill observable without sleeping.

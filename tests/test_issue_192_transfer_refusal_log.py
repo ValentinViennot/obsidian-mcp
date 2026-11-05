@@ -236,8 +236,13 @@ async def test_a_naive_expires_at_does_not_raise():
 
     A naive/aware compare raises rather than returning a wrong answer, and this
     helper runs on a path whose contract is a fixed 404.
+
+    The naive value is UTC wall-clock time, which is how the code reads a naive
+    timestamp. `datetime.now()` would be the machine's local time: one second
+    ago in UTC+0 (CI), but still in the future anywhere east of UTC.
     """
-    row = _Row(expires_at=datetime.datetime.now() - datetime.timedelta(seconds=1))
+    naive_utc_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    row = _Row(expires_at=naive_utc_now - datetime.timedelta(seconds=1))
     refusal, _ = await _classify(row)
     assert refusal.reason == "expired"
 

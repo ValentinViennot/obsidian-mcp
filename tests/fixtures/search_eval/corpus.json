@@ -1,0 +1,60 @@
+{
+  "1": {
+    "Dev/search_eval.md": {
+      "body": "Notes on the snake_case_name module and issue 356.",
+      "keyword": true,
+      "semantic": true,
+      "title": "search_eval harness"
+    },
+    "Issues/356.md": {
+      "body": "Search eval harness tracking issue.",
+      "keyword": true,
+      "semantic": true,
+      "title": "Issue 356"
+    },
+    "Notes/Receipts.md": {
+      "body": "Scanned receipts for taxes.",
+      "keyword": true,
+      "semantic": true,
+      "title": "Receipts"
+    },
+    "Notes/Taxes.md": {
+      "body": "Receipts and filing for the year.",
+      "keyword": true,
+      "semantic": true,
+      "title": "Taxes 2026"
+    },
+    "Ops/Backups.md": {
+      "body": "Rotate the backup keys every quarter; deploy the new key.",
+      "keyword": true,
+      "semantic": true,
+      "title": "Backup keys"
+    },
+    "Ops/Runbook.md": {
+      "body": "How to deploy the server and roll back a release.",
+      "keyword": true,
+      "semantic": true,
+      "title": "Deploy runbook"
+    },
+    "Weekly.md": {
+      "body": "The weekly review template.",
+      "keyword": true,
+      "semantic": true,
+      "title": "Weekly review"
+    }
+  },
+  "2": {
+    "Journal/Today.md": {
+      "body": "Today: a review of the day.",
+      "keyword": true,
+      "semantic": true,
+      "title": "Journal"
+    },
+    "Weekly.md": {
+      "body": "Weekly review notes for user two.",
+      "keyword": true,
+      "semantic": true,
+      "title": "Weekly"
+    }
+  }
+}

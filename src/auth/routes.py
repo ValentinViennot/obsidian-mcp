@@ -44,7 +44,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth import oidc
+from src.auth import oidc, pocketid
 from src.auth.passwords import (
     MIN_PASSWORD_LENGTH,
     hash_password,
@@ -65,7 +65,7 @@ from src.database import get_session
 from src.limiter import limiter
 from src.models.db import APIKey, NoteMetadata, OAuthClient, OAuthCode, OAuthToken, UsageLog, User
 from src.oauth.grants import USER_BOOTSTRAP_LOCK_KEY
-from src.services import panel_csp, rate_limits, security_events
+from src.services import oidc_links, panel_csp, rate_limits, security_events
 from src.services.vault import validate_vault_root_path, warm_user_vault_cache
 
 router = APIRouter(tags=["auth"], dependencies=[Depends(verify_csrf)])
@@ -186,7 +186,9 @@ def _render_login(
     return templates.TemplateResponse(
         request,
         "login.html",
-        {"error": error, "next": next_url, "username": username, "csrf_token": generate_csrf_token(request)},
+        {"error": error, "next": next_url, "username": username, "csrf_token": generate_csrf_token(request),
+         "oidc_enabled": settings.oidc_enabled, "oidc_display_name": settings.oidc_display_name,
+         "local_login_enabled": settings.local_login_enabled},
         status_code=status_code,
     )
 
@@ -218,9 +220,9 @@ def _render_register(
 
 # --- Federated login (AUTH_MODE=pocketid) ---------------------------------
 
-#: Re-exported from `src/auth/oidc.py` so the two handlers that set and clear
+#: Re-exported from `src/auth/pocketid.py` so the two handlers that set and clear
 #: it, and the tests that read it, name one constant.
-LOGIN_COOKIE = oidc.LOGIN_COOKIE
+LOGIN_COOKIE = pocketid.LOGIN_COOKIE
 
 
 def _federated() -> bool:
@@ -257,13 +259,13 @@ def _require_federated_route() -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
 
-def _oidc_refused(request: Request, reason: str, *, user_id: int | None = None) -> None:
+def _pocketid_refused(request: Request, reason: str, *, user_id: int | None = None) -> None:
     """One `panel_oidc_login_refused`. The rendered page is the same for all.
 
     Subject is the client address, never a resolved row: like every other
     unauthenticated refusal in this server, keying on the account an attacker
     named would hand them one fresh allowance per identity they guess. `reason`
-    is the closed vocabulary `src/auth/oidc.py` raises plus this module's own
+    is the closed vocabulary `src/auth/pocketid.py` raises plus this module's own
     four, and it is the only place the cause exists — the browser sees one
     constant page for every branch, exactly as `login_submit`'s three password
     branches answer with one byte-identical 401.
@@ -324,7 +326,7 @@ def _set_login_cookie(response: Response, sealed: str) -> None:
         httponly=True,
         secure=settings.base_url.startswith("https://"),
         samesite="lax",
-        max_age=oidc.LOGIN_COOKIE_MAX_AGE,
+        max_age=pocketid.LOGIN_COOKIE_MAX_AGE,
         path="/",
     )
 
@@ -340,21 +342,21 @@ async def _redirect_to_provider(request: Request, target: str) -> Response:
     payload to parse.
     """
     try:
-        url, pending = await oidc.authorization_request(target)
-    except oidc.OIDCError as exc:
+        url, pending = await pocketid.authorization_request(target)
+    except pocketid.OIDCError as exc:
         # The provider is unreachable, or its discovery document is unusable.
         # 503 rather than 500: nothing is wrong with the request, and a retry
         # in a minute is the right advice.
-        _oidc_refused(request, exc.reason)
+        _pocketid_refused(request, exc.reason)
         return _render_oidc_error(
             request, status_code=status.HTTP_503_SERVICE_UNAVAILABLE
         )
     response = RedirectResponse(url, status_code=status.HTTP_302_FOUND)
-    _set_login_cookie(response, oidc.seal_pending(pending))
+    _set_login_cookie(response, pocketid.seal_pending(pending))
     return response
 
 
-def _local_username_for(identity: oidc.VerifiedIdentity) -> str | None:
+def _local_username_for(identity: pocketid.VerifiedIdentity) -> str | None:
     """The local `users.username` this provider identity corresponds to.
 
     Used for **two** things and they are not the same weight:
@@ -389,7 +391,7 @@ def _local_username_for(identity: oidc.VerifiedIdentity) -> str | None:
 
 
 async def _resolve_federated_user(
-    session: AsyncSession, identity: oidc.VerifiedIdentity
+    session: AsyncSession, identity: pocketid.VerifiedIdentity
 ) -> tuple[User | None, str]:
     """Find, adopt or create the local account for a verified identity.
 
@@ -484,9 +486,7 @@ async def _resolve_federated_user(
     return created, "created"
 
 
-@router.get("/admin/auth/oidc/callback")
-@limiter.limit("10/minute")
-async def oidc_callback(
+async def pocketid_callback(
     request: Request,
     code: str = Query(""),
     state: str = Query(""),
@@ -520,12 +520,12 @@ async def oidc_callback(
 
     def refuse(reason: str, *, status_code: int = status.HTTP_400_BAD_REQUEST,
                user_id: int | None = None) -> Response:
-        _oidc_refused(request, reason, user_id=user_id)
+        _pocketid_refused(request, reason, user_id=user_id)
         response = _render_oidc_error(request, status_code=status_code)
         _clear_login_cookie(response)
         return response
 
-    pending = oidc.open_pending(request.cookies.get(LOGIN_COOKIE))
+    pending = pocketid.open_pending(request.cookies.get(LOGIN_COOKIE))
     if pending is None:
         # No cookie, a forged one, an expired one, or one carrying the wrong
         # shape. From here they are one event: there is no login in flight.
@@ -544,9 +544,9 @@ async def oidc_callback(
         return refuse("no_code")
 
     try:
-        id_token = await oidc.exchange_code(code, pending.code_verifier)
-        identity = await oidc.verify_id_token(id_token, nonce=pending.nonce)
-    except oidc.OIDCError as exc:
+        id_token = await pocketid.exchange_code(code, pending.code_verifier)
+        identity = await pocketid.verify_id_token(id_token, nonce=pending.nonce)
+    except pocketid.OIDCError as exc:
         # `provider_unreachable` is the one branch that is not the caller's
         # fault, and it is still the same page: distinguishing them for the
         # browser would tell a prober which of their forged tokens got as far
@@ -558,7 +558,7 @@ async def oidc_callback(
         )
         return refuse(exc.reason, status_code=status_code)
 
-    if not oidc.group_allows(identity):
+    if not pocketid.group_allows(identity):
         # Authenticated, not authorized. 403 rather than 400: the request was
         # perfectly well formed and the answer will not change on a retry until
         # an operator changes the provider-side group.
@@ -675,6 +675,8 @@ async def login_submit(
     session: AsyncSession = Depends(get_session),
 ):
     _require_local_password_route()
+    if not settings.local_login_enabled:
+        raise HTTPException(403, "Password sign-in is disabled")
     target = _safe_next(next)
     normalized = (username or "").strip().lower()
 
@@ -837,6 +839,133 @@ async def login_submit(
     return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
 
 
+def _oidc_refused(request: Request, reason: str):
+    # The closed set (#416 D14): anything else is recorded as `provider`
+    # rather than letting an unlisted value reach the log.
+    if reason not in security_events.OIDC_REFUSAL_REASONS:
+        reason = "provider"
+    security_events.emit(
+        "panel_oidc_refused", subject=security_events.subject_for(request=request),
+        reason=reason, client_ip=security_events.client_ip(request), route=request.url.path,
+    )
+    response = _render_login(request, error="Single sign-on could not be completed. Please try again.",
+                             status_code=503 if reason == "capacity" else 401)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if reason == "capacity":
+        response.headers["Retry-After"] = "60"
+    return response
+
+
+@router.get("/admin/auth/oidc/start")
+@limiter.limit("5/minute")
+async def oidc_start(request: Request, next: str = "/admin/"):
+    if not settings.oidc_enabled:
+        raise HTTPException(404)
+    state = None
+    try:
+        target = _safe_next(next) if len(next) <= 4096 else "/admin/"
+        state, tx = oidc.begin(request.session, target)
+        url = await oidc.authorization_url(state, tx)
+    except Exception as exc:
+        if state is not None:
+            oidc._transactions.pop(state, None)
+            request.session.pop(oidc.STATE_KEY, None)
+        reason = exc.reason if isinstance(exc, oidc.LoginRefused) else "provider"
+        return _oidc_refused(request, reason)
+    security_events.emit(
+        "panel_oidc_started", level=logging.INFO,
+        subject=security_events.subject_for(request=request),
+        client_ip=security_events.client_ip(request), route=request.url.path,
+    )
+    return RedirectResponse(url, status_code=302,
+                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
+@router.get(oidc.CALLBACK_PATH)
+@limiter.limit("10/minute")
+async def oidc_callback(request: Request, session: AsyncSession = Depends(get_session)):
+    """The OIDC callback (#416 design D4, task 3.1). In this order:
+
+    1. consume the browser-bound state, then (inside `exchange`) fetch
+       discovery;
+    2. check the RFC 9207 `iss` parameter (`oidc.check_iss_parameter`, which
+       needs discovery to know whether `iss` is mandatory);
+    3. fetch the token and the JWKS and validate the ID token;
+    4. only then touch the database: `resolve` (unlocked), `prepare_login`
+       (account guard, `FOR UPDATE` re-read, the first-login bind and
+       `last_login_at`, no commit), then `start_session`, which commits the
+       bind, the stamp and the session row together — a refused mint rolls
+       all three back;
+    5. warm the vault cache, then the events.
+
+    Every refusal goes through `_oidc_refused`, the one response builder, so
+    the body is identical whatever the reason (D14). The per-account
+    password-failure budget is neither consulted nor charged here (D10).
+    Nothing logs the subject, the issuer claim or an email.
+    """
+    if _federated():
+        return await pocketid_callback(
+            request, code=request.query_params.get("code", ""),
+            state=request.query_params.get("state", ""),
+            error=request.query_params.get("error", ""), session=session,
+        )
+    if not settings.oidc_enabled:
+        raise HTTPException(404)
+    try:
+        params = request.query_params
+        if any(len(params.getlist(k)) > 1 for k in ("state", "code", "error", "iss")):
+            raise oidc.LoginRefused("state")
+        tx = oidc.consume(request.session, params.get("state", ""))
+        if "error" in params:
+            raise oidc.LoginRefused("provider")
+        # get_session has not checked out a connection: all network I/O
+        # precedes DB access. `exchange` checks `iss` after discovery and
+        # before the token request.
+        identity = await oidc.exchange(params.get("code", ""), tx, iss=params.get("iss"))
+    except Exception as exc:
+        reason = exc.reason if isinstance(exc, oidc.LoginRefused) else "provider"
+        return _oidc_refused(request, reason)
+
+    # The database phase: `(iss, sub)` first; email only on the pending branch.
+    resolution = await oidc_links.resolve(
+        session, identity.iss, identity.sub, identity.email, identity.email_verified
+    )
+    prepared = await oidc_links.prepare_login(session, resolution)
+    if not prepared.ok:
+        # `prepare_login` has rolled back: nothing was written.
+        return _oidc_refused(request, prepared.reason)
+    user_id = prepared.user_id
+    # Reuse the one guarded mint. No provider identity or role enters the cookie.
+    if await start_session(
+        request, session, user_id, expected_session_version=prepared.session_version
+    ) is None:
+        # `start_session` rolls back on its refusal paths; this is the route's
+        # own guarantee that a refused mint leaves no binding and no
+        # `last_login_at` (D4 step 4), whatever that helper does.
+        await session.rollback()
+        return _oidc_refused(request, "session_mint")
+    username = (
+        await session.execute(select(User.username).where(User.id == user_id))
+    ).scalar_one_or_none()
+    await warm_user_vault_cache(session, user_id)
+    if prepared.linked:
+        security_events.emit(
+            "panel_oidc_linked", level=logging.INFO,
+            subject=security_events.subject_for(user_id=user_id, request=request),
+            user_id=user_id, username=username,
+            client_ip=security_events.client_ip(request), route=request.url.path,
+        )
+    security_events.emit(
+        "panel_login_succeeded", level=logging.INFO,
+        subject=security_events.subject_for(user_id=user_id, request=request),
+        user_id=user_id, username=username, client_ip=security_events.client_ip(request),
+        route=request.url.path,
+    )
+    return RedirectResponse(_safe_next(tx.next_url), status_code=302,
+                            headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
 @router.post("/admin/auth/logout")
 async def logout(request: Request, session: AsyncSession = Depends(get_session)):
     """Revoke this session server-side, then clear the cookie. Always redirects.
@@ -944,7 +1073,7 @@ async def logout(request: Request, session: AsyncSession = Depends(get_session))
         # `post_logout_redirect_uri` is built on `BASE_URL` rather than on
         # anything from the request, so a `Host` header cannot steer where the
         # provider sends the browser next.
-        provider_logout = await oidc.end_session_url(
+        provider_logout = await pocketid.end_session_url(
             f"{settings.base_url.rstrip('/')}/admin/auth/login"
         )
         if provider_logout is not None:
@@ -961,6 +1090,8 @@ async def register_form(
     session: AsyncSession = Depends(get_session),
 ):
     _require_local_password_route()
+    if settings.oidc_enabled:
+        raise HTTPException(404)
     # Bootstrap is closed once any user exists.
     if not await _users_table_empty(session):
         return RedirectResponse("/admin/auth/login", status_code=status.HTTP_302_FOUND)
@@ -977,6 +1108,8 @@ async def register_submit(
     session: AsyncSession = Depends(get_session),
 ):
     _require_local_password_route()
+    if settings.oidc_enabled:
+        raise HTTPException(404)
     # Early UX-friendly validation (no DB roundtrip).
     normalized = (username or "").strip().lower()
     if not _USERNAME_RE.match(normalized):

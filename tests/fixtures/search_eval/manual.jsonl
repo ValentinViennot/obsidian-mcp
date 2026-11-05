@@ -1,0 +1,2 @@
+{"user_id": 1, "text": "deploy  runbook", "relevant": ["Ops/Backups.md"]}
+{"user_id": 2, "text": "journal today", "relevant": ["Journal/Today.md"], "class": "identifier"}

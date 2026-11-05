@@ -299,7 +299,11 @@ def test_refusal_is_logged_with_an_error_marker(as_unassigned_user):
     # them: a refusal must not become a new disclosure channel.
     assert params["folder"] == "Private"
     assert params["limit"] == 50
-    assert set(params) == {"folder", "limit", "tags", "frontmatter", "error"}
+    assert set(params) == {
+        "folder", "limit", "tags", "frontmatter", "error",
+        # #351: the window parameters are logged like every declared one.
+        "since", "until", "order_by", "cursor",
+    }
 
 
 # --- cache semantics: the refusal must not depend on cache warmth ------------
@@ -1159,6 +1163,8 @@ def test_refused_call_persists_a_usage_log_row(as_unassigned_user):
         "limit": 50,
         "tags": ["salary"],
         "frontmatter": None,
+        # #351: the window parameters are on the allow-list too.
+        "since": None, "until": None, "order_by": None, "cursor": None,
         "error": tools._NO_VAULT_MARKER,
     }
 

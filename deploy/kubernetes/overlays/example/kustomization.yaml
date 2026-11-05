@@ -21,10 +21,11 @@ components:
 
 images:
   - name: obsidian-mcp
-    # Your registry. Build from the repo's Dockerfile and push. Pin by digest
-    # in production (newTag -> digest: sha256:...).
-    newName: registry.example.com/obsidian-mcp
-    newTag: CHANGE-ME
+    # The public release image, or your own build pushed to a registry the
+    # cluster can reach. Pin by digest in production
+    # (newTag -> digest: sha256:...).
+    newName: ghcr.io/maxkuminov/obsidian-mcp
+    newTag: CHANGE-ME   # a release tag, e.g. v0.9.3
 
 patches:
   # Public hostname and trusted proxies. Narrow TRUSTED_PROXY_IPS to your

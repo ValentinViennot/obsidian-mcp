@@ -18,7 +18,16 @@ can read it.
   stamp; reset by one that recorded it, or by a pass that was not a re-derive;
 - `walk_incomplete`: a committed pass that could not list one or more
   directories beneath the root (#309, D4); reset by one that listed them all;
-- `last_success_at` / `last_failure_at` of the index stage.
+- `last_success_at` / `last_failure_at` of the index stage;
+- `rechunk_pending` / `rechunk_observed`: the notes the scope's last embed
+  stage counted as not yet re-chunked (#355), and whether any embed stage of
+  this process has counted them at all. Published only as the process-wide,
+  non-volumetric `rechunk: "in_progress" | "complete"` — never a number, never
+  in `status`. "Not yet observed" is not "zero pending": until every known
+  scope has been counted (and at least one has), the state is `in_progress`,
+  so a fresh process over a pre-034 index does not claim `complete` before
+  its first embed stage. Under `MCP_SANDBOX_MODE` no embed stage ever runs,
+  and the state stays `complete` (nothing this process embeds is pending).
 
 **Process-wide**: consecutive tick-level failures not attributable to a scope
 (user enumeration, root-overlap detection, a tick that raised outside any
@@ -100,6 +109,15 @@ class ScopeHealth:
     last_failure_at: datetime | None = None
     #: Counters whose CRITICAL line has fired this episode.
     alerted: set[str] = field(default_factory=set)
+    #: Notes of this scope not yet re-chunked (#355, D4), as the scope's most
+    #: recent embed stage counted them under the one predicate. In process
+    #: memory only, and **never** exposed: `/health` publishes only whether
+    #: any scope's count is non-zero.
+    rechunk_pending: int = 0
+    #: Whether an embed stage of this process has counted this scope yet.
+    #: Until it has, the scope's state is unknown and `/health` must not
+    #: read `complete` on its account.
+    rechunk_observed: bool = False
 
 
 _scopes: dict[Scope, ScopeHealth] = {}
@@ -194,6 +212,33 @@ def record_walk(scope: Scope, incomplete: bool) -> None:
         _bump(scope, state, _WALK, "walk_incomplete", "walk")
     else:
         _reset(state, _WALK, "walk_incomplete")
+
+
+def record_rechunk(scope: Scope, pending: int) -> None:
+    """The scope's embed stage counted `pending` notes whose
+    `embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION` (#355).
+
+    Not a failure counter: a long re-embed degrades nothing, alerts nothing
+    and never changes `status` or the HTTP code.
+    """
+    state = _scope(scope)
+    state.rechunk_pending = max(0, int(pending))
+    state.rechunk_observed = True
+
+
+def _rechunk_state(states: list[ScopeHealth]) -> str:
+    """`complete` only when at least one scope has been counted and every
+    known scope was counted with zero pending; `in_progress` otherwise,
+    including before the first embed stage after a process start. A
+    disabled indexer (`MCP_SANDBOX_MODE`) never counts, so it reads
+    `complete` rather than `in_progress` forever."""
+    if _disabled:
+        return "complete"
+    if not any(s.rechunk_observed for s in states):
+        return "in_progress"
+    if any(not s.rechunk_observed or s.rechunk_pending > 0 for s in states):
+        return "in_progress"
+    return "complete"
 
 
 def record_enumeration(ok: bool) -> None:
@@ -309,6 +354,11 @@ def snapshot() -> dict:
         "max_consecutive_failures": max_failures,
         "quarantined_notes": quarantined,
         "last_success_at": last_success,
+        # #355, D4: process-wide and **non-volumetric**, because `/health` is
+        # unauthenticated and a count would be tenant-derived (Codex r2 B1).
+        # Exact per-owner counts live on the panel and in the owner-scoped
+        # `index_transition:` line. Never part of `status`.
+        "rechunk": _rechunk_state(states),
     }
 
 

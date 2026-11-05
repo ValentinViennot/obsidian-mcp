@@ -111,6 +111,16 @@ that did not. So the name carries the role:
   — which is exactly what a logout record can honestly say, because the account
   may have been renamed or deleted since sign-in and a logout must not pay for a
   lookup to notice;
+* a **server-derived** name (`cimd_host`, `cimd_ref`, `resource_class`,
+  `resource_host`, #357) holds a value the server computed from a parsed
+  request value. It is neither read from a row nor caller text verbatim, and
+  never a suppression subject. An `https://` client_id is **never** logged in
+  any field, at `/authorize`, `/token` or `/revoke`. `cimd_host` (its ASCII
+  host) and `cimd_ref` (the first 16 hex of SHA-256 over the submitted value,
+  for correlation) stand in for it, and `client_id_submitted` is left empty.
+  `registration_kind` (`dcr` | `cimd`) rides `oauth_client_registered` and
+  `oauth_consent_granted`. There is no separate registration-path event, so
+  each registration and each approval stays exactly one emission;
 * `key_id` names an `api_keys` row and `oauth_token_id` an `oauth_tokens` row.
   The OAuth branches of `auth_failure` used to put the latter in the former,
   which made the two indistinguishable in a query.
@@ -227,24 +237,25 @@ nothing binds the request address into a ContextVar (residual R8).
 | `panel_password_changed` | INFO | `client_ip`, `route`, `user_id`, `username` | `src/control_panel/routes.py` `change_password` (#197), **after** the commit that carries the new hash, the `session_version` bump and the revocation of every session of that user |
 | `panel_password_change_refused` | WARNING | `client_ip`, `reason`, `route`, `user_id` | `src/control_panel/routes.py` `change_password`, every refusal that reaches the handler; `reason` is `wrong_current_password` / `too_short` / `mismatch` / `same_as_current` / `nul_byte` / `account_inactive`. The two credential branches are distinguished here and **not** in the response, which carries one constant message. A request either rate limit rejected never reaches the handler and is recorded by `rate_limit_exceeded` instead |
 | `panel_session_reissue_failed` | ERROR | `client_ip`, `error_type`, `reason`, `route`, `user_id` | `src/control_panel/routes.py` `change_password`, when the mint that follows the committed change raised. The change is not rolled back and the browser is signed out. **No `exc_info` and no `str(exc)`**, for `panel_session_revocation_failed`'s reason: the rendered statement's bound parameters include a stored session hash |
-| `oauth_token_issued` | INFO | `client_id`, `client_ip`, `grant_id`, `reason`, `scope`, `user_id` | `src/oauth/routes.py` `/token`, after the mint's commit |
-| `oauth_token_refreshed` | INFO | `client_id`, `client_ip`, `grant_id`, `scope`, `user_id` | `src/oauth/routes.py` `/token`, after the rotation's commit |
-| `oauth_token_refused` | WARNING | `client_id`, `client_id_submitted`, `client_ip`, `grant_id`, `reason`, `user_id` | every `/token` refusal; `reason` is `<rfc_code>.<sub_reason>`. #325/#326 added `invalid_grant.code_reused` (a revalidated replay of a spent code that revoked nothing live, or one with no lineage), `invalid_grant.client_id_mismatch` on the code exchange (a caller-named client the code was not issued to; revokes nothing), `invalid_grant.spent_code_<check>` — `client_id_mismatch` / `unknown_client` / `authentication_failed` / `redirect_uri_mismatch` / `pkce_verifier_invalid` / `pkce_verification_failed` — for a **spent** code that failed revalidation (the response is the unknown-code 400 byte for byte, so this record is the only place the check is named; revokes nothing) and `invalid_grant.grant_lifetime_exceeded` (a live refresh token at or past its family's absolute deadline; nothing revoked) |
-| `oauth_token_rotation_failed` | ERROR | `client_id`, `client_ip`, `error_type`, `grant_id` | the `except Exception` whose traceback is discarded behind a 500 |
-| `oauth_refresh_reuse_detected` | WARNING | `client_id`, `client_ip`, `grant_id`, `revoked_tokens`, `user_id` | `src/oauth/routes.py` `/token`, when a replayed refresh token killed its whole family (#182) |
-| `oauth_refresh_reuse_revocation_failed` | ERROR | `client_id`, `client_ip`, `error_type`, `grant_id`, `user_id` | the same branch when the revocation write failed. **No `exc_info`**: a SQLAlchemy error renders the failing statement and its bound parameters, one of which is the token hash |
-| `oauth_code_replay_detected` | WARNING | `client_id`, `client_ip`, `grant_id`, `revoked_tokens`, `user_id` | `src/oauth/routes.py` `/token`, when a spent authorization code was presented again **after full revalidation** (client, redirect URI, PKCE) and its replay revoked the live family its first exchange issued (#325, RFC 6749 §4.1.2). Only when live tokens were revoked; a replay against an already-dead family, or against a code with no recorded lineage, records `oauth_token_refused` with `invalid_grant.code_reused`. Never a code, verifier, challenge or hash |
-| `oauth_code_replay_revocation_failed` | ERROR | `client_id`, `client_ip`, `error_type`, `grant_id`, `user_id` | the same branch when the revocation write or a rollback failed; the response is still the constant `invalid_grant` 400. **No `exc_info`**: the failing statement's bound parameters include the code hash |
-| `oauth_consent_granted` | INFO | `client_id`, `client_ip`, `scope`, `user_id` | `/authorize`, after the code row commits |
-| `oauth_consent_denied` | INFO | `client_id`, `client_id_submitted`, `client_ip`, `user_id` | `/authorize` deny |
-| `oauth_authorize_refused` | WARNING | `client_id`, `client_id_submitted`, `client_ip`, `reason`, `user_id` | every `/authorize` refusal |
-| `oauth_cross_user_client_refused` | WARNING | `actor_user_id`, `client_id`, `client_ip`, `route`, `user_id` | `_cross_user_client_error`, the one helper both call sites return |
-| `oauth_client_registered` | INFO | `client_id`, `client_ip`, `client_name_submitted`, `count`, `scope` | DCR, after the commit. **Never** the client secret |
+| `oauth_token_issued` | INFO | `cimd_host`, `cimd_ref`, `client_id`, `client_ip`, `grant_id`, `reason`, `scope`, `user_id`, `resource_class`, `resource_host` | `src/oauth/routes.py` `/token`, after the mint's commit |
+| `oauth_token_refreshed` | INFO | `cimd_host`, `cimd_ref`, `client_id`, `client_ip`, `grant_id`, `scope`, `user_id`, `resource_class`, `resource_host` | `src/oauth/routes.py` `/token`, after the rotation's commit |
+| `oauth_token_refused` | WARNING | `cimd_host`, `cimd_ref`, `client_id`, `client_id_submitted`, `client_ip`, `grant_id`, `reason`, `user_id`, `resource_class`, `resource_host` | every `/token` refusal; #357 added `invalid_client.internal_id_submitted` (a live credential presented with a synthetic `cimd_…` id, decided *after* the credential lookup and the unchanged replay/reuse processing) and `invalid_grant.spent_code_internal_id_submitted`; an `https://` submitted client_id is never logged — `cimd_host` + `cimd_ref` stand in for it; `reason` is `<rfc_code>.<sub_reason>`. #325/#326 added `invalid_grant.code_reused` (a revalidated replay of a spent code that revoked nothing live, or one with no lineage), `invalid_grant.client_id_mismatch` on the code exchange (a caller-named client the code was not issued to; revokes nothing), `invalid_grant.spent_code_<check>` — `client_id_mismatch` / `unknown_client` / `authentication_failed` / `redirect_uri_mismatch` / `pkce_verifier_invalid` / `pkce_verification_failed` — for a **spent** code that failed revalidation (the response is the unknown-code 400 byte for byte, so this record is the only place the check is named; revokes nothing) and `invalid_grant.grant_lifetime_exceeded` (a live refresh token at or past its family's absolute deadline; nothing revoked) |
+| `oauth_token_rotation_failed` | ERROR | `cimd_host`, `cimd_ref`, `client_id`, `client_ip`, `error_type`, `grant_id`, `resource_class`, `resource_host` | the `except Exception` whose traceback is discarded behind a 500 |
+| `oauth_refresh_reuse_detected` | WARNING | `cimd_host`, `cimd_ref`, `client_id`, `client_ip`, `grant_id`, `revoked_tokens`, `user_id`, `resource_class`, `resource_host` | `src/oauth/routes.py` `/token`, when a replayed refresh token killed its whole family (#182) |
+| `oauth_refresh_reuse_revocation_failed` | ERROR | `cimd_host`, `cimd_ref`, `client_id`, `client_ip`, `error_type`, `grant_id`, `user_id`, `resource_class`, `resource_host` | the same branch when the revocation write failed. **No `exc_info`**: a SQLAlchemy error renders the failing statement and its bound parameters, one of which is the token hash |
+| `oauth_code_replay_detected` | WARNING | `cimd_host`, `cimd_ref`, `client_id`, `client_ip`, `grant_id`, `revoked_tokens`, `user_id`, `resource_class`, `resource_host` | `src/oauth/routes.py` `/token`, when a spent authorization code was presented again **after full revalidation** (client, redirect URI, PKCE) and its replay revoked the live family its first exchange issued (#325, RFC 6749 §4.1.2). Only when live tokens were revoked; a replay against an already-dead family, or against a code with no recorded lineage, records `oauth_token_refused` with `invalid_grant.code_reused`. Never a code, verifier, challenge or hash |
+| `oauth_code_replay_revocation_failed` | ERROR | `cimd_host`, `cimd_ref`, `client_id`, `client_ip`, `error_type`, `grant_id`, `user_id`, `resource_class`, `resource_host` | the same branch when the revocation write or a rollback failed; the response is still the constant `invalid_grant` 400. **No `exc_info`**: the failing statement's bound parameters include the code hash |
+| `oauth_consent_granted` | INFO | `cimd_host`, `cimd_ref`, `client_id`, `client_ip`, `outcome`, `registration_kind`, `scope`, `user_id`, `resource_class`, `resource_host` | `/authorize`, after the code row commits. `registration_kind` is `dcr` or `cimd` on every approval (#357); a CIMD approval adds `cimd_host`, `cimd_ref` and `outcome` (`created` / `refreshed` / `unchanged`, the synthetic row's upsert). Exactly one emission per approval — there is no separate registration-path event |
+| `oauth_consent_denied` | INFO | `cimd_host`, `cimd_ref`, `client_id`, `client_id_submitted`, `client_ip`, `user_id`, `resource_class`, `resource_host` | `/authorize` deny |
+| `oauth_authorize_refused` | WARNING | `cimd_host`, `cimd_ref`, `client_id`, `client_id_submitted`, `client_ip`, `reason`, `user_id`, `resource_class`, `resource_host` | every `/authorize` refusal. #357: a CIMD refusal is `client_metadata.<sub>` (`internal_id_submitted`, `url_invalid`, `url_not_canonical`, `fetch_cooldown`, `fetch_budget_exhausted`, `fetch_busy`, `ssrf_refused`, `fetch_failed`, `fetch_timeout`, `http_status`, `too_large`, `content_encoded`, `not_json`, `client_id_mismatch`, `document_invalid`, `redirect_uris_invalid`, `auth_method_unsupported`, `secret_present`, `grant_types_invalid`, `scope_invalid`, `redirect_uri_mismatch`, `metadata_changed`) behind the constant `invalid_client` 400; `client_vanished` is the sweep-won-the-race refusal. Never a resolved address, SSRF error text or document byte |
+| `oauth_cross_user_client_refused` | WARNING | `actor_user_id`, `client_id`, `client_ip`, `route`, `user_id`, `resource_class`, `resource_host` | `_cross_user_client_error`, the one helper both call sites return |
+| `oauth_client_registered` | INFO | `client_id`, `client_ip`, `client_name_submitted`, `count`, `registration_kind`, `scope` | DCR, after the commit; `registration_kind` is always `dcr` (#357). **Never** the client secret |
 | `oauth_client_registration_refused` | WARNING | `client_ip`, `reason` | DCR refusals |
-| `oauth_grant_revoked` | INFO | `actor_user_id`, `client_id`, `client_ip`, `count`, `grant_id`, `route`, `user_id` | each HTTP caller, after **its own** commit — never inside `revoke_grant_family` |
-| `oauth_revoke_noop` | INFO | `client_id_submitted`, `client_ip`, `reason` | RFC 7009 §2.2 — the response says nothing, so the log must |
-| `oauth_revoke_refused` | WARNING | `client_id`, `client_ip`, `reason` | `/revoke` client-auth failure |
-| `rate_limit_exceeded` | WARNING | `client_ip`, `limit_count`, `method`, `route`, `window_seconds` | `src/main.py`, a local wrapper around slowapi's handler — the one hook every 429 passes through |
+| `oauth_grant_revoked` | INFO | `cimd_host`, `cimd_ref`, `actor_user_id`, `client_id`, `client_ip`, `count`, `grant_id`, `route`, `user_id` | each HTTP caller, after **its own** commit — never inside `revoke_grant_family` |
+| `oauth_revoke_noop` | INFO | `cimd_host`, `cimd_ref`, `client_id_submitted`, `client_ip`, `reason` | RFC 7009 §2.2 — the response says nothing, so the log must. `internal_id_submitted` (#357) is a synthetic `cimd_…` id, refused before the token lookup |
+| `oauth_resource_classified` | INFO | `resource_class`, `resource_host`, `route` | `src/oauth/resource.py` (#357): the RFC 8707 classification-only record, emitted **only** on an `/authorize` or `/token` terminal path with no required outcome event — a successful consent render, the multi-user login redirect, an unhandled exception, a framework 422 (`src/main.py`'s route-aware validation handler: `GET /authorize` classified from the query only, `POST /authorize` and `/token` `unclassified_malformed` with no body read). `resource_class` is `absent` / `accepted_1`…`accepted_4` / `unexpected` / `unclassified_rate_limited` / `unclassified_malformed`; `resource_host` only for `unexpected`, a host and never a path or query |
+| `oauth_revoke_refused` | WARNING | `cimd_host`, `cimd_ref`, `client_id`, `client_ip`, `reason` | `/revoke` client-auth failure |
+| `rate_limit_exceeded` | WARNING | `client_ip`, `limit_count`, `method`, `resource_class`, `route`, `window_seconds` | `src/main.py`, a local wrapper around slowapi's handler — the one hook every 429 passes through. On `/token` it also carries `resource_class: unclassified_rate_limited` (#357): the refused request's body is never read |
 | `auth_failure` | WARNING | `client_ip`, `key_id`, `oauth_token_id`, `reason`, `route`, `token_tag` | `src/mcp_server/auth.py`, every 401 site; `reason` includes `grant_lifetime_exceeded` (#326) for an OAuth access token whose grant family is at or past its absolute deadline — distinct from `key_expired`, which is the token's own `expires_at` |
 | `auth_failure_rate_limited` | WARNING | `client_ip`, `limit_count`, `route`, `window_seconds` | `APIKeyMiddleware`, when an address is over its failed-authentication budget (#194). **One per slot per window**, on the first refusal: every later one in the same window is the same fact. No `token_tag` and no `reason` — nothing was looked up and no credential was read |
 | `tool_write_refused` | WARNING | `actor_kind`, `key_id`, `oauth_token_id`, `tool`, `user_id` | `_require_write`, the single definition all nine call sites reach |
@@ -264,6 +275,7 @@ nothing binds the request address into a ContextVar (residual R8).
 | `move_rewrite_failed` | WARNING | `error_type`, `tool` | `move_note`'s link rewrite failing for one source, and the confirmation outage that stops the remaining ones; the move carries on or stops, but the rename stands. The path is named in the tool's reply and in the move's `params`, not in a field |
 | `move_rewrite_overlap_refused` | WARNING | `error_type`, `tool` | `move_note` aborting the **whole** move because one source holds a link nested inside another link to the same note (#211). Distinct from `move_rewrite_failed`: nothing was mutated |
 | `move_post_rename_failed` | WARNING | `error_type`, `reason`, `tool` | the two best-effort failures after the rename has stood; `reason` is `title_read_failed` or `db_update_failed`. Neither fails the call |
+| `change_feed_root_changed` | WARNING | `tool`, `user_id` | a tool's change-feed event dropped under the feed lock because the caller's vault assignment no longer matches the root the tool ran under (#351, D4). Names no path, root or root digest; the tool's result is unchanged |
 | `quota_admission_failed` | ERROR | `day`, `error_type`, `key_id` | `src/services/quotas.py` — re-raised unchanged; a quota that has stopped deciding is an incident |
 | `quota_counter_prune_failed` | WARNING | `error_type` | the same module's housekeeping prune |
 | `publication_refused_confirmation_unavailable` | WARNING | `error_type`, `user_id` | `src/services/vault.py` — the assignment is *unknown*, which is not "changed" |
@@ -282,7 +294,7 @@ nothing binds the request address into a ContextVar (residual R8).
 | `panel_ondemand_index_failed` | ERROR | `error_type`, `user_id` | the panel's on-demand index action |
 | `panel_ondemand_embed_failed` | ERROR | `error_type`, `user_id` | the panel's on-demand embed action |
 | `panel_health_strip_failed` | ERROR | `error_type` | the dashboard health strip's read and rollback failures |
-| `internal_transport_plaintext` | WARNING | `outcome`, `reason` | `src/services/transport_security.py`, from the lifespan, **at most once per hop per process start** (#184, #185). `reason` is the hop — `database` (`check_database_transport`, when `pg_stat_ssl` reports the application's own session unencrypted under `DATABASE_SSL_MODE=prefer` or `disable`) or `embedding` (`log_embedding_transport`, when the active embedding URL is `http` to a non-loopback host). `outcome` is what admitted the plaintext hop: the database mode (`prefer` / `disable`) or `override` for `EMBEDDING_ALLOW_PLAINTEXT`. **No host, port, URL, DSN or path**, and a constant message: the startup INFO lines carry scheme/host/port for the operator; a record in a shared sink carries only the closed vocabulary |
+| `internal_transport_plaintext` | WARNING | `outcome`, `reason` | `src/services/transport_security.py`, from the lifespan, **at most once per hop per process start** (#184, #185). `reason` is the hop — `database` (`check_database_transport`, when `pg_stat_ssl` reports the application's own session unencrypted under `DATABASE_SSL_MODE=prefer` or `disable`) `embedding` (`log_embedding_transport`, when the active embedding URL is `http` to a non-loopback host) or `rerank` (`log_rerank_transport`, when `RERANK_URL` is `http` to a non-loopback host, #367). `outcome` is what admitted the plaintext hop: the database mode (`prefer` / `disable`) or `override` for `EMBEDDING_ALLOW_PLAINTEXT` / `RERANK_ALLOW_PLAINTEXT`. **No host, port, URL, DSN or path**, and a constant message: the startup INFO lines carry scheme/host/port for the operator; a record in a shared sink carries only the closed vocabulary |
 | `events_suppressed` | *the suppressed event's own level* | `count`, `reason`, `window_seconds` | the suppressor itself; `reason` names the suppressed event |
 
 ### What stays on the bare logger, and why
@@ -297,7 +309,8 @@ show.
 
 **One startup record is catalogued anyway: `internal_transport_plaintext`.**
 The rule above keeps *flood* channels bounded, and this record cannot flood —
-it is emitted at most twice per process start, one per hop, so the suppressor
+it is emitted at most three times per process start, one per hop (the third
+is the optional reranker, #367), so the suppressor
 is irrelevant to it. It is catalogued because it is a standing **security
 fact** an operator queries by name ("which hops of which deployment are still
 cleartext"), and a catalogued event is the only log shape with a stable name
@@ -495,3 +508,54 @@ point of logging them at that level.
   up to three per transfer publication, until `mcp-rate-limits`' write bucket
   refuses. They are durability notes on operations that succeeded, and keeping
   them off the destructive publication path is the reason.
+
+## Native OIDC events (#414, #416)
+
+| Event | Level | Fields | Meaning |
+| --- | --- | --- | --- |
+| `panel_oidc_started` | INFO | `client_ip`, `route` | Authlib produced the provider authorization redirect |
+| `panel_oidc_refused` | WARNING | `reason`, `client_ip`, `route` | Closed reasons (#416): `capacity`, `state`, `provider`, `token`, `entitlement`, `unlinked`, `email_unverified`, `link_conflict`, `account`, `session_mint`; never a `user_id` or `username` |
+| `panel_oidc_linked` | INFO | `user_id`, `username`, `client_ip`, `route` | A pending expectation bound at first sign-in, after the commit that also minted the session (#416) |
+| `panel_oidc_link_set` | INFO | `actor_user_id`, `user_id`, `username`, `mode`, `client_ip`, `route` | An admin set an expected email (`mode` `expect`) or bound a subject (`bind`), after the commit (#416) |
+| `panel_oidc_link_removed` | INFO | `actor_user_id`, `user_id`, `username`, `count`, `client_ip`, `route` | An admin unlinked an account, after the commit; `count` is the sessions revoked (#416) |
+
+OIDC successes reuse `panel_login_succeeded` after the existing session mint commits. Refusals use the normal bounded suppressor. No provider subject, group, code, token, state, nonce, verifier or upstream exception text enters these events. Uvicorn's callback access-log query is filtered in `configure_logging`; proxy logs need the corresponding deployment setting before activation. Other Uvicorn logs keep their existing formatting.
+
+**The refusal reasons are a closed set** (`security_events.OIDC_REFUSAL_REASONS`;
+`tests/test_oidc_callback_linking.py` checks that the reasons the code can emit,
+that set and the table row above are the same three things). The first five
+come from `src/auth/oidc.py` before any database access: `capacity` (the
+in-memory login store is full or the process-wide start rate is spent),
+`state` (missing, replayed, expired or foreign-browser state; duplicated query
+parameters), `provider` (discovery, token or JWKS failure, a provider `error`,
+a wrong or missing RFC 9207 `iss`, an endpoint off the issuer's host, an
+unoffered auth method, a compressed or oversized body), `token` (signature,
+algorithm, claims) and `entitlement` (the configured group is absent). The
+rest come from the callback's database phase: `unlinked` (the reason for an
+identity with no linked user: no binding and no live matching expectation),
+`email_unverified` (an expectation
+matched but `email_verified` was not the boolean `true`), `link_conflict`
+(another row took the identity first), `account` (the resolved row is gone or
+inactive) and `session_mint` (`start_session` refused). `_oidc_refused` maps
+any value outside the set to `provider` rather than letting it reach the log.
+
+**No `user_id` or `username` on any refusal, `account` included.** The record
+would confirm that a provider identity resolves to a local user, the one fact
+the uniform refusal page exists to withhold. The refusal is keyed by address,
+like `panel_login_account_throttled`'s subject.
+
+**The three linking events name the account by its row only.**
+`panel_oidc_linked` (a first-login bind) is emitted after the commit that
+minted the session, so it never records a bind that was rolled back with a
+refused mint; it is followed by the ordinary `panel_login_succeeded`.
+`panel_oidc_link_set` (`mode` is the closed `OIDC_LINK_SET_MODES`, `expect` or
+`bind`) and `panel_oidc_link_removed` (`count` = sessions revoked by the
+unlink) are emitted after the admin action's commit, with `actor_user_id` the
+acting admin; a refused admin action (conflict, `bound_already`, the
+last-reachable-admin rule, self-unlink) emits nothing of its own, and an
+actor-revoked refusal records the existing `panel_forbidden` with reason
+`actor_revoked`. **None of
+the OIDC events carries a subject, an issuer (expected or claimed), an email,
+a group, or anything else the provider sent**; nothing logs the issuer at all.
+The `VerifiedIdentity` dataclass has a redacted `repr` so a stray log line
+cannot carry one either.

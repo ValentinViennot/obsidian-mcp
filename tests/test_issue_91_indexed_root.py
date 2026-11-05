@@ -1223,7 +1223,11 @@ async def test_the_pass_scans_the_directory_it_pinned_not_the_one_the_link_now_n
     link.symlink_to(a, target_is_directory=True)
     facts_a = facts_for(link)
 
-    session = FakeSession(provenance=(None, None, None), existing={})
+    # `note_ids` names every upserted row, as the real index does: the task
+    # rebuild (#350) records a changed path with no index row as a skip.
+    session = FakeSession(
+        provenance=(None, None, None), existing={}, note_ids={"OnlyInA.md": 1}
+    )
     install(monkeypatch, session, link)
 
     real_observe = indexer.observe_root_facts
@@ -1459,7 +1463,9 @@ async def test_the_stamp_is_whole_even_when_a_fact_is_unobservable(
     session = FakeSession(
         provenance=(facts.assignment, "00", "1:staleandwrong"),
         existing={},
-        note_ids={},
+        # Names the upserted row, as the real index does (#350's task rebuild
+        # records a changed path with no index row as a skip).
+        note_ids={"Note.md": 1},
     )
     install(monkeypatch, session, vault)
 
@@ -1579,7 +1585,11 @@ async def test_a_row_less_unreadable_file_does_not_withhold_the_stamp(
     file meant a full-scope rewrite every tick for ever.
     """
     vault = make_vault(tmp_path, "vault", {"Gone.md": "x\n", "Kept.md": "y\n"})
-    session = FakeSession(provenance=(None, None, None), existing={}, note_ids={})
+    # `note_ids` names every upserted row, as the real index does: the task
+    # rebuild (#350) records a changed path with no index row as a skip.
+    session = FakeSession(
+        provenance=(None, None, None), existing={}, note_ids={"Kept.md": 1}
+    )
     install(monkeypatch, session, vault)
 
     real = indexer.read_note_at
@@ -1630,7 +1640,11 @@ async def test_a_directory_walk_failure_over_no_row_does_not_withhold(
     row it could leave certified wrongly; #309's `walk_incomplete` still
     reports the directory."""
     vault = make_vault(tmp_path, "vault", {"a.md": "a\n", "sub/b.md": "b\n"})
-    session = FakeSession(provenance=(None, None, None), existing={}, note_ids={})
+    # `note_ids` names every upserted row, as the real index does: the task
+    # rebuild (#350) records a changed path with no index row as a skip.
+    session = FakeSession(
+        provenance=(None, None, None), existing={}, note_ids={"a.md": 1}
+    )
     install(monkeypatch, session, vault)
     os.chmod(vault / "sub", 0)
     try:
@@ -1706,7 +1720,12 @@ async def test_a_changed_path_with_no_index_row_is_recorded_as_a_skip(
 @pytest.mark.asyncio
 async def test_a_pass_with_an_empty_skip_list_stamps(monkeypatch, tmp_path):
     vault = make_vault(tmp_path, "vault", {"a.md": "a\n", "sub/b.md": "b\n"})
-    session = FakeSession(provenance=(None, None, None), existing={}, note_ids={})
+    # `note_ids` names every upserted row, as the real index does: the task
+    # rebuild (#350) records a changed path with no index row as a skip.
+    session = FakeSession(
+        provenance=(None, None, None), existing={},
+        note_ids={"a.md": 1, "sub/b.md": 2},
+    )
     install(monkeypatch, session, vault)
 
     await indexer.index_vault(user_id=7)
@@ -2195,7 +2214,7 @@ async def test_a_row_that_changes_between_verification_and_certification_is_refu
     monkeypatch.setattr(indexer.settings, "embedding_exclude_patterns", [], raising=False)
     monkeypatch.setattr(indexer, "_is_paused", lambda: False)
 
-    async def fake_batch(chunks):
+    async def fake_batch(chunks, **_kw):
         return [[0.0] * 4 for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", fake_batch)
@@ -2293,7 +2312,7 @@ async def test_an_unchanged_row_is_certified_against_what_was_embedded(
     monkeypatch.setattr(indexer.settings, "embedding_exclude_patterns", [], raising=False)
     monkeypatch.setattr(indexer, "_is_paused", lambda: False)
 
-    async def fake_batch(chunks):
+    async def fake_batch(chunks, **_kw):
         return [[0.0] * 4 for _ in chunks]
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", fake_batch)

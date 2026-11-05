@@ -31,6 +31,7 @@ import base64
 import itertools
 import json
 import time
+from urllib.parse import urlencode
 
 import httpx
 import jwt
@@ -39,7 +40,7 @@ import respx
 from cryptography.hazmat.primitives.asymmetric import rsa
 from starlette.requests import Request
 
-from src.auth import oidc
+from src.auth import pocketid as oidc
 from src.auth import routes as auth_routes
 from src.config import settings
 from src.limiter import limiter
@@ -367,10 +368,9 @@ async def _run_callback(session, *, state, cookie, code="an-auth-code", error=""
     request = _make_request(
         "/admin/auth/oidc/callback",
         cookies={oidc.LOGIN_COOKIE: cookie} if cookie else None,
+        query=urlencode({"code": code, "state": state, "error": error}),
     )
-    return request, await auth_routes.oidc_callback(
-        request=request, code=code, state=state, error=error, session=session
-    )
+    return request, await auth_routes.oidc_callback(request=request, session=session)
 
 
 # ── The authorization request ───────────────────────────────────────────────
@@ -1229,7 +1229,7 @@ def test_an_expired_seal_is_refused(monkeypatch):
 
 
 def test_a_seal_missing_a_field_is_refused():
-    from src.auth.oidc import _login_serializer
+    from src.auth.pocketid import _login_serializer
 
     assert oidc.open_pending(_login_serializer().dumps({"state": "s"})) is None
     assert oidc.open_pending(None) is None

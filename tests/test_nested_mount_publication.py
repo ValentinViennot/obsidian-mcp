@@ -66,10 +66,9 @@ def test_the_statx_struct_matches_the_kernels():
 
 def test_statx_is_reached_through_the_glibc_wrapper_unlike_openat2():
     """D24's raw-syscall reasoning is about `openat2` and does not carry over:
-    glibc exports `statx` and exports no `openat2` at any version."""
+    glibc exports `statx`, while `openat2` is reached by raw syscall whether or
+    not this glibc exports a wrapper (a newer one does)."""
     assert vault_fs._statx_fn() is not None
-    with pytest.raises(AttributeError):
-        ctypes.CDLL(None).openat2
 
 
 def test_two_real_mounts_are_told_apart():

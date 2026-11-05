@@ -122,6 +122,8 @@ EXPECTED_KEYS = {
     "max_consecutive_failures",
     "quarantined_notes",
     "last_success_at",
+    # #355: process-wide and non-volumetric, "in_progress" | "complete".
+    "rechunk",
 }
 
 
@@ -488,3 +490,48 @@ def test_sandbox_lifespan_marks_the_indexer_disabled(monkeypatch):
     snap = asyncio.run(_run())
     assert snap["status"] == "disabled"
     assert _health()[1]["status"] == "ok"
+
+
+def test_rechunk_is_a_non_volumetric_state_that_never_degrades(threshold):
+    """#355 (D4): a long, healthy transition leaves `/health` ok; the field
+    is a string, never the count, and names no scope."""
+    indexer_health.record_index(None, True)
+    for remaining in (40, 30, 20, 10, 5, 4, 3, 2, 1, 1):
+        indexer_health.record_embed(None, 0)
+        indexer_health.record_rechunk(None, remaining)
+        indexer_health.record_rechunk(7, 1234)
+        code, body, _ = _health()
+        assert code == 200 and body["status"] == "ok"
+        assert body["indexer"]["rechunk"] == "in_progress"
+        assert "1234" not in str(body) and str(remaining * 1000) not in str(body)
+    indexer_health.record_rechunk(None, 0)
+    indexer_health.record_rechunk(7, 0)
+    _code, body, _ = _health()
+    assert body["indexer"]["rechunk"] == "complete"
+
+
+def test_rechunk_is_in_progress_until_the_first_embed_stage_reports():
+    """#355 follow-up: "not yet observed" is not "zero pending". Production
+    read `complete` over 4,206 pre-034 notes before the first embed stage."""
+    assert indexer_health.snapshot()["rechunk"] == "in_progress"
+    indexer_health.record_rechunk(None, 0)
+    assert indexer_health.snapshot()["rechunk"] == "complete"
+    indexer_health.record_rechunk(None, 5)
+    assert indexer_health.snapshot()["rechunk"] == "in_progress"
+    _code, body, _ = _health()
+    assert body["indexer"]["rechunk"] == "in_progress" and "5" not in json.dumps(
+        body["indexer"]["rechunk"]
+    )
+
+
+def test_rechunk_waits_for_every_known_scope():
+    indexer_health.record_rechunk(1, 0)
+    indexer_health.record_index(2, True)  # known, never counted
+    assert indexer_health.snapshot()["rechunk"] == "in_progress"
+    indexer_health.record_rechunk(2, 0)
+    assert indexer_health.snapshot()["rechunk"] == "complete"
+
+
+def test_rechunk_reads_complete_when_indexing_is_disabled():
+    indexer_health.mark_disabled()
+    assert indexer_health.snapshot()["rechunk"] == "complete"

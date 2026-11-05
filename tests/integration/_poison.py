@@ -12,6 +12,8 @@ failure is planted with triggers driven by a rules table:
 - `tsvector` — BEFORE UPDATE that changes `content_tsvector` of the path (the
   incremental pass's keyword vector and the full rebuild alike);
 - `link`     — BEFORE INSERT on `note_links` whose source note has the path;
+- `task`     — BEFORE INSERT on `note_tasks` whose note has the path (#350:
+  a task-derivation failure, which is isolated and never quarantined);
 - `batch`    — a statement-level failure (22000) of any multi-row INSERT on
   `notes_metadata`, which no single row reproduces (the path is ignored).
 
@@ -105,6 +107,26 @@ _INSTALL = [
     "CREATE TRIGGER poison_batch AFTER INSERT ON notes_metadata "
     "REFERENCING NEW TABLE AS inserted "
     "FOR EACH STATEMENT EXECUTE FUNCTION poison_batch()",
+    """
+    CREATE OR REPLACE FUNCTION poison_tasks() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    DECLARE code text; k integer;
+    BEGIN
+      SELECT r.errcode, r.shots INTO code, k
+        FROM poison_rules r JOIN notes_metadata n ON n.file_path = r.path
+       WHERE r.site = 'task' AND n.id = NEW.note_id
+       LIMIT 1;
+      code := poison_fire(code, k);
+      IF code IS NOT NULL THEN
+        RAISE EXCEPTION 'synthetic task failure for a test'
+          USING ERRCODE = code;
+      END IF;
+      RETURN NEW;
+    END $$
+    """,
+    "DROP TRIGGER IF EXISTS poison_tasks ON note_tasks",
+    "CREATE TRIGGER poison_tasks BEFORE INSERT ON note_tasks "
+    "FOR EACH ROW EXECUTE FUNCTION poison_tasks()",
     "DELETE FROM poison_rules",
 ]
 
@@ -112,6 +134,8 @@ _UNINSTALL = [
     "DROP TRIGGER IF EXISTS poison_notes ON notes_metadata",
     "DROP TRIGGER IF EXISTS poison_links ON note_links",
     "DROP TRIGGER IF EXISTS poison_batch ON notes_metadata",
+    "DROP TRIGGER IF EXISTS poison_tasks ON note_tasks",
+    "DROP FUNCTION IF EXISTS poison_tasks()",
     "DROP FUNCTION IF EXISTS poison_batch()",
     "DROP FUNCTION IF EXISTS poison_notes()",
     "DROP FUNCTION IF EXISTS poison_links()",

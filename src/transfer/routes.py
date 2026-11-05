@@ -61,7 +61,7 @@ from src.config import MAX_NOTE_BYTES, settings
 from src.database import async_session
 from src.limiter import limiter
 from src.models.db import UsageLog
-from src.services import rate_limits, refusals, security_events, transfer, vault_fs
+from src.services import change_feed, rate_limits, refusals, security_events, transfer, vault_fs
 from src.services.vault import classify_bytes, is_hidden_path
 
 logger = logging.getLogger(__name__)
@@ -639,8 +639,12 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         # token; and before `check_publication_support`, because that is a
         # filesystem probe and a rate control that admits work has to precede
         # the work — the same order `_tracked` uses.
+        # The principal that minted this capability answers for its bytes
+        # twice: here, in the write bucket, and in the change feed (#351, owner
+        # decision 4) — one rule, not two.
+        minter = transfer.minting_principal(row, minting_credential)
         admitted, retry_after = rate_limits.take(
-            transfer.minting_principal(row, minting_credential),
+            minter,
             refusals.SCOPE_PRINCIPAL_WRITE,
         )
         if not admitted:
@@ -946,6 +950,28 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
 
     # Reaching here means the gate recorded `result` and its transaction
     # committed: `stream_to_vault` raises `PostPublishFailure` otherwise.
+    #
+    # The change-feed event (#351, D3), after the publication and in its own
+    # short session, attributed to the minting principal and the actor the
+    # token row carries — never `current_*`, which this public route does not
+    # set. Swallows every failure: the next pass records the change unattributed.
+    if change_feed.is_note_path(row.path):
+        h = result.get("note_hash")
+        await change_feed.record_tool_events(
+            [change_feed.Event(
+                "modified" if row.expected_fingerprint is not None else "created",
+                path=row.path, content_hash=h,
+                reason=None if h is not None else change_feed.REASON_NOT_INDEXABLE,
+            )],
+            root=row.vault_root,
+            session_factory=async_session,
+            user_id=row.user_id,
+            attribution=change_feed.Attribution.of(
+                tool=change_feed.TRANSFER_UPLOAD_TOOL,
+                actor={"actor_kind": row.actor_kind, "actor_label": row.actor_label},
+                principal=minter,
+            ),
+        )
     return JSONResponse(
         {
             "path": row.path,

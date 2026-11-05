@@ -292,7 +292,7 @@ async def test_an_unlistable_directory_keeps_its_tasks(sessionmaker, vault):
         assert await tasks_of(sessionmaker, "sub/a.md") == ["protected"]
 
 
-async def test_the_v3_to_v4_backfill_stamps_4_and_re_embeds_nothing(
+async def test_the_v3_backfill_stamps_current_version_and_re_embeds_nothing(
     sessionmaker, vault, monkeypatch
 ):
     write(vault, "old.md", "body\n- [ ] backfilled\n[[x]]\n")
@@ -308,13 +308,13 @@ async def test_the_v3_to_v4_backfill_stamps_4_and_re_embeds_nothing(
     assert "not yet scanned for tasks: 1 notes" in await tools.list_tasks_impl()
 
     async def unexpected(_chunks, **_kw):
-        pytest.fail("the version-4 bump must not call the embedding provider")
+        pytest.fail("the extraction bump must not call the embedding provider")
 
     monkeypatch.setattr(embeddings_service, "get_embeddings_batch", unexpected)
     await indexer.index_vault()
     await indexer.embed_vault()
     after = await note(sessionmaker, "old.md")
-    assert after.extraction_version == 4
+    assert after.extraction_version == indexer.CURRENT_EXTRACTION_VERSION == 5
     assert after.embedded_content_hash == before.embedded_content_hash == after.content_hash
     assert await tasks_of(sessionmaker, "old.md") == ["backfilled"]
     assert "not yet scanned for tasks: 0 notes" in await tools.list_tasks_impl()

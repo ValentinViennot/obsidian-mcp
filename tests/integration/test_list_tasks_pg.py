@@ -4,7 +4,7 @@ What needs the database: the resume predicate with `'infinity'::date` on both
 sides, the owner-scoped join, the header counts in one snapshot, the compact
 cursor's path-hash resolution in SQL (`sha256(convert_to(...))` agreeing with
 Python's), and that no `notes_metadata.id` reaches a cursor or a line. Rows are
-seeded directly (stamped at extraction version 4) so each scenario controls
+seeded directly (stamped at the current extraction version) so each scenario controls
 exactly what is indexed; the not-yet-scanned count is driven by a real pass.
 
 The tool body is called through `__wrapped__`: the property under test is the
@@ -82,7 +82,7 @@ class Seeder:
     def __init__(self, sessionmaker):
         self.sessionmaker = sessionmaker
 
-    async def note(self, path, tasks, *, uid=None, failed=False, truncated=False, version=4):
+    async def note(self, path, tasks, *, uid=None, failed=False, truncated=False, version=indexer.CURRENT_EXTRACTION_VERSION):
         """`tasks`: list of dicts (line, status_char, state, text, due, …)."""
         async with self.sessionmaker() as session:
             note_id = (await session.execute(text(

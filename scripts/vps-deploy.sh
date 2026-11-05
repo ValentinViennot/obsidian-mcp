@@ -23,12 +23,9 @@
 #
 # WHAT A ROLLBACK HERE IS AND IS NOT
 #
-# Rolling back restores the IMAGE. It does not undo a migration: `alembic
-# downgrade` is not safe to run unattended, and the daily restic snapshot is
-# the real way back from a bad one. So a release whose migration is not
-# backward-compatible will fail health, roll the image back, and STILL be
-# broken — that case wants a human and the runbook, which is why the failure
-# path says so out loud.
+# Rolling back restores only the IMAGE. Releases with pending migrations are
+# refused before the application changes: they require a planned manual rollout
+# with the old writer stopped, a full backup and a schema-aware recovery plan.
 #
 # The pin this script writes also lives outside the Komodo clone, so the next
 # Komodo DeployStack drops it and the stack returns to the floating `latest`
@@ -220,19 +217,18 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Migrate with the new image, before the new image serves traffic
+# Refuse migrations: this legacy path cannot quiesce the old writer safely.
 # ---------------------------------------------------------------------------
-#
-# Same order as `make deploy`, for the same reason: migrations are written to
-# be backward-compatible, so the old container keeps serving correctly against
-# the new schema for the few seconds between here and the recreate. The reverse
-# order would put new code in front of an old schema, which is the window
-# nobody tests.
+# Probe the candidate without its startup migration hook. Keep the persisted
+# pin on the running image if the probe fails or a migration is pending.
 write_pin "$NEW_REF"
-note "running alembic upgrade head with the new image"
-if ! compose run --rm -T "$SERVICE" alembic upgrade head; then
+if ! migration_state="$(compose run --rm --no-deps -T -e RUN_MIGRATIONS=false "$SERVICE" python scripts/migration_status.py)"; then
   write_pin "$PREVIOUS_REF"
-  die "migration failed. The stack is untouched and still on $PREVIOUS_REF."
+  die "cannot establish migration status; application unchanged. Use a planned manual rollout."
+fi
+if [ "$migration_state" != current ]; then
+  write_pin "$PREVIOUS_REF"
+  die "migration pending or unknown: this legacy deploy refuses to migrate while the old application serves traffic. Take a full backup and use a planned rollout that stops the old application before upgrading."
 fi
 
 # ---------------------------------------------------------------------------
@@ -315,12 +311,9 @@ if wait_for_health "$ROLLBACK_HEALTH_TIMEOUT_SECONDS" "$BASELINE_RESTARTS"; then
   cat >&2 <<EOF
 vps-deploy: rolled back to $PREVIOUS_REF and the service is healthy again.
 
-  Two things are NOT undone and need a person:
-    * The migration that ran before the failed release is still applied. If it
-      was not backward-compatible, this rollback did not fix anything.
-    * The digest pin lives outside the Komodo clone, so the next DeployStack
-      returns the stack to the floating 'latest' tag — which is the image that
-      just failed. Fix forward, or pin $PREVIOUS_REF in the GitOps repo.
+  No database migration was run by this script. The digest pin lives outside
+  the Komodo clone, so the next DeployStack returns to that clone's image.
+  Fix forward, or pin $PREVIOUS_REF in the GitOps repo before redeploying.
 EOF
   exit 1
 fi

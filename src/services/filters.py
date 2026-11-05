@@ -19,6 +19,15 @@ def _escape_like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def folder_prefix_clause(folder: str):
+    """The `folder` predicate: a prefix match on `notes_metadata.file_path`,
+    with the LIKE wildcards (`%`, `_`, `\\`) escaped. Shared by
+    `apply_note_filters` and `list_tasks` (#350), so both read a folder the
+    same way."""
+    escaped = _escape_like(folder)
+    return NoteMetadata.file_path.like(f"{escaped}%", escape="\\")
+
+
 def apply_note_filters(
     stmt: Select,
     *,
@@ -55,8 +64,7 @@ def apply_note_filters(
     # an unfiltered query through this helper, so a zero-row approximate scan
     # is always ambiguous and always re-runs exact (see `semantic_search`).
     if folder:
-        escaped = _escape_like(folder)
-        stmt = stmt.where(NoteMetadata.file_path.like(f"{escaped}%", escape="\\"))
+        stmt = stmt.where(folder_prefix_clause(folder))
     if tags:
         stmt = stmt.where(NoteMetadata.tags.contains(tags))
     if frontmatter:

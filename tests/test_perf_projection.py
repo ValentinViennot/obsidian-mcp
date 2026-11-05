@@ -42,6 +42,8 @@ FORBIDDEN = {
     ("notes_metadata", "content_tsvector"),
     ("notes_metadata", "frontmatter"),
     ("note_embeddings", "embedding"),
+    # #355 (D6): the prefix is embedded input, never rendered.
+    ("note_embeddings", "embed_prefix"),
 }
 
 
@@ -61,6 +63,9 @@ class _Result:
     def scalar_one_or_none(self):
         return self._rows[0] if self._rows else None
 
+    def scalar(self):
+        # The transition count (#355): an empty batch is zero.
+        return self._rows[0] if self._rows else 0
 
 class _RecordingSession:
     """Serves one batch per non-`SET LOCAL` statement and records each one."""
@@ -70,7 +75,7 @@ class _RecordingSession:
         self.statements: list = []
 
     async def execute(self, clause, *_a, **_k):
-        if str(clause).lstrip().upper().startswith("SET LOCAL"):
+        if str(clause).lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")):
             return _Result()
         self.statements.append(clause)
         return _Result(self._batches.pop(0) if self._batches else [])
@@ -92,7 +97,7 @@ def _quiet_usage(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _fake_embedding(monkeypatch):
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
@@ -155,6 +160,23 @@ def test_content_tsvector_is_deferred_with_raiseload():
     assert dict(prop.strategy_key).get("raiseload") is True
 
 
+def test_body_excerpt_is_deferred_with_raiseload():
+    """#344 (V-N1): the stored excerpt is read only inside `ts_headline`
+    server-side; an entity reader must fail loudly, never lazy-load it."""
+    prop = inspect(NoteMetadata).attrs.body_excerpt
+    assert prop.deferred is True
+    assert dict(prop.strategy_key).get("raiseload") is True
+
+
+def test_touching_body_excerpt_on_a_loaded_entity_raises():
+    note = NoteMetadata(id=1, file_path="a.md", title="a", content_hash="h")
+    make_transient_to_detached(note)
+    session = Session()
+    session.add(note)
+    with pytest.raises(InvalidRequestError, match="raiseload"):
+        _ = note.body_excerpt
+
+
 def test_frontmatter_stays_eager():
     """D5 assessed `frontmatter` and left it alone: deferring it would turn any
     future entity reader on a write path into a runtime error."""
@@ -176,6 +198,7 @@ def test_a_whole_entity_select_no_longer_carries_content_tsvector():
 
     sql = str(select(NoteMetadata).compile(dialect=postgresql.dialect()))
     assert "content_tsvector" not in sql
+    assert "body_excerpt" not in sql
     assert "frontmatter" in sql  # still eager
 
 
@@ -197,7 +220,8 @@ async def test_semantic_search_projects_the_find_related_shape():
     await semantic_search(session, "q", limit=5)
     (stmt,) = session.statements
     _assert_projected(stmt, [
-        "note_id", "chunk_index", "chunk_text", "file_path", "title", "tags",
+        "note_id", "chunk_index", "chunk_text", "heading_path", "section_ordinal",
+        "file_path", "title", "tags",
         "content_hash", "embedded_content_hash", "chunks_truncated", "distance",
     ])
 
@@ -225,14 +249,24 @@ async def test_semantic_search_breaks_exact_distance_ties_deterministically():
 
 
 @pytest.mark.asyncio
-async def test_keyword_search_projects_four_columns():
-    row = SimpleNamespace(file_path="a.md", title="a", tags=["t"], rank=0.5)
+async def test_keyword_search_projects_five_columns():
+    """The conjunctive statement projects `id` (for the page-bounded snippet
+    statement, #344) beside the four rendered columns, and still nothing it
+    does not render: no tsvector, no excerpt, no frontmatter."""
+    row = SimpleNamespace(id=7, file_path="a.md", title="a", tags=["t"], rank=0.5)
     session = _RecordingSession([[row]])
     results = await full_text_search(session, "needle")
-    (stmt,) = session.statements
-    _assert_projected(stmt, ["file_path", "title", "tags", "rank"])
-    assert results == [{"path": "a.md", "title": "a", "tags": ["t"], "rank": 0.5}]
+    stmt = session.statements[0]
+    _assert_projected(stmt, ["id", "file_path", "title", "tags", "rank"])
+    assert [(r["path"], r["title"], r["tags"], r["rank"], r["match"]) for r in results] == [
+        ("a.md", "a", ["t"], 0.5, "all")
+    ]
     assert _order_by_sql(stmt) == "rank DESC, notes_metadata.file_path ASC"
+    # No statement of the call projects the excerpt or the vector as a column.
+    for later in session.statements[1:]:
+        if isinstance(later, Select):
+            for col in _output_columns(later):
+                assert col not in FORBIDDEN | {("notes_metadata", "body_excerpt")}, col
 
 
 _T = datetime.datetime(2026, 9, 1, 12, 30, tzinfo=datetime.timezone.utc)
@@ -275,7 +309,7 @@ async def test_get_recent_projects_and_renders_unchanged(monkeypatch):
     )
     assert out == (
         "Last 2 modified notes:\n\n"
-        "- `a.md` — A [x, y] (modified 2026-09-01 12:30)\n"
+        "- `a.md` — A [x, y] (modified 2026-09-01 12:30 UTC)\n"
         "- `b.md` — B (modified unknown)"
     )
 

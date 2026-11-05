@@ -169,6 +169,16 @@ def utc_day(now: _dt.datetime | None = None) -> _dt.date:
     return moment.astimezone(_dt.timezone.utc).date()
 
 
+def utc_day_start(now: _dt.datetime | None = None) -> _dt.datetime:
+    """Midnight UTC opening the day `utc_day(now)` names, as an aware instant.
+
+    For a reader that counts "today" the way the quota does: the dashboard's
+    "Requests Today" binds this rather than `date_trunc('day', now())`, which
+    truncates in the session's zone.
+    """
+    return _dt.datetime.combine(utc_day(now), _dt.time.min, tzinfo=_dt.timezone.utc)
+
+
 def as_utc(moment: _dt.datetime) -> _dt.datetime:
     """One clock reading, normalised to UTC. Naive input is assumed UTC.
 

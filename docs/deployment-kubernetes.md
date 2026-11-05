@@ -34,6 +34,7 @@ deploy/kubernetes/
     secret.example.yaml         the Secret's shape. NOT applied, placeholders only
     pvc-vault.yaml              the vault volume
     vault-init-job.example.yaml one-shot ownership fix for a NEW empty vault volume
+    rebuild-tsvectors-job.example.yaml  one-off keyword-index rebuild (FTS_CONFIGS change; once after migration 031)
     deployment.yaml             1 replica, Recreate, migration initContainer, probes
     service.yaml                ClusterIP :8000
     networkpolicy.yaml          default deny + the app's allow-list
@@ -57,16 +58,18 @@ in an overlay copied from `overlays/example/`.
   CRI-O (`RuntimeDefault`, which the manifests request) allow it. **Kernel
   5.8** is also needed for the file-transfer tools. Below it the server starts,
   and uploads and imports refuse.
-- **A container image you can pull.** The project publishes no public image.
-  Build one from the repository's `Dockerfile` and push it to a registry your
-  cluster can reach:
+- **A container image you can pull.** Prebuilt images are public at
+  `ghcr.io/maxkuminov/obsidian-mcp`: `:v<release>` per release tag (the image
+  CI built and scanned for that commit, retagged, never rebuilt), `:main` for
+  the tip. Point `images:` in your overlay at a release tag and pin by digest
+  in production (`docker buildx imagetools inspect ghcr.io/maxkuminov/obsidian-mcp:v<release>`
+  prints it). To run your own build instead, build from the repository's
+  `Dockerfile` and push it to a registry your cluster can reach:
 
   ```bash
   docker build -t registry.example.com/obsidian-mcp:$(git rev-parse --short HEAD) .
   docker push registry.example.com/obsidian-mcp:$(git rev-parse --short HEAD)
   ```
-
-  Then set `images:` in your overlay. Pin by digest in production.
 - **PostgreSQL 16 with pgvector 0.8.0 or newer.** Use your own database, or the
   optional [`postgres/`](#database) component. On an older pgvector the server
   exits, because filtered semantic search would silently lose results.
@@ -199,6 +202,13 @@ both loaded with `envFrom`. Anything unset takes the default below. Invalid
 values refuse startup with a message naming the setting. The server does not
 silently fall back.
 
+The `migrate` initContainer and the example Jobs load the same two objects and
+validate the same settings. Keep it that way. A credential added to the app
+container alone, for example `OIDC_CLIENT_SECRET` through `env`/`secretKeyRef`
+when you turn on [native OIDC](native-oidc.md), passes the app's checks but
+makes the initContainer refuse to start. Under `Recreate` that is an outage,
+not a stalled rollout.
+
 List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 `OAUTH_KNOWN_REDIRECT_HOSTS` accept CSV or a JSON list. `ALLOWED_ORIGINS`,
 `ALLOWED_HOSTS` and `EMBEDDING_EXCLUDE_PATTERNS` accept **JSON lists only**
@@ -249,6 +259,10 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `OLLAMA_EMBED_BATCH_SIZE` | `16` | Chunks per `/api/embed` request (1 to 256). |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Acknowledge a plaintext `http://` embedding URL to a non-loopback host. |
 | `EMBEDDING_CA_FILE` | unset | PEM CA for an `https` embedding endpoint behind a private CA. Replaces the default bundle. |
+| `RERANK_URL` | unset | Optional Jina-compatible `/v1/rerank` endpoint (e.g. `llama-server --reranking`) for `rerank=true`. Receives query and note text. Same `https`/loopback rule; an unreachable reranker never blocks startup. See DEPLOYMENT.md, "Reranker (optional)". |
+| `RERANK_MODEL` | unset | Sent as `model` in the rerank request. |
+| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100 to 10000); past it the page falls back unreranked. |
+| `RERANK_ALLOW_PLAINTEXT` | `false` | Acknowledge a plaintext `http://` reranker URL to a non-loopback host (separate from the embedding flag). |
 | `EMBEDDING_EXCLUDE_PATTERNS` | `["*.excalidraw.md","Excalidraw/*"]` | fnmatch globs that are keyword-indexed but not embedded (JSON list). |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `512` / `0` | Chunking (tokens). Overlap must be below size. A change needs a reset. |
 
@@ -262,6 +276,9 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `INDEXER_DEGRADED_AFTER_FAILURES` | `3` | Consecutive failed index, embedding or re-derive passes before `/health` reports `degraded`. |
 | `INDEXER_QUARANTINE_RETRIES_PER_TICK` | `5` | Re-runs per user per pass while isolating notes whose database writes fail on their own data. |
 | `FTS_CONFIGS` | `english` | Postgres text-search configs for keyword search. A change needs `rebuild-tsvectors`. |
+| `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weights `{D, C, B, A}`; title and aliases are indexed at `A`, the body at `D`. Four finite numbers, each in [1e-6, 1]. |
+| `KEYWORD_EXCERPT_CHARS` | `20000` | Characters of each note's indexed text stored for snippets (1000–100000). |
+| `KEYWORD_SNIPPET_ROWS` | `20` | Rows per `keyword_search` page that get a snippet (0–100; 0 disables). |
 | `EMBED_CHUNK_BUDGET_PER_USER` | `5000` | Chunks embedded per user per pass (multi-user fairness). |
 | `EMBED_TIME_BUDGET_SECONDS_PER_USER` | `300` | Seconds of embedding per user per pass. |
 | `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS` | `10` | How long the overlap check waits on one vault root before quarantining that account (multi-user). |
@@ -290,8 +307,8 @@ them.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MCP_RATE_LIMIT_PER_MINUTE` / `MCP_RATE_LIMIT_BURST` | `120` / `30` | General per-principal bucket. |
-| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` / `MCP_WRITE_RATE_LIMIT_BURST` | `60` / `15` | Write bucket (the vault-mutating tools and uploads). |
+| `MCP_RATE_LIMIT_PER_MINUTE` / `MCP_RATE_LIMIT_BURST` | `600` / `120` | General per-principal bucket. |
+| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` / `MCP_WRITE_RATE_LIMIT_BURST` | `120` / `30` | Write bucket (the vault-mutating tools and uploads). |
 | `MCP_AUTH_FAILURE_LIMIT` / `MCP_AUTH_FAILURE_WINDOW_SECONDS` | `60` / `300` | Failed `/mcp` authentications per client address per window. |
 | `MCP_AUTH_FAILURE_TABLE_SIZE` | `4096` | Slots in that address table. |
 | `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals with their own bucket before overflow sharing. |
@@ -668,6 +685,33 @@ The procedure:
    `kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic check` should print
    "No new upgrade operations detected."
 
+**Upgrading to the reranker release (#367)** there is no migration and no
+operator step: `semantic_search` and `hybrid_search` gain an optional
+`rerank` argument whose `false` default leaves their output unchanged, and
+four optional settings (`RERANK_*`, unset by default) enable it. The class
+mapping is unchanged, so readiness evidence carries over. `/health` gains a
+`rerank` field (`absent` until `RERANK_URL` is set; never a non-200).
+Rolling the image back is a plain redeploy; a client still sending `rerank`
+is then refused by the unknown-argument rule.
+
+**Upgrading to `hybrid_search` (#354)** there is no migration and no
+operator step: a new tool, one optional setting (`HYBRID_RRF_K`, default 60,
+1–1000, set in the ConfigMap if at all), and `CLASS_MAPPING_VERSION` 5, which
+starts a new readiness epoch for `make concurrency-report` (`hybrid_search`
+shares the `embedding` class with `semantic_search`). Rolling the image back
+is a plain redeploy: the tool disappears and its usage rows stay.
+
+**Across migration 032 (task listing, #350)** there is no operator step.
+The first pass after the rollout re-derives every note once at extraction
+version 4 and stores its checkbox tasks; nothing is re-embedded. Until it
+finishes, `list_tasks` counts the notes not yet scanned in its header and
+`move_note(rewrite_links=True)` returns `index_not_ready`. `list_tasks` joins
+the `scan` concurrency class (`CLASS_MAPPING_VERSION` 3), which starts a new
+readiness epoch for `make concurrency-report`. Rolling the image back is not a
+clean rollback: the previous image re-extracts every note and clears every
+embedding certification, then re-chunks every note with full vector reuse and
+no provider calls; treat rollback as roll-forward.
+
 If a migration fails, the pod stays in `Init:Error` and the old version is
 already stopped. Either fix forward, or restore the backup and roll the image
 back. Alembic downgrades are not a supported rollback path.
@@ -712,7 +756,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: task
-          image: registry.example.com/obsidian-mcp:<same tag as the Deployment>
+          image: ghcr.io/maxkuminov/obsidian-mcp:<same tag as the Deployment>
           command: ["python", "-m", "scripts.rebuild_tsvectors"]   # or scripts.reset_embeddings
           envFrom:
             - configMapRef: { name: obsidian-mcp-config }
@@ -732,6 +776,18 @@ spec:
 ```
 
 4. When it has completed, `kubectl -n obsidian-mcp scale deploy/obsidian-mcp --replicas=1`.
+
+The rebuild Job above is checked in as
+`deploy/kubernetes/base/rebuild-tsvectors-job.example.yaml` (set the image
+to the Deployment's tag and add your extra mounts), so the whole step is one
+`kubectl apply -f` between the two `scale` commands. **Run it once after
+upgrading across migration 031 (#344):** 031 re-heads every keyword vector in
+the migrate initContainer, so ranking is right at once, but the excerpt
+`keyword_search`'s snippets come from is stored only when a vector is written
+— until the Job has run, notes indexed before 031 show `head:` or no snippet,
+and startup logs how many. There is no old-image overlap to worry about here:
+`strategy: Recreate` ends the old pod before the new pod's `migrate`
+initContainer runs.
 
 Both tasks take the index generation lock. With the app scaled down nothing
 else holds it. If you run one with the app up (possible only for
@@ -753,13 +809,31 @@ Two things hold state: the **vault** and the **database**.
   clients and grants, users, usage history and quotas. A dump contains every
   note's text and every credential hash, so treat it as sensitive.
 
+  This fork defaults to a full dump, preserving both current index data and
+  historical embeddings. Only an explicit `BACKUP_FULL=0` omits rows from
+  `notes_metadata`, `note_embeddings`, `note_links`, `note_tasks`, `indexer_runs`
+  and `indexer_state`; their schema remains. Ordinary startup rebuilds current
+  data only. Historical embeddings then require a separate history backfill.
+  Credentials, users, usage, quotas and change-feed data are always dumped.
+
 [`components/db-backup`](../deploy/kubernetes/components/db-backup/) is a
 nightly CronJob that follows `make db-backup`'s contract. It writes a
 `pg_dump` under `umask 077`, gzips and verifies it, prunes past 30 days while
 keeping the newest 7, and records the dump in `backups_log`. A dump is
 accepted only if the archive verifies *and* the SQL ends with pg_dump's
 end-of-dump trailer, because an empty or truncated dump still gzips to a valid
-file. That table is
+file. **If your CronJob lives elsewhere** (an infra repository, a CNPG
+`ScheduledBackup` plus your own `pg_dump`), mirror the flags:
+
+```
+pg_dump --no-owner \
+  --exclude-table-data=notes_metadata --exclude-table-data=note_embeddings \
+  --exclude-table-data=note_links --exclude-table-data=note_tasks \
+  --exclude-table-data=indexer_runs --exclude-table-data=indexer_state \
+  --dbname="$url"
+```
+
+and drop the six flags for the weekly full dump. That table is
 where the panel's Health page reads the last backup's age, so a dump taken by
 any other means leaves the page warning. The backup volume is mounted only by
 the backup Job, never by the app container. The Job uses only
@@ -826,8 +900,31 @@ unverified archive.
    ```
 
 6. Scale the app back to 1. Its migration initContainer brings an older dump
-   up to the image's schema. Resume the CronJob. Drop
-   `obsidian_mcp_before_restore` once the restored deployment checks out.
+   up to the image's schema; `alembic check` from the app pod must then print
+   "No new upgrade operations detected." (it does for a schema-only dump too).
+   Resume the CronJob. Drop `obsidian_mcp_before_restore` once the restored
+   deployment checks out.
+7. **If the dump was taken with `BACKUP_FULL=0`, the index is empty and the
+   indexer rebuilds it; there is nothing to run by hand.** An empty index over
+   a non-empty vault is the ordinary first-start case, not the refused one
+   (the "empty root over an existing index" guard is the inverse: a vault that
+   vanished under a populated index). The startup pass is a full-hash pass
+   over every note — metadata, keyword vectors, links — and the embed pass in
+   the same tick sends every chunk to the embedding provider. Both take time
+   proportional to vault size: the scan is minutes for a few thousand notes,
+   the embed stage is chunks × provider latency. With more than one active
+   user the embed stage is budgeted per user per pass
+   (`EMBED_CHUNK_BUDGET_PER_USER`, `EMBED_TIME_BUDGET_SECONDS_PER_USER`), so
+   a large multi-user rebuild spans several `INDEX_INTERVAL_SECONDS` ticks.
+   `indexer_state` is empty too, so startup *adopts* the current embedding and
+   keyword configuration instead of refusing; the reset-embeddings workflow is
+   only needed if you also changed `EMBEDDING_DIMENSIONS` or the model.
+   Meanwhile `/health` reports the indexer (`status: "degraded"` only if a
+   pass actually fails) and the panel dashboard shows the pending count;
+   semantic search returns partial results until the embed pass finishes,
+   keyword search is complete after the first pass. Then trigger the backup
+   Job once (`kubectl create job --from=cronjob/obsidian-mcp-db-backup …`) so
+   `backups_log` has a post-restore row.
 
 ## Troubleshooting
 
@@ -838,6 +935,7 @@ unverified archive.
 | Startup, readiness or liveness probe fails with **400** | The probe lost its `Host: localhost` header, or `ALLOWED_HOSTS` was set explicitly without `localhost` (it is always added, so check the override). |
 | Every request through the ingress gets **400** | The ingress rewrites `Host`. It must reach the app as `MCP_HOSTNAME`. |
 | Container exits at start with a `critical` log line | Each startup check names itself: `openat2` unavailable (kernel or seccomp), pgvector < 0.8.0, `EMBEDDING_DIMENSIONS` or model disagreeing with the stored vectors, a placeholder `SECRET_KEY`, a plaintext embedding URL without `EMBEDDING_ALLOW_PLAINTEXT`, a TLS key in `DATABASE_URL`. |
+| `migrate` initContainer exits 1 with `OIDC requires OIDC_CLIENT_ID and OIDC_CLIENT_SECRET` (or another settings `ValidationError`) | The initContainer does not get the same environment as the app. Add the missing variable to the Secret every container loads, or add the same `secretKeyRef` to the initContainer. To restore service at once, set `OIDC_ENABLED=false`. |
 | `migrate` initContainer fails with `permission denied to create extension "vector"` | Create the extension once as a superuser in the app database. |
 | Container exits at start: `Database role … is a PostgreSQL superuser. Refusing to start` | The role in `DATABASE_URL` is a superuser. Point it at a non-superuser role that owns the app database (the bundled Postgres and CloudNativePG both create one). `DATABASE_ALLOW_SUPERUSER=true` turns the refusal into a warning, as a stop-gap only. |
 | Container exits at start: `DATABASE_URL carries a placeholder password (changeme / CHANGE_ME)` | The Secret still carries a shipped placeholder. Generate one (`openssl rand -hex 32`), set it on the database role, and put it in `DATABASE_URL`. |

@@ -483,6 +483,28 @@ def test_soft_delete_moves_the_file_into_trash(root_fd, vault):
     assert (vault / dest).read_bytes() == b"bytes"
 
 
+def test_soft_delete_stamps_the_trash_name_in_utc(root_fd, vault, monkeypatch):
+    """`delete_file` relies on this default stamp, while `delete_note` passes a
+    UTC one; on a host whose local zone is not UTC the two used to be named
+    hours apart (#339). The fake clock answers a naive local-time call with a
+    wall clock five hours off, so only a UTC stamp passes."""
+    from datetime import datetime as real_datetime, timedelta, timezone
+
+    instant = real_datetime(2026, 10, 23, 23, 30, 5, tzinfo=timezone.utc)
+
+    class FakeDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return (instant - timedelta(hours=5)).replace(tzinfo=None)
+            return instant.astimezone(tz)
+
+    monkeypatch.setattr(vault_fs, "datetime", FakeDatetime)
+    (vault / "Attachments" / "b.txt").write_bytes(b"bytes")
+    dest = soft_delete(root_fd, "Attachments/b.txt")
+    assert dest.split("/", 1)[1].startswith("20261023-233005-b.txt-")
+
+
 def test_soft_delete_suffixes_colliding_basenames(root_fd, vault):
     (vault / "one").mkdir()
     (vault / "two").mkdir()

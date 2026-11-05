@@ -6,7 +6,9 @@
 > and temporal `026` remain unchanged. Incoming upstream `025`–`030` are fork
 > `031`–`036`, respectively. The upstream rationale below retains its historical
 > revision references; use the [compatibility map](upstream-sync-20261015.md)
-> when locating current migration files. The single current Alembic head is `036`.
+> when locating current migration files. The November synchronization appends upstream `031`–`037` as fork `037`–`043`.
+> The single current Alembic head is `043`; deployed fork revisions stay unchanged.
+> Native OIDC uses `native_oidc_subject` to preserve legacy PocketID subjects.
 
 ## Schema drift is not only what `alembic check` sees
 
@@ -663,6 +665,132 @@ and `RESET`. The gate's head literal is `030`; its cases cover the fresh
 shape, the chain from 029, no backfill, stamp-back with a recorded marker
 kept, four impostor-column refusals, and both downgrade directions.
 
+## 031: `notes_metadata.body_excerpt`, and the in-SQL re-head (#344)
+
+031 is a column **and** a data step, and the data step is the point.
+
+- **The column**: `body_excerpt text NULL`, no default, 031's comment marker
+  declared in the ORM, deferred with raiseload like `content_tsvector`. The
+  first `KEYWORD_EXCERPT_CHARS` characters of exactly the text a row's keyword
+  vector was built from, written in the same UPDATE as the vector by the
+  incremental pass and the rebuild, preserved by both move paths. **No
+  backfill**: nothing in the database holds the body (`chunk_text` is
+  embed-time, masked, capped and stale under #200), so the excerpt arrives
+  with each note's next write or with one `make rebuild-tsvectors`, and
+  startup logs how many rows still lack one. Reconcile-or-refuse on a re-run
+  (030's shape); a column of another shape is text of unknown origin that
+  `keyword_search` would present as the note's own.
+- **The re-head, with no file access.** Every pre-031 vector is entirely
+  weight `D` (`to_tsvector` emits no other weight), so `head(title, aliases)
+  || ts_filter(content_tsvector, '{d}')` over stored columns equals a fresh
+  build byte for byte on the first application — measured on PostgreSQL 16 —
+  and ranking is right at deploy with no operator step. Three rules make it
+  safe:
+  - **the generation lock first**, under a 10 s `lock_timeout`: with `make
+    deploy` stopping the app before a pending migration and k8s
+    `Recreate`-ing, a holder is a pass someone left running against the
+    deploy order, and the migration fails naming it rather than waiting;
+  - **the stored fingerprint's configs**, not the environment's: the body
+    lexemes were built under those, and a head under another stemmer is the
+    mixed-configuration vector the startup guard exists to refuse. Absent →
+    the environment's (what adoption would bless); unreadable → refuse by
+    name, as the guard does;
+  - **skip a row that already carries a weight-`A` lexeme.** `ts_filter`
+    keeps the body's absolute positions as the previous concatenation
+    assigned them, so a second application shifts them by the previous head's
+    length (`'beta':1A 'bodi':3 'text':4` against a fresh `bodi:2 text:3`);
+    the predicate makes the stamp-back re-run byte-idempotent. Matching,
+    phrases and `ts_rank_cd` are invariant under the shift, which is why the
+    move paths (which do re-head repeatedly) are specified on those and not
+    on bytes.
+
+  **031 imports the live builders** (`fts.rehead_tsvector_sql`,
+  `fts.aliases_text`) rather than freezing a copy, so a later builder change
+  changes what 031 does on a fresh database. That is intended: the
+  migration and the writers must build the same bytes (the builders sort
+  the configs for the same reason — the fingerprint stores them sorted).
+
+  Each UPDATE runs in a savepoint; SQLSTATE 54000 leaves that row unchanged
+  and logged by id (its next edit or the rebuild writes it through the
+  halving retreat); any other error fails the migration whole.
+- **`downgrade()` restores the old semantics, not only the schema** (Codex
+  r1 #4): under the lock it sets every vector to `ts_filter(content_tsvector,
+  '{d}')` — no `A` lexeme survives, so the previous image sees no title-only
+  matches and its later D-only writes do not mix with headed rows — and only
+  then drops a marked column.
+- **The deploy order is part of the migration.** An old-image process
+  serving between 031's commit and its own replacement could `move_note` a
+  note 031 had just re-headed: it rewrites `title` and `file_path` but keeps
+  the headed vector, and the new image then serves the old stem at weight
+  `A` for ever (neither the unchanged-hash scan nor 031's skip predicate
+  revisits it). So `make deploy` stops the app before `alembic upgrade head`
+  whenever `alembic current` differs from `alembic heads`, `DEPLOYMENT.md`
+  says stop → migrate → start for a hand-driven stack, and k8s already has
+  no overlap (`Recreate` + the migrate initContainer).
+
+The gate's head literal is `031`; its cases cover the fresh shape and the
+byte-exact re-head, the chain from 030, the stamp-back byte-idempotence, the
+stored-fingerprint configs versus the environment and the absent case, five
+unreadable fingerprints refused, a synthetic 54000 row left behind, four
+impostor-column refusals, the downgrade stripping every head and keeping
+every body lexeme, and the foreign-column downgrade. `alembic check` is clean
+after each.
+
+## 032: `note_tasks` and `tasks_truncated` (#350)
+
+032 creates one derived table and two per-note bits, and writes no row.
+
+- **`note_tasks`**: one row per checkbox list item, keyed by `note_id`
+  (`notes_metadata.id`, `ON DELETE CASCADE`) with **no path and no owner** —
+  both come from the join, so no move writer has a second column to keep in
+  step and no task can be listed under another tenant. `UNIQUE (note_id, line)`
+  (one checkbox per line; it also catches a double insert), CHECKs on `state`
+  (`open`/`done`/`cancelled`) and `priority`, `ix_note_tasks_note` and
+  `ix_note_tasks_state_due`, `tags varchar(128)[]` with `tags_cut`, the table
+  comment marker `task rows derived per note (032_note_tasks)`.
+- **`notes_metadata.tasks_truncated`** and **`tasks_failed`**, both `BOOLEAN
+  NOT NULL DEFAULT false` (metadata-only ADD), each with its own marker:
+  the per-note cap bit (`links_truncated`'s lifecycle) and the isolated
+  task-derivation failure bit (never a quarantine).
+- **No backfill in SQL**: the rows need the bodies. Extraction version 4 makes
+  the first pass after deploy re-derive every note once, without re-embedding.
+- **Reconcile or refuse**, 028's shape for the table (columns, PK, defaults,
+  CHECKs, UNIQUE, FK, index set, marker — complete, not minimal) and 022's for
+  the columns, every pre-existing unit verified before anything is created;
+  `downgrade()` drops only marked units. The schema gate covers fresh upgrade,
+  stamp-back re-run, the cascade, and an impostor of each unit. `alembic check`
+  sees the table, the columns and their comments through the ORM mirror
+  (`NoteTask`, `_NOTE_TASKS_TABLE_MARKER`, `_TASKS_TRUNCATED_COLUMN_MARKER`,
+  `_TASKS_FAILED_COLUMN_MARKER`); it does not compare CHECK predicates, which
+  the gate asserts through the catalogue.
+- `note_tasks` is **derived** for backups (#348): schema-only in `make
+  db-backup` and the Kubernetes backup Job.
+- `change-feed` (#351) owns 033.
+
+## The session TimeZone is UTC
+
+Every DateTime column is `timestamptz` and the application reasons in UTC
+(the quota's accounting day, the usage chart, the dashboard's "Requests
+Today"). SQL `date_trunc` on a `timestamptz`, `now()::date` and
+`timestamptz`-to-text casts follow the **session's** `TimeZone`, which
+defaults to the server's — UTC in the `pgvector/pgvector` image, the host's
+zone on a typical distro-installed Postgres. So both engines (`src/database.py`
+and `alembic/env.py`) send `timezone: UTC` in asyncpg's `server_settings`,
+from one constant in `src/services/db_session.py`. Before this, on a non-UTC
+server the usage chart's day buckets began at the server's local midnight but
+were labelled with the UTC date (a day early east of UTC) and "Requests Today"
+counted from local midnight while the per-key quota counted from UTC midnight.
+
+The pin is a backstop. The queries whose answer depends on a zone also say
+UTC on their own — `date_trunc(field, ts, 'UTC')` in `chart_series` (the
+three-argument form needs PostgreSQL 12; the floor is 16) and a
+Python-computed UTC midnight (`quotas.utc_day_start`) bound into "Requests
+Today" — so they stay right on a connection that did not come through either
+engine (a test fixture, `psql`). `tests/integration/test_utc_time_pg.py` runs
+them on sessions set to `Asia/Kolkata` and `America/Los_Angeles`. New SQL time
+arithmetic should do the same: bind a UTC instant computed in Python, or name
+the zone.
+
 ## Database transport (#184)
 
 Before this change the engine passed no `ssl` argument and `DATABASE_URL`
@@ -912,3 +1040,284 @@ Encryption at rest for the dumps is not implemented; if it is added, keep a
 restore-tested copy with separately managed keys before switching it on, or
 the backup stops being a backup.
 
+### Derived vs durable tables (#348)
+
+Twenty-one tables, two kinds. **Six are a cache of the vault plus
+settings** and are dumped schema-only by `make db-backup` and the Kubernetes
+backup Job (`pg_dump --exclude-table-data=<table>` for each; `BACKUP_FULL=1`
+dumps their rows too):
+
+| Table | Rebuilt by |
+| --- | --- |
+| `notes_metadata` | the index pass (full-hash at startup; keyword vectors included) |
+| `note_links` | the index pass per note, and the one-shot backfill when empty |
+| `note_tasks` | the index pass per note, beside the link rebuild (#350); restored empty together with `notes_metadata`, so the first pass rebuilds both |
+| `note_embeddings` | the embed pass, which embeds every note without a current vector |
+| `indexer_runs` | nothing — display history the panel lists, read for no decision |
+| `indexer_state` | startup *adopts* the current fingerprints when absent; the rotation cursor restarts at the first tenant |
+
+The schema (DDL, the `halfvec` expression index, `alembic_version`) is still
+in the dump, so a restore followed by `alembic check` is clean, and an empty
+index over a non-empty vault is the ordinary first-start case — the #309
+guard refuses the *inverse* (an empty root over a populated index). The
+other **fifteen are durable and are why backups and alembic cannot go away**:
+`users` (including the index-provenance columns, which survive a restore and
+let the first pass classify the root), `api_keys`, `oauth_clients`,
+`oauth_codes`, `oauth_tokens`, `transfer_tokens`, `user_sessions`,
+`usage_logs`, `quota_counters`, `backups_log` (the panel's backup-age
+source), `concurrency_counters` and `concurrency_runs` (the #188 readiness
+evidence `make concurrency-report` reads, together with `usage_logs` — it
+never reads `indexer_runs`, which is why the pass history can be derived), and
+the change feed's `note_events`, `note_event_scopes` and `note_event_gaps`
+(#351: history, sequence counters and retention watermarks are not in the
+vault, and a cursor survives a restore only if events and counters return
+together). `tests/test_backup_derived_tables.py` pins both lists against
+`src/models/db.py`; a new table fails it until classified. The restore
+runbook is in `DEPLOYMENT.md` (compose) and `docs/deployment-kubernetes.md`.
+
+## 033: `content_changed_at` and the change-feed tables (#351)
+
+033 adds `notes_metadata.content_changed_at` (nullable, backfilled with
+`COALESCE(modified_at, indexed_at)`, then `NOT NULL DEFAULT now()`, marked)
+and three marked tables: `note_events` (bigserial surrogate `id`, plain
+`user_id`, per-scope `seq` with `UNIQUE (user_id, seq) NULLS NOT DISTINCT`,
+the kind/source/reason/path/principal CHECKs), `note_event_scopes`
+(`user_id` unique `NULLS NOT DISTINCT`, `last_seq`, the retention watermark
+`pruned_through_seq` / `pruned_at`) and `note_event_gaps`.
+
+**No foreign key on any of them.** An FK from an event to `users` would take
+`FOR KEY SHARE` on the `users` row *after* the index pass holds
+`notes_metadata` row locks, while a permanent user deletion takes the `users`
+row first and then cascades into those rows — the cycle the indexer already
+documents (`ProvenanceLockUnavailable`). And an event must outlive its
+`notes_metadata` row. Cleanup is explicit: `delete_user` purges the scope
+under the feed lock taken last, and retention removes rows of user ids that
+no longer exist. Alembic compares neither CHECK predicates, `NULLS NOT
+DISTINCT` nor the absence of an FK, so the schema gate asserts all three
+through `pg_constraint`.
+
+The re-run reconciles rather than adopts: a pre-existing table is compared
+with a TEMP twin built from the very DDL the revision would run (columns,
+every constraint definition, index columns, the marker), and anything else is
+refused by name before anything is created; `downgrade()` drops only marked
+units. The three tables are **durable** for backups (above): history,
+sequence counters and watermarks cannot be rebuilt from the vault, and a
+cursor stays valid across a restore only if events and counters come back
+together (L8: a restore rolls `last_seq` back, so a later cursor is refused
+and the agent restarts from a date).
+
+## 034: the chunk locator, the prefix and the chunking version (#355)
+
+034 adds five nullable, marked columns with no default, **no backfill** and no
+index: `note_embeddings.heading_path text[]` (`{}` for section 0),
+`section_ordinal integer` (integer, because a 10 MiB note can hold more than
+32,767 headings) and `embed_prefix text` (≤ 300 characters, app-enforced), and
+`notes_metadata.embedded_chunking_version smallint` and
+`embedded_input_digest varchar(64)`. NULL is the truthful pre-034 value
+everywhere: a legacy chunk with no section, a note certified under the old
+chunker. The embed backlog re-selects such notes per note (see
+indexing-and-embeddings.md, "Heading-aware chunks"); the stored embedding
+fingerprint is untouched, so nothing refuses at startup.
+
+Two CHECKs, added `NOT VALID` then `VALIDATE`d so the scan of
+`note_embeddings` holds only `SHARE UPDATE EXCLUSIVE`:
+`ck_note_embeddings_heading_meta` (the three row columns all NULL, or all set
+with `section_ordinal >= 0` and `(section_ordinal = 0) = (cardinality(
+heading_path) = 0)`) and `ck_notes_metadata_embedded_chunking_version` (NULL
+or `>= 1`). Both are resolved through `pg_constraint` by definition, measured
+off a TEMP twin, and carry constraint markers (not compared by `alembic
+check`); the schema gate asserts them.
+
+**Reconcile or refuse.** On a re-run a same-named column must have the exact
+type, be nullable, carry no default and 034's marker, and a CHECK of 034's
+name must have 034's definition, be validated and be marked; anything else is
+refused by name before anything changes. `search_path` is pinned and
+asserted; `lock_timeout` / `statement_timeout` are set and `RESET`. Only table
+ownership is needed (`test_nonsuperuser_migrations_pg.py`).
+
+**The downgrade deletes and un-certifies.** In one transaction holding the
+generation lock (`pg_advisory_xact_lock(8029183045093649969)`, written
+literally): `embedded_content_hash = NULL` for every note holding a row with a
+non-NULL `embed_prefix`, delete those rows, then drop only the marked
+constraints and columns. The 033 build reuses a vector on exact `chunk_text`
+alone, so a vector of a prefixed input left behind would be reused as the bare
+chunk's. Those notes are absent from semantic search until the old build
+re-embeds them (L7). Both tables stay **derived** for backups (#348).
+
+## 035: tags in the keyword vector (#391)
+
+035 adds, alters and drops **no schema object**; `alembic check` stays clean.
+It is a data step on 031's model, in one transaction: `lock_timeout 10s`,
+`statement_timeout 15min`, `search_path` pinned and the qualified table
+asserted (all `RESET`), the generation lock (`pg_advisory_xact_lock(
+8029183045093649969)`, literal, pinned by `tests/test_migration_035_literals.py`)
+before the first row is read, and the configs from the stored
+`fts_fingerprint` (present → its `configs`; absent → the environment's;
+unreadable → refuse naming the key, nothing changed).
+
+**The rewrite.** Per row with a vector, in id order, `content_tsvector =
+head(title, aliases, tags) || ts_filter(content_tsvector, '{d}')` through the
+shared `rehead_tsvector_sql`, from the stored `title`, `aliases_text(
+frontmatter)` and `tags_text(tags)` — no file access. Two predicates in the
+UPDATE's own `WHERE`: `length(ts_filter(content_tsvector, '{b}')) = 0` (a row
+already carrying a tags part is skipped — `rehead` is not
+position-idempotent, so this is what makes a stamp-back re-run byte-equal)
+and `length(<tags part>) > 0` (a row whose tags produce no lexeme is already
+what the new builder writes, since an empty `B` part shifts nothing). 035
+composes no `to_tsvector(` itself: `fts.tags_tsvector_sql` gives the
+predicate's tags part. A D-only row (031 left it at the size limit) is
+re-headed byte-exactly; a headed tagged row keeps body positions shifted by
+the old head's length (#391 L1).
+
+**The size preflight, then all-or-nothing.** Before the first UPDATE, a
+read-only estimate per row the rewrite would change: `S(ts_filter(v, '{d}'))
++ S(head(title, aliases, tags))`, with `S(v)` = Σ over `unnest(v)` of the
+lexeme's bytes rounded up to even plus `2 + 2 × npos` when it has positions
+(`size_sql` in the migration). Measured on the gate: for a concatenation
+that crosses the limit, `S` equalled the size PostgreSQL reported (1,049,880
+both); the design measured four under on another case. `S` is within four
+bytes of PostgreSQL's count — not a strict upper bound — and the 64-byte
+margin absorbs that. Any estimate above 1,048,511 (the 1,048,575 limit less 64) aborts
+naming the count and every id, before anything is written. The rewrite has no
+savepoints: any row error, 54000 included, fails the migration naming the
+row id and SQLSTATE (never the path, the bound parameters or text — the
+driver error is not chained), with nothing committed. The operator's
+read-only pre-merge statement in `DEPLOYMENT.md` sums `S(a) + S(d) + S(b)`
+over the stored parts separately (never `S` of the merged vector, where a
+lexeme shared by title and body is stored once), strips U+0002/U+0003 from
+the tags as `tags_text` does, and additionally flags every candidate with no
+`A` lexeme (`d_only`), since such a row gains its whole head in 035. The gate
+runs that statement verbatim and asserts that every id 035's preflight
+rejects (a D-only row, a shared-lexeme row, a sentinel-tag row, Codex's position-saturation row) is flagged. The tags part is bounded per tag — each tag's full form and its `/`-expanded form parsed as separate documents — and the multi-config form combines the per-config parses with `UNION ALL` (a deduplicating `UNION` under-counts; an `english,simple` case pins it).
+
+**Downgrade** takes the generation lock and sets `ts_filter(content_tsvector,
+'{a,d}')` on every row carrying a `B` lexeme; a lexeme in both the tags and
+the body keeps its body positions.
+
+**Cost.** Measured on the gate container (PostgreSQL 16, local): 4,265
+synthetic rows of 1,800 words and three tags each — preflight ≈ 10 s,
+rewrite ≈ 27 s, the alembic run 28–41 s. Every rewritten row is a new tuple
+version (027's vacuum thresholds). Only table ownership is needed
+(`test_nonsuperuser_migrations_pg.py`).
+
+## 036: `oauth_clients.client_id_metadata_url` (#357)
+
+One nullable `VARCHAR(2048)` and one CHECK, `ck_oauth_clients_cimd_shape`.
+The URL is present exactly when `client_id LIKE 'cimd\_%'`, and such a row is
+`token_endpoint_auth_method = 'none'` with no secret hash. There is no backfill:
+every existing row is a DCR registration and already satisfies it.
+`client_id` is **not** widened. The synthetic id is `cimd_` + 59 hex of an
+HMAC, so `oauth_codes.client_id`, `oauth_tokens.client_id` and both
+`actor_ref` columns keep `VARCHAR(64)`.
+
+**Re-runnable by reconciliation**, 025's rule. The column carries a comment
+marker mirrored in `src/models/db.py`
+(`_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER`), so `alembic check` compares it. A
+re-run adopts the column only when its type, nullability, default and marker
+are its own. It adopts the CHECK only when `pg_get_constraintdef` equals what
+PostgreSQL prints for 036's own definition, which it reads from a `NOT VALID`
+probe created and dropped in the same transaction. Otherwise it refuses and
+names the difference.
+
+**The downgrade refuses while any CIMD row exists**, naming the count. Dropping
+the column would leave rows no URL can reach, and deleting them would cascade
+their grants. Delete those clients in the panel first.
+`tests/integration/test_oauth_cimd_migration_pg.py` pins the refusal and the
+CHECK.
+
+## 037: OIDC account links on `users` (#416)
+
+Six nullable columns on `users`, in two triples, and five named constraints.
+No new table, no foreign key, no backfill.
+
+| column | type | meaning |
+| --- | --- | --- |
+| `oidc_issuer` | `VARCHAR(2048)` | issuer the subject is bound under (exact `iss`) |
+| `oidc_subject` | `VARCHAR(255)` | the bound `sub` |
+| `oidc_linked_at` | `TIMESTAMPTZ` | when the binding was made |
+| `oidc_expected_issuer` | `VARCHAR(2048)` | issuer a pending expectation was set under |
+| `oidc_expected_email` | `VARCHAR(254)` | the normalized expected email |
+| `oidc_expected_set_at` | `TIMESTAMPTZ` | when the admin set it (drives the 7-day expiry) |
+
+- `uq_users_oidc_identity UNIQUE (oidc_issuer, oidc_subject)` — one identity,
+  at most one user. NULLs are distinct, so unlinked rows never collide.
+- `uq_users_oidc_expected UNIQUE (oidc_expected_issuer, oidc_expected_email)`
+  — two users cannot wait for one address, so a match is never ambiguous.
+- `ck_users_oidc_bound_complete` / `ck_users_oidc_expected_complete` — each
+  triple is all NULL or all set.
+- `ck_users_oidc_not_both` — a row is never bound and pending at once.
+
+All five are declared on the ORM model, so `alembic check` stays clean. The
+email is stored already normalized, which is why a plain UNIQUE suffices: a
+`lower()` expression index would not autogenerate cleanly. The btree row
+bound (2,048 + 255 plus overhead) is under PostgreSQL's 2,704-byte index row
+limit; `OIDC_ISSUER` is validated to ≤ 2,048 characters and `sub` to ≤ 255.
+
+**Columns, not a `user_oidc_identities` table, because a table needs an FK to
+`users`**, and an FK to `users` is what reopened the permanent-deletion
+deadlock for the change-feed tables (033). On the row, deleting a user removes
+its link with no purge step, and the user-row lock every admin action already
+takes covers the link. #415 kept its mapping in the environment, so there was
+nothing to migrate: every existing row reads NULL in all six, meaning "not
+linked".
+
+**Marker-owned, reconcile or refuse** — 029's and 030's shape, applied to
+eleven objects:
+
+- Each column carries `OIDC account link (037_oidc_account_links)` as its
+  COMMENT, mirrored byte-identically as `_OIDC_LINK_COLUMN_MARKER` in
+  `src/models/db.py` and passed as `comment=`, so `alembic check` compares it
+  (a drift shows as a pending `alter_column(comment=…)`). The migration's
+  `COLUMN_MARKER` and the model constant must stay identical.
+- Each constraint carries `OIDC account link constraint
+  (037_oidc_account_links)`. Autogenerate does not compare constraint
+  comments, so the gate reads them from the catalogue.
+- **All eleven objects are checked before anything is touched.** A same-named
+  column is adopted only with the exact type, nullable, no default and the
+  marker; a same-named constraint only with the canonical
+  `pg_get_constraintdef` (measured off a scratch TEMP table, 013's device, so
+  it is the server's own normalization), `convalidated` and the marker.
+  Anything else is refused by name and nothing changes — **including the right
+  shape without a marker**: an unmarked object has unknown provenance, and
+  adopting it would let `downgrade()` drop something 037 did not create. A
+  relation squatting a constraint's name is refused too.
+- `downgrade()` decides each object on its own marker, constraints before
+  columns, and prints a skip line for each unmarked one. **It loses every
+  link**; the docstring says so.
+- `search_path` is pinned to `public` and asserted, `lock_timeout` /
+  `statement_timeout` are set, and all are `RESET` afterwards. Nothing needs
+  superuser; `test_nonsuperuser_migrations_pg.py` runs it as the owning role.
+
+**The gate.** `HEAD_REVISION` in `tests/integration/test_schema_check.py` is
+`"037"`. Its 037 cases: chains from 036 and is head; a fresh upgrade has the
+exact marked shape (per column: type, nullability, absent default,
+`col_description`; per constraint: `pg_get_constraintdef`, `convalidated`,
+`obj_description`); the upgrade from 036 leaves existing users unchanged with
+all six NULL; a stamp-back re-run over the marked shape changes nothing; the
+valid row shapes are admitted and every invalid one rejected (half-bound,
+half-pending, bound-and-pending, a duplicate identity, a duplicate
+expectation, setting an expectation on a bound row); impostor refusals for a
+column (wrong type, NOT NULL, a default, unmarked) and for a constraint (wrong
+definition, `NOT VALID`, unmarked), all eleven checked before any is created;
+a squatting index name refused; a partial marked set adopted and completed;
+downgrade drops marked objects and keeps users, skips unmarked ones, and a
+downgrade to 036 followed by a re-upgrade recreates the shape identically
+with `alembic check` clean.
+
+## Fork backup and deployment compatibility, November 2026
+
+Full backups remain the default (`BACKUP_FULL=1`) in the Makefile and the
+Kubernetes backup job. The upstream cache classification above describes
+current indexing only: this fork's `note_embeddings` also stores historical
+validity intervals. Startup does not rebuild those rows. Explicit
+`BACKUP_FULL=0` omits them and requires a separate backfill from the original
+Git history and embedding provider; it is not an equivalent recovery point.
+
+Deployment probes run `scripts/migration_status.py` with
+`RUN_MIGRATIONS=false`, so examining the candidate cannot trigger the image's
+startup upgrade hook. Failed or ambiguous probes refuse deployment. The Make
+rollout stops the old application before a pending migration. The legacy VPS
+script refuses any pending migration and restores its previous image pin;
+these releases need a planned rollout with the old writer stopped. This is
+required by the keyword-vector migrations, whose new representation must not
+be written by old application code.

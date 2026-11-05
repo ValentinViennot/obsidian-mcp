@@ -65,6 +65,10 @@ spec:
                   value: "30"
                 - name: BACKUP_RETAIN_MIN
                   value: "7"
+                # Preserve historical vectors: startup only rebuilds current notes.
+                # "0" deliberately omits index rows and needs a history backfill.
+                - name: BACKUP_FULL
+                  value: "1"
               securityContext:
                 allowPrivilegeEscalation: false
                 readOnlyRootFilesystem: true

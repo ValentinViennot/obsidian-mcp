@@ -177,6 +177,13 @@ async def test_move_note_commits_its_own_link_rewrite_once(vault, monkeypatch):
     updated" — that never existed on disk. The moved note is recorded twice
     (once by the rename, once by its own rewrite) and must appear once.
     """
+    # This fixture has no database: isolate the Git publication contract from
+    # the keyword-generation and change-feed transactions covered by PG tests.
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(tools, "_enter_keyword_generation", noop)
+    monkeypatch.setattr(tools.change_feed, "append_events", noop)
     monkeypatch.setattr(tools, "async_session", _FakeSession)
     await tools.create_note_impl("old/Target.md", "Self: [[old/Target]]\n")
 

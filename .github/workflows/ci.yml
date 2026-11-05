@@ -28,7 +28,9 @@ jobs:
   tests:
     name: tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Offline suite + the real-Postgres integration modules in one job: ~27 min
+    # on main before #416, which adds ~380 tests. 30 was cancelling green runs.
+    timeout-minutes: 45
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -74,6 +76,17 @@ jobs:
       # this one just names the cause.
       - name: Verify the mount-namespace harness can run
         run: unshare -Urm --propagation private true
+
+      # tests/integration/test_search_eval_pg.py runs `make search-eval-export`
+      # through real `psql` (#356, design D3), and fails rather than skips when
+      # it is missing. GitHub's Ubuntu image ships the client today; this only
+      # installs it if the image ever stops doing so.
+      - name: Ensure the PostgreSQL client is present
+        run: |
+          if ! psql --version; then
+            sudo apt-get update && sudo apt-get install -y postgresql-client
+            psql --version
+          fi
 
       - name: Run the test suite
         env:

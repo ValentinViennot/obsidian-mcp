@@ -34,8 +34,8 @@ nothing to slow it and nothing to tell it to stop.
 | 1a | Request occupancy (#261, #188) | `APIKeyMiddleware`, before auth session through ASGI completion | global / presented-bearer fingerprint | 64 / 20, waiters 64 / 16, sharing one 2 s transport deadline with 1b; mode default **shadow** | enforce: transport 429 after the deadline or on waiter overflow; queue: admitted with an overrun; shadow: observation only. A disconnected waiter is released at once | `mcp_concurrency_pressure` event; request-level `concurrency_counters`; authenticated observations can accompany tool rows |
 | 1b | Auth-session occupancy (#261, #188) | around the middleware's own DB session only | global | 2, waiters 32, same deadline as 1a | enforce: transport 429 before opening a session; queue/shadow as 1a | same transport event and counters |
 | 1c | Body-memory budget (#322) | `APIKeyMiddleware`, after authentication and the auth permit, before the app reads a byte; **POST only** | process (two lanes: ≤ 1 MiB small, the rest large) | cgroup limit × 0.5 ÷ 8 (128 MiB on 2 GiB), 15 s wait, 8 waiters; **always on, every mode** | transport **429** `code: body_memory` + `Retry-After: 2`; **413** for a declared length above the per-request limit | `mcp_concurrency_pressure`, `reason: body:memory`; **not** in `concurrency_counters` |
-| 2 | General velocity bucket | `_tracked`, first gate | principal | 120/min, burst 30 (`MCP_RATE_LIMIT_PER_MINUTE`, `MCP_RATE_LIMIT_BURST`) | in-band, sentinel line | `rate_limited`, scope `principal` — **coalesced** |
-| 3 | Write velocity bucket | `_tracked` (write tools) **and** `PUT /transfer/upload` | principal | 60/min, burst 15 (`MCP_WRITE_RATE_LIMIT_PER_MINUTE`, `MCP_WRITE_RATE_LIMIT_BURST`) | in-band on a tool; **429** on the transfer route | `rate_limited`, scope `principal_write` — **coalesced** |
+| 2 | General velocity bucket | `_tracked`, first gate | principal | 600/min, burst 120 (`MCP_RATE_LIMIT_PER_MINUTE`, `MCP_RATE_LIMIT_BURST`) | in-band, sentinel line | `rate_limited`, scope `principal` — **coalesced** |
+| 3 | Write velocity bucket | `_tracked` (write tools) **and** `PUT /transfer/upload` | principal | 120/min, burst 30 (`MCP_WRITE_RATE_LIMIT_PER_MINUTE`, `MCP_WRITE_RATE_LIMIT_BURST`) | in-band on a tool; **429** on the transfer route | `rate_limited`, scope `principal_write` — **coalesced** |
 | 4 | Vault admission (#66) | `_tracked` | user | — | in-band | `no_vault_assigned` (and the three vault-root quarantine markers, #199) |
 | 5a | Unencodable-argument screen (#149) | `_tracked` | argument | — | in-band | `argument_not_encodable` |
 | 5b | Query and import-URL length caps | `_tracked`, beside 5a | argument | 8,192 (`MAX_SEARCH_QUERY_CHARS`; `MAX_IMPORT_URL_CHARS` for `import_from_url`'s `url`, #322) | in-band | `argument_too_long` — **own row** |
@@ -81,7 +81,13 @@ middleware, which binds a principal or answers 401/429. The failed-auth budget
 
 ## Gate order, and the invariant it preserves
 
-L2 → L3 → L4 → L5a/b → L5c (slots) → L6 (quota) → body → telemetry.
+L2 → L3 → L4 → L5a/b → L5c (slots) → L6 (quota) → write gate → body → telemetry.
+
+The **write gate** (#358) is not an admission gate: it runs `_require_write()`
+at the body boundary for the tools in `tool_permissions.WRITE_REQUIRED_TOOLS`
+and its refusal is the body's own (executed work, the `permission_denied`
+marker). Those bodies used to refuse as their first act, so the tokens and the
+quota slot a read-only write call spends are exactly what they were.
 
 - **A token is not a quota slot.** A rate token refills, so consuming one on a
   call a later gate refuses is correct — the refusal itself costs work. The
@@ -130,10 +136,11 @@ request rate.
 ## Two buckets, because velocity and destruction are different questions
 
 The general bucket is a **velocity** bound: it stops a hot loop and bounds the
-rate at which any work is created. It is *not* a blast-radius bound — 120
-deletes a minute empties a 2,577-note vault in about twenty minutes. The write
-bucket halves that. **Neither bucket bounds totality**; only the daily quota
-does, and only for the credentials it reaches.
+rate at which any work is created. It is *not* a blast-radius bound — the
+write bucket's 120 deletes a minute (the general bucket alone would allow 600)
+still empties a 2,577-note vault in about twenty minutes. **Neither bucket
+bounds totality**; only the daily quota does, and only for the credentials it
+reaches.
 
 > **Accepted limitation, owner-approved.** OAuth principals and pre-existing
 > NULL-limit API keys have **velocity bounds only** — no durable ceiling on
@@ -211,8 +218,8 @@ renderer appending a single final line to the existing prose.
 What an agent actually receives when the general bucket refuses it:
 
 ```
-Error: this credential exceeded its general rate limit of 120 calls per minute, so the call was refused before it ran. Nothing was read, written, or counted against the daily quota. Retry in 3 seconds, or slow the calling loop down.
-MCP-REFUSAL {"code":"rate_limited","scope":"principal","limit":120,"limit_unit":"calls_per_minute","retry_after_seconds":3}
+Error: this credential exceeded its general rate limit of 600 calls per minute, so the call was refused before it ran. Nothing was read, written, or counted against the daily quota. Retry in 1 seconds, or slow the calling loop down.
+MCP-REFUSAL {"code":"rate_limited","scope":"principal","limit":600,"limit_unit":"calls_per_minute","retry_after_seconds":1}
 ```
 
 - The sentinel `MCP-REFUSAL` is **line-initial** and the JSON is **one line**,
@@ -507,13 +514,13 @@ once, in `src/services/api_keys.py` (`resolve_create_limit`,
 
 **Why 5,000.** ~1,600 tool calls per 30 days across all credentials, so
 5,000/day is two orders of magnitude of headroom and cannot interrupt a real
-session, while a runaway stops the same day. At 120/min it takes ≥ 42 minutes
+session, while a runaway stops the same day. At 600/min it takes ≥ 8 minutes
 to spend. It binds only keys created after this shipped.
 
 ## Key creation is one budget across two representations (#323)
 
 Every new API key is a new `/mcp` principal, and a new principal starts with a
-full general (30) and write (15) burst. Until #323 only `POST /api/keys` was
+full general (120) and write (30) burst. Until #323 only `POST /api/keys` was
 throttled (5/min per address, slowapi); `POST /admin/keys/create` was not, so a
 session plus its CSRF token could script it and reset both per-principal
 buckets at will — and, with a blank limit field, skip the daily quota too.
@@ -655,6 +662,24 @@ against credential guessing; #194's own verification withdrew that (256-bit
 > failures / 5 minutes — no working client fails 60 times in 5 minutes), by
 > `MCP_AUTH_FAILURE_LIMIT=null`, and by the one WARNING naming the address the
 > first time a slot engages.
+
+## The CIMD document fetch: the failed-auth table, a second time (#357)
+
+`/authorize` with an `https://` client_id makes an outbound fetch that an
+unauthenticated caller can drive in single-user mode. In the reference
+deployment it sits behind SSO, but the app does not rely on that.
+`src/oauth/cimd.py` bounds it in this order, and a refusal spends nothing:
+1. A cache hit charges nothing.
+2. **Joining an in-progress fetch of the same URL** charges nothing. The join is evaluated before every cap, so it can never be refused by one.
+3. A 30 s per-URL cooldown after a failure.
+4. `OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE` (10, 1–120) on a fixed 4,096-slot table using **exactly** this section's algorithm. `rate_limits.salted_slot_index` is now the one shared definition, with its own per-process salt; slot 0 is reserved for no address; a fixed 60 s window; collisions merge and nothing is evicted, so address churn cannot refill a spent slot.
+5. At most one fetch in flight per slot.
+6. At most eight per process.
+
+The per-slot in-flight cap is the defence against one caller holding the pool
+with slow origins. Eight distinct slots can still fill it for up to 10 s (L11
+in [oauth and grants](oauth-and-grants.md)). The state is in-process, under
+the same `--workers 1` contract as everything else here.
 
 ## The panel login budget is keyed by account, exactly, and is not a lockout
 
@@ -903,10 +928,10 @@ the page to see. The full reading rules are in
 | `TRUSTED_PROXY_IPS` | `127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | The peers whose `X-Forwarded-*` headers are honoured — the address every control here keys on. CSV or JSON, stored canonicalised, empty trusts nobody. The only such control; uvicorn's is off. |
 | `PANEL_LOGIN_FAILURE_LIMIT` | `10` | Failed panel sign-ins one **account** may accrue per window before further attempts are refused without comparing the password. Null disables. |
 | `PANEL_LOGIN_FAILURE_WINDOW_SECONDS` | `900` | The window that budget is counted over. |
-| `MCP_RATE_LIMIT_PER_MINUTE` | `120` | Sustained tool calls per minute per principal. Null (with the burst) disables the general bucket. |
-| `MCP_RATE_LIMIT_BURST` | `30` | Capacity of the general bucket. |
-| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `60` | Sustained vault-mutating calls per minute per principal (the eight write tools plus `PUT /transfer/upload`). |
-| `MCP_WRITE_RATE_LIMIT_BURST` | `15` | Capacity of the write bucket. |
+| `MCP_RATE_LIMIT_PER_MINUTE` | `600` | Sustained tool calls per minute per principal. Null (with the burst) disables the general bucket. |
+| `MCP_RATE_LIMIT_BURST` | `120` | Capacity of the general bucket. |
+| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `120` | Sustained vault-mutating calls per minute per principal (the eight write tools plus `PUT /transfer/upload`). |
+| `MCP_WRITE_RATE_LIMIT_BURST` | `30` | Capacity of the write bucket. |
 | `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals holding their own limiter entry before the shared overflow entry. |
 | `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one coalescing window stays open. |
 | `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** key receives when the caller names none (omitted JSON field, blank form field). Null makes the limit **required** on create; unlimited is only ever an administrator's explicit request (#323). |
@@ -1028,11 +1053,35 @@ ending in a 500, shared with the panel and `/token`.
 
 | Class | Tools | Ceiling | Connections |
 | --- | --- | --- | --- |
-| `embedding` | `semantic_search` | 1 | 1 |
+| `embedding` | `semantic_search`, `hybrid_search` (#354, `CLASS_MAPPING_VERSION` 5) | 1 | 1 |
 | `vector` | `find_related` | 1 | 1 |
 | `write` | the eight write-class tools (L3) | 1 | 2 |
-| `scan` | `keyword_search`, `list_notes`, `get_tags`, `get_neighborhood`, `find_orphans`, `list_files` | 2 | 1 |
+| `scan` | `keyword_search`, `list_notes`, `get_tags`, `get_neighborhood`, `find_orphans`, `list_files`, `list_tasks` (#350, `CLASS_MAPPING_VERSION` 3), `get_changes` (#351, `CLASS_MAPPING_VERSION` 4) | 2 | 1 |
 | `light` | `read_note`, `read_file`, `get_recent`, `get_vault_guide`, `get_backlinks`, `get_links`, `request_upload`, `check_upload`, `request_download` | 4 | 1 |
+
+`hybrid_search` makes the same embedding-provider round trip as
+`semantic_search`, so the two **share the one `embedding` slot**: under
+`queue`/`enforce` a burst of hybrid calls queues semantic calls (intended,
+one provider), and a call that degrades to keyword-only still held the slot —
+the class is per tool, not per outcome. Its database work is one session
+held only after the embedding returns, so one connection.
+
+A `rerank=true` call (#367) on either tool **stays in `embedding`**: the
+class is per tool, not per argument, so `CLASS_MAPPING_VERSION` does not
+move. The slot is held through the rerank exchange, which extends the hold by
+at most `RERANK_TIMEOUT_MS` (1.5 s by default, 30 s at most since #402); the database
+session is closed before the request is sent, so no connection is held during
+it. In `shadow` nothing waits, and the reranker client's two-connection pool
+is what bounds work in flight on the reranker. Readiness evidence gathered
+while reranking is in use mixes the two hold profiles, and the class version
+does not separate them (L7); read `make concurrency-report` with that in mind
+before promoting to `queue`. **Under `queue` or `enforce`, keep
+`RERANK_TIMEOUT_MS ≤ MCP_CONCURRENCY_WAIT_SECONDS × 1000`** unless that report
+passes over evidence including `rerank=true` traffic (#402, rerank-documents
+L10): with `MCP_CONCURRENCY_EMBEDDING=1`, one rerank call holding the sole
+`embedding` slot for 20 s makes a concurrent `semantic_search` /
+`hybrid_search` wait the 5 s tool wait and then, under `enforce`, be refused
+with `slot_timeout` (under `queue`, admitted with `overrun`).
 
 #261's `other` held 15 of the 25 tools and was pinned to 1. Raising it alone
 would let one tenant's scans hold every cheap-read slot, so it was split by
@@ -1486,8 +1535,17 @@ means raising the multiplier's default and floor, never loosening the guard.
 - Past 10,000 principals the shared overflow entries lose per-principal
   attribution but not their counts.
 - **The defaults are guesses against a small sample** (~1,600 calls per 30
-  days). Every one of them is a setting; read `/admin/performance` for a week
-  before treating any as settled.
+  days). The velocity buckets were raised once already (2026-10-23: 120/30 →
+  600/120 general, 60/15 → 120/30 write) after a real agent scan of ~400 reads
+  at 8–13 calls/s was refused mid-task. Every one of them is a setting; read
+  `/admin/performance` for a week before treating any as settled.
 - A shared key is a shared bucket. Two agents on one credential contend,
   exactly as they do for the daily quota — an agent that deserves isolation
   deserves its own credential.
+
+### Fork classification epoch, November 2026
+
+`CLASS_MAPPING_VERSION = 6` distinguishes the combined 31-tool mapping from
+both upstream epoch 5 and the previous fork epoch 3. Git history tools remain
+in the scan class; new `list_tasks` and `get_changes` are scans and
+`hybrid_search` shares semantic search's embedding class.

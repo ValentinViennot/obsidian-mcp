@@ -33,6 +33,21 @@ from src.services import vault as vault_service
 from src.services import vault_fs
 
 
+@pytest.fixture(autouse=True)
+def _no_keyword_generation(monkeypatch):
+    """#351: `move_note` now stops its link rewrites when its metadata
+    transaction fails, so these scripted fake sessions must let that
+    transaction succeed. Its opening generation lock and fingerprint re-read
+    are pinned against PostgreSQL in `tests/integration/test_keyword_ranking_pg.py`;
+    stand them down here, as the other offline move modules do."""
+    from src.mcp_server import tools as _tools
+
+    async def _noop(_session):
+        return None
+
+    monkeypatch.setattr(_tools, "_enter_keyword_generation", _noop)
+
+
 @pytest.fixture
 def vault(monkeypatch, tmp_path):
     async def noop(*args, **kwargs):

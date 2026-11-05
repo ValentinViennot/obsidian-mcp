@@ -64,6 +64,20 @@ from src.services import vault_fs
 from src.services.vault import UnconfirmedPublication, VaultAssignmentChanged
 
 
+@pytest.fixture(autouse=True)
+def _no_keyword_generation(monkeypatch):
+    """The fake sessions here are scripted by statement order. `move_note`'s
+    metadata transaction now opens with the index generation lock and the
+    keyword fingerprint re-read (#344, D6); both are pinned against a real
+    PostgreSQL in `tests/integration/test_keyword_ranking_pg.py`, so stand
+    them down here."""
+
+    async def _noop(_session):
+        return None
+
+    monkeypatch.setattr(tools, "_enter_keyword_generation", _noop)
+
+
 UID = 8801
 
 
@@ -1435,6 +1449,16 @@ def _reachable(name: str, seen: set[str] | None = None) -> set[str]:
 # at the *call site*, from the keyword.
 _CONDITIONAL_WRITE_GATE = "_mint_preflight"
 
+# `_tracked` (and the closures nested in it) runs `_require_write()` at the body
+# boundary for the tools in `tool_permissions.WRITE_REQUIRED_TOOLS` (#358). Every
+# impl is wrapped by it, so its presence says nothing about whether *this* tool
+# writes; the question here is what the tool's own body does.
+_DECORATOR_NODES = {
+    id(node)
+    for node in ast.walk(TOOLS_FUNCTIONS["_tracked"])
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+}
+
 
 def _needs_write(reachable: set[str]) -> bool:
     """Whether the tool gates on `_require_write`, directly or through the
@@ -1442,6 +1466,8 @@ def _needs_write(reachable: set[str]) -> bool:
     actually asks for write."""
     for name in reachable:
         node = TOOLS_FUNCTIONS[name]
+        if id(node) in _DECORATOR_NODES:
+            continue
         if name != _CONDITIONAL_WRITE_GATE and "_require_write" in _called_names(node):
             return True
         for call in ast.walk(node):

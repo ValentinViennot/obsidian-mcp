@@ -51,6 +51,33 @@ _INDEXED_PROVENANCE_MARKER = (
 _OIDC_SUBJECT_COLUMN_MARKER = (
     "the identity provider's stable subject claim (025_oidc_subject)"
 )
+# Migration 037's ownership marker for the six OIDC link columns on `users`
+# (#416), mirrored here so `alembic check` compares it like any other column
+# attribute. Must stay byte identical to `COLUMN_MARKER` in
+# `alembic/versions/037_oidc_account_links.py`; a mismatch shows up as a
+# pending `alter_column(comment=...)` rather than as a `downgrade()` that has
+# quietly stopped recognising its own columns. The five constraints carry a
+# separate marker (`CONSTRAINT_MARKER` there) that autogenerate does not
+# compare, so it lives in the migration only and the schema gate reads it from
+# the catalogue.
+_OIDC_LINK_COLUMN_MARKER = "OIDC account link (037_oidc_account_links)"
+
+# The three CHECK predicates migration 037 creates, byte identical to the
+# migration's literals. Autogenerate does not compare CHECK predicates; they
+# are declared here so a fresh `create_all` and the migration agree, and the
+# schema gate asserts them through `pg_constraint` by definition.
+_OIDC_BOUND_COMPLETE_PREDICATE = (
+    "(oidc_issuer IS NULL AND native_oidc_subject IS NULL AND oidc_linked_at IS NULL) OR "
+    "(oidc_issuer IS NOT NULL AND native_oidc_subject IS NOT NULL "
+    "AND oidc_linked_at IS NOT NULL)"
+)
+_OIDC_EXPECTED_COMPLETE_PREDICATE = (
+    "(oidc_expected_issuer IS NULL AND oidc_expected_email IS NULL "
+    "AND oidc_expected_set_at IS NULL) OR "
+    "(oidc_expected_issuer IS NOT NULL AND oidc_expected_email IS NOT NULL "
+    "AND oidc_expected_set_at IS NOT NULL)"
+)
+_OIDC_NOT_BOTH_PREDICATE = "native_oidc_subject IS NULL OR oidc_expected_email IS NULL"
 
 
 class User(Base):
@@ -90,6 +117,46 @@ class User(Base):
     # width for an identifier of the same kind.
     oidc_subject: Mapped[str | None] = mapped_column(
         String(255), nullable=True, comment=_OIDC_SUBJECT_COLUMN_MARKER
+    )
+    # ── OIDC account link (issue #416, migration 037) ──────────────────────
+    #
+    # Two triples, each all-NULL or all-set (the two `_complete` CHECKs), and
+    # never both set on one row (`ck_users_oidc_not_both`).
+    #
+    # *Bound*: `(oidc_issuer, native_oidc_subject)` is the provider identity this
+    # user signs in as, compared by exact equality with a validated ID
+    # token's `(iss, sub)`. Once set, nothing else about the token (email,
+    # username) is ever consulted for this user. UNIQUE, so one identity maps
+    # to at most one user; NULLs are distinct, so unlinked rows never collide.
+    #
+    # *Pending*: an administrator's expectation that the first verified login
+    # whose normalized email equals `oidc_expected_email` under
+    # `oidc_expected_issuer`, within `oidc_links.PENDING_DAYS` of
+    # `oidc_expected_set_at`, binds this user. Stored already normalized
+    # (`oidc_links.normalize_email`), so a plain UNIQUE suffices and no
+    # functional index is needed.
+    #
+    # Columns rather than a table on purpose: a table needs a foreign key to
+    # `users`, and an FK to `users` reopened the permanent-deletion deadlock
+    # for the feed tables. Deleting the row deletes its link. All writes go
+    # through `src/services/oidc_links.py` under the account guard.
+    oidc_issuer: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    native_oidc_subject: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_linked_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_expected_issuer: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_expected_email: Mapped[str | None] = mapped_column(
+        String(254), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_expected_set_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
     )
 
     # ── Index provenance (issue #91, migration 016) ────────────────────────
@@ -262,6 +329,15 @@ class User(Base):
             unique=True,
             postgresql_where=text("oidc_subject IS NOT NULL"),
         ),
+        UniqueConstraint("oidc_issuer", "native_oidc_subject", name="uq_users_oidc_identity"),
+        UniqueConstraint(
+            "oidc_expected_issuer", "oidc_expected_email", name="uq_users_oidc_expected"
+        ),
+        CheckConstraint(_OIDC_BOUND_COMPLETE_PREDICATE, name="ck_users_oidc_bound_complete"),
+        CheckConstraint(
+            _OIDC_EXPECTED_COMPLETE_PREDICATE, name="ck_users_oidc_expected_complete"
+        ),
+        CheckConstraint(_OIDC_NOT_BOTH_PREDICATE, name="ck_users_oidc_not_both"),
     )
 
 
@@ -384,6 +460,12 @@ _OAUTH_CLIENT_LAST_USED_COLUMN_MARKER = (
     "(025_oauth_client_last_used)"
 )
 
+# Byte-identical to `COLUMN_MARKER` in 036_oauth_cimd.py, so `alembic check`
+# compares it and a re-run of 036 can recognise its own column (#357).
+_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER = (
+    "created by 036_oauth_cimd: Client ID Metadata Document URL (#357)"
+)
+
 # Same device, same rule: byte identical to `CODE_GRANT_MARKER` and
 # `ISSUED_AT_MARKER` in `alembic/versions/029_oauth_grant_lifetime.py`.
 _OAUTH_CODE_GRANT_ID_COLUMN_MARKER = (
@@ -402,6 +484,44 @@ _NOTE_STAT_COLUMN_MARKER = (
 # Migration 030's marker on `notes_metadata.derived_under`, byte identical to
 # its `MARKER`; declared as the column comment so `alembic check` compares it.
 _DERIVED_UNDER_COLUMN_MARKER = "re-derive progress digest (030_note_derived_under)"
+# Byte identical to `MARKER` in `alembic/versions/031_keyword_head_and_excerpt.py`.
+_BODY_EXCERPT_COLUMN_MARKER = "keyword excerpt (031_keyword_head_and_excerpt)"
+# Migration 032's markers (#350). Byte identical to `TABLE_MARKER`,
+# `TRUNCATED_MARKER` and `FAILED_MARKER` in `alembic/versions/032_note_tasks.py`;
+# declared as the table and column comments so `alembic check` compares them.
+_NOTE_TASKS_TABLE_MARKER = "task rows derived per note (032_note_tasks)"
+_TASKS_TRUNCATED_COLUMN_MARKER = "task-extraction truncation marker (032_note_tasks)"
+_TASKS_FAILED_COLUMN_MARKER = "task-derivation failure marker (032_note_tasks)"
+# Migration 033 (#351, the change feed). Byte identical to the migration's
+# literals, so `alembic check` compares them.
+_CONTENT_CHANGED_AT_COLUMN_MARKER = "content-change stamp (033_content_changed_at)"
+_NOTE_EVENTS_TABLE_MARKER = "change-feed events (033_content_changed_at)"
+_NOTE_EVENT_SCOPES_TABLE_MARKER = "change-feed scope counters (033_content_changed_at)"
+_NOTE_EVENT_GAPS_TABLE_MARKER = "change-feed write gaps (033_content_changed_at)"
+# Migration 034 (#355, heading-aware chunks; design D4/D5). Byte identical to
+# the migration's literals, so `alembic check` compares them.
+_HEADING_META_COLUMN_MARKER = "chunk section locator (034_heading_chunks)"
+_EMBED_PREFIX_COLUMN_MARKER = "embedded context prefix (034_heading_chunks)"
+_EMBEDDED_CHUNKING_VERSION_COLUMN_MARKER = (
+    "chunking version of the stored vectors (034_heading_chunks)"
+)
+_EMBEDDED_INPUT_DIGEST_COLUMN_MARKER = (
+    "digest of the embedded provider inputs (034_heading_chunks)"
+)
+# The two CHECKs 034 adds. Alembic does not compare CHECK predicates; the
+# schema gate asserts both through `pg_constraint`. Byte identical to the
+# migration's `HEADING_META_PREDICATE` / `CHUNKING_VERSION_PREDICATE`.
+_HEADING_META_CHECK_NAME = "ck_note_embeddings_heading_meta"
+_HEADING_META_PREDICATE = (
+    "(heading_path IS NULL AND section_ordinal IS NULL AND embed_prefix IS NULL) OR "
+    "(heading_path IS NOT NULL AND section_ordinal IS NOT NULL "
+    "AND embed_prefix IS NOT NULL AND section_ordinal >= 0 "
+    "AND (section_ordinal = 0) = (cardinality(heading_path) = 0))"
+)
+_CHUNKING_VERSION_CHECK_NAME = "ck_notes_metadata_embedded_chunking_version"
+_CHUNKING_VERSION_PREDICATE = (
+    "embedded_chunking_version IS NULL OR embedded_chunking_version >= 1"
+)
 # The all-or-none CHECK over those four columns. The predicate is the
 # migration's `STAT_PREDICATE`, byte for byte.
 _NOTE_STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
@@ -499,6 +619,25 @@ class NoteMetadata(Base):
     frontmatter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     embedded_content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Heading-aware chunks (#355, migration 034, design D3a/D4). Stamped by
+    # `certify_embedded` in the same conditional UPDATE as
+    # `embedded_content_hash`, on every certifying branch (embedded,
+    # certified-empty, excluded). `embedded_chunking_version` is the
+    # `src.services.embeddings.CHUNKING_VERSION` the stored vectors were built
+    # under; NULL means "pre-034 chunking". It is deliberately **not** part of
+    # the stored embedding fingerprint: a note on another version is re-selected
+    # by the embed backlog (`IS DISTINCT FROM`, never `<`), not refused at
+    # startup. `embedded_input_digest` is the SHA-256 hex of the canonical JSON
+    # of the ordered provider inputs the certification covers (`[]` for an
+    # empty or excluded note); the full-hash pass recomputes it as a backstop.
+    embedded_chunking_version: Mapped[int | None] = mapped_column(
+        SmallInteger,
+        nullable=True,
+        comment=_EMBEDDED_CHUNKING_VERSION_COLUMN_MARKER,
+    )
+    embedded_input_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_EMBEDDED_INPUT_DIGEST_COLUMN_MARKER
+    )
     # Which fence grammar derived this row's links, tags and vectors.
     # `content_hash` cannot see a grammar change — the bytes are unchanged — so
     # without a separate marker the derivation gate would certify stale link
@@ -553,6 +692,29 @@ class NoteMetadata(Base):
         server_default=text("false"),
         comment=_CHUNKS_TRUNCATED_COLUMN_MARKER,
     )
+    # Set when this note's task extraction hit `MAX_TASKS_PER_NOTE` and the
+    # pass stored only the first N tasks in document order; cleared when a
+    # later extraction completes under the cap. `links_truncated`'s lifecycle,
+    # for its reason: `list_tasks` counts capped notes in every header rather
+    # than presenting a capped set as complete (#350, migration 032).
+    tasks_truncated: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        comment=_TASKS_TRUNCATED_COLUMN_MARKER,
+    )
+    # Set when this note's task derivation failed on the attempt and on its
+    # one retry (design D4 of #350): its task rows are absent, and every
+    # `list_tasks` header counts it. **Not** a quarantine — the note's row,
+    # keyword vector, links and embeddings are untouched. Written only by the
+    # task stage, in the transaction of the attempt for the row's current
+    # hash, and cleared only by a later successful derivation.
+    tasks_failed: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        comment=_TASKS_FAILED_COLUMN_MARKER,
+    )
     # Deferred with raise-on-load (#280, design D5). No read path renders the
     # tsvector: `keyword_search` uses it only server-side (`@@`, `ts_rank_cd`),
     # and every writer is SQL text or `insert().values`, which deferral does
@@ -562,6 +724,23 @@ class NoteMetadata(Base):
     # that genuinely needs it selects the column explicitly.
     content_tsvector: Mapped[str | None] = mapped_column(
         TSVECTOR, nullable=True, deferred=True, deferred_raiseload=True
+    )
+    # The first `KEYWORD_EXCERPT_CHARS` characters of exactly the body text the
+    # row's keyword vector was built from (#344, migration 031, design D4):
+    # the same prefix the vector's successful attempt bound under the halving
+    # retreat, sentinel-free (U+0000/U+0002/U+0003 removed). Written in the
+    # same UPDATE as `content_tsvector` by the incremental pass and the
+    # rebuild; preserved by both move paths. `ts_headline` reads it
+    # server-side for `keyword_search`'s snippet; no read path ships it, hence
+    # deferred with raiseload like the vector. NULL means "the vector was last
+    # written by a build that stored no excerpt" (every pre-031 row until it is
+    # edited or `make rebuild-tsvectors` runs) and the tool says so.
+    body_excerpt: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        deferred=True,
+        deferred_raiseload=True,
+        comment=_BODY_EXCERPT_COLUMN_MARKER,
     )
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     modified_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -606,6 +785,24 @@ class NoteMetadata(Base):
     indexed_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # When the row's *content* last changed (#351, migration 033, design D1).
+    # Written in exactly one place: the index pass's batch upsert, in the same
+    # statement that overwrites `content_hash` — `now()` (the pass
+    # transaction's start) when the stored hash differs from the new one, the
+    # existing value otherwise, and the file's mtime for a row inserted at a
+    # path that had none. So a `touch`, a stat refresh, a stale-marker or
+    # re-derive re-upsert with the same hash, either move path, the keyword
+    # vector writers and the link backfill never move it. Not mtime on a
+    # change, deliberately: a sync client that preserves mtime would otherwise
+    # stamp a real edit in the past. The migration backfilled
+    # `COALESCE(modified_at, indexed_at)`; the server default exists only so a
+    # direct insert (tests, the move-less fallback) is never NULL.
+    content_changed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment=_CONTENT_CHANGED_AT_COLUMN_MARKER,
+    )
 
     # `note_embeddings.note_id` is `ON DELETE CASCADE` (migration 001), so the
     # chunks of a deleted note go with it without the ORM loading one row per
@@ -639,6 +836,10 @@ class NoteMetadata(Base):
         # Migration 026. Alembic does not compare CHECK predicates; the schema
         # gate asserts this one through `pg_constraint`.
         CheckConstraint(_NOTE_STAT_PREDICATE, name=_NOTE_STAT_CHECK_NAME),
+        # Migration 034, asserted by the schema gate like the one above.
+        CheckConstraint(
+            _CHUNKING_VERSION_PREDICATE, name=_CHUNKING_VERSION_CHECK_NAME
+        ),
     )
 
 
@@ -650,6 +851,22 @@ class NoteEmbedding(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dimensions), nullable=False)
+    # The chunk's section (#355, migration 034, design D1/D5/D6): the heading
+    # path outermost first (`{}` for the text before the first heading) and
+    # the `read_note(section="#N")` ordinal (0 for that preamble), plus the
+    # context prefix the provider input was built from (`embed_prefix +
+    # "\n\n" + chunk_text`). All three NULL on a pre-034 row, all three set on
+    # a row written since (the CHECK below). `chunk_text` stays un-prefixed.
+    # The reuse key is `(embed_prefix, chunk_text)`; the locator is not in it.
+    heading_path: Mapped[list[str] | None] = mapped_column(
+        ARRAY(Text), nullable=True, comment=_HEADING_META_COLUMN_MARKER
+    )
+    section_ordinal: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment=_HEADING_META_COLUMN_MARKER
+    )
+    embed_prefix: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment=_EMBED_PREFIX_COLUMN_MARKER
+    )
 
     # ── Validity interval (migration 025) ──────────────────────────────────
     #
@@ -701,6 +918,7 @@ class NoteEmbedding(Base):
         # and autogenerate does not compare one, so there is nothing here for
         # `alembic check` to drift against.)
         Index("ix_note_embeddings_validity", "valid_to", "valid_from"),
+        CheckConstraint(_HEADING_META_PREDICATE, name=_HEADING_META_CHECK_NAME),
     )
 
 
@@ -727,6 +945,227 @@ class NoteLink(Base):
         Index("ix_note_links_source", "source_note_id"),
         Index("ix_note_links_target", "target_note_id"),
         Index("ix_note_links_target_path", "target_path"),
+    )
+
+
+# The closed sets 032's CHECKs enforce, mirrored from the migration (which
+# pins its own copy) and from `src.services.tasks`.
+NOTE_TASK_STATES = ("open", "done", "cancelled")
+NOTE_TASK_PRIORITIES = ("highest", "high", "medium", "low", "lowest")
+# `NoteTask` has a column named `text`, which shadows `sqlalchemy.text` inside
+# its class body.
+_sql_text = text
+
+
+class NoteTask(Base):
+    """One checkbox list item of a note body (#350, migration 032).
+
+    Derived state with exactly `note_links`' lifecycle: written only by the
+    index pass, beside the link rebuild, in the transaction that wrote the
+    note's row. Keyed by `note_id` with **no path and no owner** (design D1):
+    both come from the note's row through the join, so a task row cannot
+    outlive or precede its note and follows an id-preserving move unwritten.
+    No relationship on `NoteMetadata` loads these.
+    """
+
+    __tablename__ = "note_tasks"
+    _TABLE_MARKER: ClassVar[str] = _NOTE_TASKS_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    note_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("notes_metadata.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    line: Mapped[int] = mapped_column(Integer, nullable=False)
+    status_char: Mapped[str] = mapped_column(String(1), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    text_cut: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=_sql_text("false")
+    )
+    due: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    scheduled: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    start: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    done_on: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    priority: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    tags: Mapped[list[str] | None] = mapped_column(ARRAY(String(128)), nullable=True)
+    tags_cut: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=_sql_text("false")
+    )
+    heading_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("note_id", "line", name="uq_note_tasks_note_id_line"),
+        CheckConstraint(
+            "state IN (" + ", ".join(f"'{v}'" for v in NOTE_TASK_STATES) + ")",
+            name="ck_note_tasks_state",
+        ),
+        CheckConstraint(
+            "priority IN (" + ", ".join(f"'{v}'" for v in NOTE_TASK_PRIORITIES) + ")",
+            name="ck_note_tasks_priority",
+        ),
+        Index("ix_note_tasks_note", "note_id"),
+        Index("ix_note_tasks_state_due", "state", "due"),
+        {"comment": _NOTE_TASKS_TABLE_MARKER},
+    )
+
+
+# ── The change feed (#351, migration 033) ────────────────────────────────
+#
+# **No foreign key on any of the three tables, on purpose (design D2).** An
+# event must outlive its `notes_metadata` row (a deletion is recorded *after*
+# the row is gone), so none to that table; and none to `users` either: the
+# INSERT's FK check takes `FOR KEY SHARE` on the `users` row *after* the index
+# pass already holds `notes_metadata` row locks, while a permanent user
+# deletion takes the `users` row first and then cascades into exactly those
+# rows — the documented deadlock (`ProvenanceLockUnavailable`). Cleanup is
+# explicit instead: `delete_user`'s permanent branch purges the scope under the
+# feed lock, and retention deletes rows of user ids that no longer exist.
+
+NOTE_EVENT_KINDS = ("created", "modified", "moved", "deleted", "gap", "reset")
+NOTE_EVENT_META_KINDS = ("gap", "reset")
+NOTE_EVENT_SOURCES = ("mcp", "index")
+NOTE_EVENT_REASONS = ("removed", "not_indexable", "quarantined")
+NOTE_EVENT_GAP_REASONS = ("pass_overflow", "write_failed")
+NOTE_EVENT_PRINCIPAL_KINDS = ("api_key", "oauth")
+
+
+def _sql_in(column: str, values) -> str:
+    return f"{column} IN (" + ", ".join(f"'{v}'" for v in values) + ")"
+
+
+#: The CHECK predicates, `{name: predicate}`, mirrored by migration 033 (which
+#: pins its own copy) and asserted through `pg_constraint` by the schema gate.
+NOTE_EVENT_CHECKS = {
+    "ck_note_events_kind": _sql_in("kind", NOTE_EVENT_KINDS),
+    "ck_note_events_source": _sql_in("source", NOTE_EVENT_SOURCES),
+    "ck_note_events_reason": _sql_in("reason", NOTE_EVENT_REASONS),
+    "ck_note_events_gap_reason": _sql_in("gap_reason", NOTE_EVENT_GAP_REASONS),
+    "ck_note_events_principal_kind": _sql_in(
+        "principal_kind", NOTE_EVENT_PRINCIPAL_KINDS
+    ),
+    # A meta line names no note; a note line always names one.
+    "ck_note_events_path": (
+        "(" + _sql_in("kind", NOTE_EVENT_META_KINDS) + " AND path IS NULL) OR ("
+        "kind NOT IN ('gap', 'reset') AND path IS NOT NULL)"
+    ),
+    # Only a move has a source path, and a move always has one.
+    "ck_note_events_from_path": (
+        "(kind = 'moved' AND from_path IS NOT NULL) OR "
+        "(kind <> 'moved' AND from_path IS NULL)"
+    ),
+    # A principal is a pair, and only a tool event carries an actor.
+    "ck_note_events_principal": (
+        "(principal_kind IS NULL) = (principal_ref IS NULL) AND "
+        "(source = 'mcp' OR (principal_kind IS NULL AND actor_kind IS NULL "
+        "AND actor_label IS NULL AND tool IS NULL))"
+    ),
+}
+
+
+class NoteEvent(Base):
+    """One change-feed line (#351, design D2).
+
+    `seq` is the per-scope sequence, assigned only by
+    `src.services.change_feed.append_events` under the scope's advisory lock
+    held to commit, so a reader's `ev:<seq>` cursor is exact and reveals
+    nothing about another tenant. `id` is a surrogate: never rendered, never
+    accepted. `principal_ref` is compared for `by="me"` and never rendered;
+    `actor_ref` is deliberately not stored (a column nobody reads is a column
+    somebody later renders).
+    """
+
+    __tablename__ = "note_events"
+    _TABLE_MARKER: ClassVar[str] = _NOTE_EVENTS_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    occurred_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    from_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str] = mapped_column(String(8), nullable=False)
+    tool: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    actor_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    actor_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    principal_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    principal_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    gap_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    gap_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "seq", name="uq_note_events_user_id_seq",
+            postgresql_nulls_not_distinct=True,
+        ),
+        *(CheckConstraint(predicate, name=name)
+          for name, predicate in NOTE_EVENT_CHECKS.items()),
+        # Suppression and `get_changes`: the latest event *at* a path is the
+        # highest seq whose `path` or `from_path` is it. A b-tree scans
+        # backwards for `ORDER BY seq DESC`, so neither index is declared DESC.
+        Index("ix_note_events_user_path_seq", "user_id", "path", "seq"),
+        Index("ix_note_events_user_from_path_seq", "user_id", "from_path", "seq"),
+        Index("ix_note_events_occurred_at", "occurred_at"),
+        {"comment": _NOTE_EVENTS_TABLE_MARKER},
+    )
+
+
+class NoteEventScope(Base):
+    """One row per scope that has ever had an event (#351, design D4/D9).
+
+    `last_seq` never decreases, so a seq is never reused even after retention
+    or a discard removed the event that held it. `pruned_through_seq` /
+    `pruned_at` are the retention watermark `get_changes` turns into
+    `history_truncated`; they live here rather than in `indexer_state`, which
+    backups dump schema-only, because they must be restored with the events.
+    """
+
+    __tablename__ = "note_event_scopes"
+    _TABLE_MARKER: ClassVar[str] = _NOTE_EVENT_SCOPES_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    pruned_through_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    pruned_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", name="uq_note_event_scopes_user_id",
+            postgresql_nulls_not_distinct=True,
+        ),
+        {"comment": _NOTE_EVENT_SCOPES_TABLE_MARKER},
+    )
+
+
+class NoteEventGap(Base):
+    """A pass append that failed (#351, design D5): `gap_count` events that
+    are not in `note_events`. Committed with the pass; the scope's next
+    successful append consumes every row into one `gap write_failed` line."""
+
+    __tablename__ = "note_event_gaps"
+    _TABLE_MARKER: ClassVar[str] = _NOTE_EVENT_GAPS_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gap_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    recorded_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_note_event_gaps_user_id", "user_id"),
+        {"comment": _NOTE_EVENT_GAPS_TABLE_MARKER},
     )
 
 
@@ -793,6 +1232,12 @@ class OAuthClient(Base):
         nullable=True,
         comment=_OAUTH_CLIENT_LAST_USED_COLUMN_MARKER,
     )
+    # A Client ID Metadata Document client's URL (#357, migration 036). Set
+    # exactly when `client_id` starts `cimd_` (the synthetic, per-(URL, user)
+    # row); NULL for every RFC 7591 registration. The CHECK below enforces it.
+    client_id_metadata_url: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER
+    )
 
     user: Mapped["User | None"] = relationship(back_populates="oauth_clients")
 
@@ -801,6 +1246,12 @@ class OAuthClient(Base):
             "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL) OR "
             "(token_endpoint_auth_method = 'client_secret_post' AND client_secret_hash IS NOT NULL)",
             name="ck_oauth_clients_auth_method_secret",
+        ),
+        CheckConstraint(
+            "((client_id LIKE 'cimd\\_%') = (client_id_metadata_url IS NOT NULL)) AND "
+            "(client_id_metadata_url IS NULL OR "
+            "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL))",
+            name="ck_oauth_clients_cimd_shape",
         ),
     )
 

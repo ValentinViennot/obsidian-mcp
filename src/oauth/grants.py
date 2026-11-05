@@ -85,6 +85,16 @@ USER_BOOTSTRAP_LOCK_KEY = 7283910429
 # password change takes *this* key rather than one of its own.
 ACCOUNT_GUARD_LOCK_KEY = 7_842_119_530_461_007
 
+# The change feed's per-scope append lock (#351, design D4), taken with the
+# **two-key** form `pg_advisory_xact_lock(NOTE_EVENTS_LOCK_NS, <scope key>)`,
+# whose lock space is disjoint from the single-bigint keys above. The scope
+# key is the `user_id`, or 0 for single-user mode. Held to commit by every
+# insert into `note_events` (`change_feed.append_events`), by retention and
+# by both purges, so a scope's `seq` order is its commit order. A wire
+# constant for the same rolling-deploy reason as `USER_BOOTSTRAP_LOCK_KEY`: an
+# old and a new process must take the same lock or seqs stop being exact.
+NOTE_EVENTS_LOCK_NS = 3_510_351
+
 
 def new_grant_id() -> str:
     """A fresh grant identifier for one consent event."""

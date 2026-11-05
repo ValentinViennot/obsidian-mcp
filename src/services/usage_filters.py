@@ -57,6 +57,7 @@ cases, and `ix_usage_logs_user_id` the by-user one.
 """
 from __future__ import annotations
 
+from datetime import timezone
 from urllib.parse import urlencode
 
 from sqlalchemy import text
@@ -278,18 +279,36 @@ async def recent_logs(session, filters: Filters, limit: int = LOG_LIMIT):
 
 
 async def chart_series(session, filters: Filters) -> dict:
-    """`{labels, values}` — matching requests per bucket, oldest first.
+    """Matching requests per bucket, oldest first.
 
-    Buckets are `date_trunc`ed in the database and rendered here. Empty buckets
-    are not filled in: the chart is a bar per bucket that had traffic, which is
-    what it drew before the filters existed, and inventing zero-height bars for
-    a filter that matched nothing would make an empty result look like a busy
-    one.
+    Returns `{labels, values, instants, bucket}`: `labels` are UTC renderings
+    (`%H:%M` for hour buckets, `%m/%d` for day buckets), `instants` the ISO-8601
+    UTC start of each bucket, `bucket` is `"hour"` or `"day"`.
+
+    **Buckets are cut in UTC, explicitly.** `date_trunc(field, ts, 'UTC')` (the
+    three-argument form, PostgreSQL 12+; the supported floor is 16) truncates
+    the instant as seen in UTC whatever the session's `TimeZone` is. The
+    two-argument form truncated in the session zone, so on a server whose zone
+    was not UTC every day bucket began at *local* midnight and was then
+    labelled with that instant's UTC date — one day early east of UTC — and in
+    a half-hour zone every hour label read `:30`. The engine also pins the
+    session to UTC (`src/services/db_session.py`); this does not rely on it.
+
+    The page renders **hour** buckets in the viewer's own zone from `instants`
+    (an hour is an hour anywhere, so a local label is honest — the same
+    `Intl.DateTimeFormat` treatment as the request log beside it), and keeps
+    **day** buckets as UTC dates labelled "UTC": a UTC day relabelled with a
+    local date would claim a local calendar day the bar does not count.
+
+    Empty buckets are not filled in: the chart is a bar per bucket that had
+    traffic, which is what it drew before the filters existed, and inventing
+    zero-height bars for a filter that matched nothing would make an empty
+    result look like a busy one.
     """
     where, params = filters._clauses()
     bucket = _BUCKETS[filters.window]
     sql = f"""
-        SELECT date_trunc('{bucket}', ul.created_at) AS bucket, count(*) AS cnt
+        SELECT date_trunc('{bucket}', ul.created_at, 'UTC') AS bucket, count(*) AS cnt
         FROM usage_logs ul
         WHERE {where}
         GROUP BY bucket
@@ -297,10 +316,20 @@ async def chart_series(session, filters: Filters) -> dict:
     """
     rows = (await session.execute(text(sql), params)).fetchall()
     fmt = "%H:%M" if bucket == "hour" else "%m/%d"
+    starts = [_as_utc(r.bucket) for r in rows]
     return {
-        "labels": [r.bucket.strftime(fmt) for r in rows],
+        "labels": [s.strftime(fmt) for s in starts],
         "values": [r.cnt for r in rows],
+        "instants": [s.isoformat().replace("+00:00", "Z") for s in starts],
+        "bucket": bucket,
     }
+
+
+def _as_utc(moment):
+    """A bucket start as an aware UTC datetime (naive is taken as UTC)."""
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 async def actor_totals(session, filters: Filters):

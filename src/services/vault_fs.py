@@ -83,7 +83,7 @@ import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from src.config import settings
@@ -453,10 +453,12 @@ _RESOLVE_STRICT = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS
 _O_LOOKUP = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 
 # `syscall(2)` numbers for `openat2`. Unlike `_SYS_RENAMEAT2` this table is not
-# a fallback for an old glibc — it is the implementation. **glibc exports no
-# `openat2` wrapper at any version** (D24): measured on glibc 2.36 and 2.39,
-# where `renameat2`, `statx`, `close_range` and `getrandom` all resolve through
-# `ctypes.CDLL(None)` and `openat2` raises `AttributeError`.
+# a fallback for an old glibc — it is the implementation. **glibc exported no
+# `openat2` wrapper** when this was written (D24): measured on glibc 2.36 and
+# 2.39, where `renameat2`, `statx`, `close_range` and `getrandom` all resolve
+# through `ctypes.CDLL(None)` and `openat2` raises `AttributeError`. A newer
+# glibc does export one (GitHub's ubuntu runner image, 2026-10-23); the raw
+# syscall stays correct either way, so the wrapper is deliberately not used.
 #
 # The number is 437 everywhere, because the syscall postdates the unified
 # numbering convention. That uniformity is a convenience, not a licence to
@@ -2427,7 +2429,7 @@ def soft_delete_at(
         if cross_mount_definitely(src_dir_fd, trash_fd):
             raise _trash_mount_boundary(rel_path, trash_dir)
         if stamp is None:
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         try:
             created = _rename_into_trash(
                 src_dir_fd, name, trash_fd, f"{stamp}-{name}"

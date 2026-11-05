@@ -1,0 +1,4 @@
+# Shell scripts run under bash, which treats a CRLF line ending as part of
+# the command. Keep them LF in every checkout, including Windows ones with
+# core.autocrlf=true.
+*.sh text eol=lf

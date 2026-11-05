@@ -3998,6 +3998,12 @@ def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None,
     return new_text, None
 
 
+#: Upstream task-tag grammar (#350), retained for the new task tool. Note
+#: tags use the fork's Unicode/comment-aware `_INLINE_TAG_RE` and `_is_tag`
+#: rules below; task-local tags currently expose the narrower ASCII grammar.
+INLINE_TAG_RE = re.compile(r"(?:^|\s)#([a-zA-Z][a-zA-Z0-9_/-]*)")
+
+
 def extract_tags(
     body: str, frontmatter: dict, *, dropped: list[int] | None = None
 ) -> list[str]:

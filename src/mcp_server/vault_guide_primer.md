@@ -197,6 +197,11 @@ wikilink to a vault note titled `NodeName`.
   - [ ] Subtask
 ```
 
+`list_tasks` lists checkbox tasks across the vault (open, done or
+cancelled, with Tasks-plugin dates such as `📅 2026-11-01`) from the index,
+without reading notes. Tasks-plugin query blocks (` ```tasks ... ``` `) are
+literal text this server does not evaluate.
+
 ## Plugin syntax (Dataview, Templater, etc.)
 
 Notes may contain plugin syntax that looks executable:
@@ -261,3 +266,9 @@ Once a file is stored, embed it in a note the usual way — `![[path]]` via
 - Plugin syntax (Dataview, Templater) is literal text, not code to run.
 - Backlinks are computed from the link graph; query them via tools, do
   not edit source notes to "create" a backlink.
+- Checkbox tasks are indexed; `list_tasks` lists them across the vault.
+- Changes since a previous session are listed by
+  `get_changes(since=<stored cursor>)`; the `next_since` it returns is the
+  cursor to keep in your own notes for next time. Notes whose content
+  changed are also found with `order_by="content_changed"` and `since` on
+  `get_recent` / `list_notes`.

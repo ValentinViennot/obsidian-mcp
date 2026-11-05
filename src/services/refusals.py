@@ -7,7 +7,7 @@ codes, and one renderer that appends a single machine-readable final line to
 the human prose a tool already returns:
 
 ```
-MCP-REFUSAL {"code":"rate_limited","scope":"principal","limit":120,"limit_unit":"calls_per_minute","retry_after_seconds":3}
+MCP-REFUSAL {"code":"rate_limited","scope":"principal","limit":600,"limit_unit":"calls_per_minute","retry_after_seconds":1}
 ```
 
 The sentinel is line-initial and the JSON is one line, so the pair survives

@@ -281,6 +281,17 @@ async def test_guide_mentions_file_tools(vault):
     assert "non-markdown" in result
 
 
+async def test_guide_points_at_list_tasks_in_its_tasks_section(vault):
+    """`vault-guide` delta (#350): the primer's Tasks section names
+    `list_tasks`, says query blocks are not evaluated, and does not rank it."""
+    result = await tools.get_vault_guide_impl()
+    tasks = result.split("## Tasks", 1)[1].split("\n## ", 1)[0]
+    assert "`list_tasks`" in tasks
+    assert "not evaluate" in tasks
+    for word in ("MUST", "IMPORTANT", "always use", "never read"):
+        assert word not in tasks
+
+
 async def test_guide_explains_the_transfer_flow(vault):
     """An agent that cannot pass bytes has to discover the link flow here."""
     result = await tools.get_vault_guide_impl()

@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from src.config import settings
+from src.services.db_session import SESSION_TIMEZONE_SETTINGS
 from src.services.pool_budget import POOL_SIZE, POOL_OVERFLOW
 from src.services.transport_security import (
     STRICT_DB_MODES,
@@ -98,7 +99,14 @@ engine = create_async_engine(
         # index can take a few seconds each on a large vault. 10s (the old
         # value) caused QueryCanceledError on occasional notes and may have
         # left the indexer's session in a stuck state.
-        "server_settings": {"statement_timeout": "60000"},
+        #
+        # `timezone: UTC` — SQL time arithmetic (`date_trunc`, `now()::date`)
+        # must agree with the UTC the application reasons in, whatever zone
+        # the Postgres server was installed with. See `src/services/db_session.py`.
+        "server_settings": {
+            "statement_timeout": "60000",
+            **SESSION_TIMEZONE_SETTINGS,
+        },
         # **The one place engine TLS is decided** (#184), shared with
         # `alembic/env.py`. A strict `DATABASE_SSL_MODE` is an explicit
         # `ssl.SSLContext`, not asyncpg's mode string: the string path consults

@@ -144,7 +144,7 @@ async def env(engine, monkeypatch, tmp_path):
         monkeypatch.setattr(module, 'async_session', maker)
     monkeypatch.setattr(embeddings_service, 'async_session', maker, raising=False)
 
-    async def fake_embedding(_text):
+    async def fake_embedding(_text, **_kw):
         return list(UNIT)
     monkeypatch.setattr(embeddings_service, 'get_embedding', fake_embedding)
 
@@ -212,6 +212,9 @@ CALLS = [
     ('get_neighborhood', 'get_neighborhood_impl', lambda s: (('a.md',), {})),
     ('find_related', 'find_related_impl', lambda s: (('a.md',), {})),
     ('find_orphans', 'find_orphans_impl', lambda s: ((), {})),
+    ('list_tasks', 'list_tasks_impl', lambda s: ((), {})),  # #350
+    ('get_changes', 'get_changes_impl', lambda s: (('ev:0',), {})),  # #351
+    ('hybrid_search', 'hybrid_search_impl', lambda s: (('quartzite',), {'limit': 5})),  # #354
     ('create_note', 'create_note_impl', lambda s: (('new.md', 'first\n'), {})),
     ('edit_note', 'edit_note_impl', lambda s: (('new.md', 'second\n'), {})),
     ('set_frontmatter', 'set_frontmatter_impl',
@@ -269,3 +272,72 @@ async def test_every_registered_tool_stays_within_its_class_multiplier(env):
     assert not refused, f'pre-body refusals instead of real work: {refused}; {outputs}'
     # Every class was actually exercised with at least one real checkout.
     assert all(peak >= 1 for _, peak, _ in measured.values()), measured
+
+
+async def test_hybrid_search_holds_no_connection_during_the_provider_call(env, monkeypatch):
+    """#354 D2: the query is embedded before the transaction opens, so a slow
+    provider holds no pooled connection; the call's peak stays one."""
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_embedding(_text, **_kw):
+        started.set()
+        await release.wait()
+        return list(UNIT)
+
+    monkeypatch.setattr(embeddings_service, 'get_embedding', slow_embedding)
+    with identity(env):
+        env.meter.reset()
+        task = asyncio.create_task(tools.hybrid_search_impl('quartzite', limit=5))
+        await asyncio.wait_for(started.wait(), 10)
+        await asyncio.sleep(0.5)  # the provider is "slow": nothing may be checked out
+        assert env.meter.active == 0, 'a connection is held during the provider call'
+        release.set()
+        out = await asyncio.wait_for(task, 10)
+    assert 'arms: both' in out, out
+    assert max(env.meter.task_peaks.values(), default=0) <= 1
+    assert env.meter.peak <= CLASS_CONNECTIONS['embedding'] == 1
+
+
+@pytest.fixture
+def slow_reranker(monkeypatch):
+    """#367: a fake reranker that sleeps 1 s before answering, enabled."""
+    from src.services import rerank
+    from tests.fixtures.fake_reranker import FakeReranker
+
+    server = FakeReranker().start()
+    server.mode = 'sleep:1000'
+    monkeypatch.setattr(settings, 'rerank_url', server.url)
+    monkeypatch.setattr(settings, 'rerank_timeout_ms', 5000)
+    monkeypatch.setattr(rerank, '_client', None)
+    rerank._reset_state_for_tests()
+    rerank._set_enabled()
+    yield server
+    rerank._reset_state_for_tests()
+    server.stop()
+
+
+@pytest.mark.parametrize('impl', ['semantic_search_impl', 'hybrid_search_impl'])
+async def test_a_rerank_call_holds_no_connection_during_the_exchange(env, slow_reranker, impl):
+    """#367 D11: the session closes before the rerank request is sent, so a
+    reranker that takes a second holds no pooled connection; the per-tool
+    peak stays one and the class is unchanged."""
+    from src.services import rerank
+
+    with identity(env):
+        env.meter.reset()
+        task = asyncio.create_task(getattr(tools, impl)('quartzite', limit=5, rerank=True))
+        for _ in range(200):
+            if slow_reranker.requests:
+                break
+            await asyncio.sleep(0.01)
+        assert slow_reranker.requests, 'the rerank request was sent'
+        for _ in range(5):   # sampled through the reranker's sleep
+            assert env.meter.active == 0, 'a connection is held during the rerank exchange'
+            await asyncio.sleep(0.15)
+        out = await asyncio.wait_for(task, 10)
+    await rerank.close_rerank_client()
+    assert 'reranked: true (candidates: ' in out, out
+    assert max(env.meter.task_peaks.values(), default=0) <= 1
+    assert env.meter.peak <= CLASS_CONNECTIONS['embedding'] == 1
+    assert concurrency.TOOL_CLASSES['semantic_search'] == 'embedding'
+    assert concurrency.TOOL_CLASSES['hybrid_search'] == 'embedding'

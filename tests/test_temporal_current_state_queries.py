@@ -99,7 +99,8 @@ class _RecordingSession:
 
 @pytest.mark.asyncio
 async def test_semantic_search_scopes_to_current_by_default(monkeypatch):
-    async def _embed(_q):
+    async def _embed(_q, *, kind):
+        assert kind == "query"
         return [0.1, 0.2, 0.3]
 
     monkeypatch.setattr(embeddings, "get_embedding", _embed)
@@ -119,7 +120,8 @@ async def test_semantic_search_as_of_asks_for_the_version_that_was_live(monkeypa
     rather than adding to it — otherwise a point-in-time query could only ever
     return rows that are still current, which is no point-in-time query at
     all."""
-    async def _embed(_q):
+    async def _embed(_q, *, kind):
+        assert kind == "query"
         return [0.1, 0.2, 0.3]
 
     monkeypatch.setattr(embeddings, "get_embedding", _embed)
@@ -173,7 +175,8 @@ async def test_embed_note_replaces_only_the_current_vectors(monkeypatch):
     monkeypatch.setattr(embeddings.settings, "chunk_size", 1)
     monkeypatch.setattr(embeddings.settings, "chunk_overlap", 0)
 
-    async def _batch(chunks):
+    async def _batch(chunks, *, kind):
+        assert kind == "document"
         return [[0.0, 1.0]] * len(chunks)
 
     monkeypatch.setattr(embeddings, "get_embeddings_batch", _batch)
@@ -219,3 +222,29 @@ def test_the_predicate_composes_onto_a_delete():
         NoteEmbedding.note_id == 1, current_embedding_predicate()
     )
     assert CURRENT_ONLY in _sql(stmt)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_rerank_text", [False, True])
+async def test_shared_semantic_arm_never_returns_historical_candidates(with_rerank_text):
+    session = _RecordingSession()
+    await embeddings.semantic_arm_rows(
+        session, [0.1, 0.2, 0.3], overfetch=50,
+        with_rerank_text=with_rerank_text,
+    )
+    selects = [s for s in session.statements if s.startswith("SELECT")]
+    assert len(selects) == 2  # ordered query and zero-row exact fallback
+    assert all(CURRENT_ONLY in stmt for stmt in selects)
+
+
+def test_rechunk_health_does_not_count_history_only_notes():
+    assert "lv.valid_to IS NULL" in embeddings.legacy_vectors_sql()
+    assert CURRENT_ONLY in _sql(embeddings.legacy_vectors_expr())
+
+
+def test_search_evaluation_membership_and_lengths_exclude_history():
+    from scripts.search_eval.db import MEMBERSHIP_SQL, UNDER_MIN_SQL
+
+    assert "e.valid_to IS NULL" in MEMBERSHIP_SQL
+    assert "ne.valid_to IS NULL" in UNDER_MIN_SQL
+    assert "o.valid_to IS NULL" in UNDER_MIN_SQL

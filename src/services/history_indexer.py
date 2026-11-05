@@ -518,11 +518,10 @@ async def store_version(
 ) -> int:
     """Embed one historical version and add its rows. Returns the chunk count.
 
-    Chunked and cleaned by exactly the functions the ordinary pass uses, and
-    for exactly that reason: a historical vector that was produced by a
-    different cleaner or a different chunk size sits in the same column and the
-    same index as a current one, and cosine distance between them would be
-    comparing two conventions rather than two texts.
+    Historical rows retain the legacy bounded chunker and comment-aware
+    cleaner. Current rows now use heading-aware chunks with title prefixes;
+    historical rows have no reconstructed title/locator certification. They
+    remain excluded from ordinary current-state and reranked searches.
     """
     cleaned = clean_for_embedding(content)
     chunks, _truncated = chunk_text_bounded(
@@ -533,7 +532,7 @@ async def store_version(
     )
     if not chunks:
         return 0
-    vectors = await get_embeddings_batch(chunks)
+    vectors = await get_embeddings_batch(chunks, kind="document")
     if len(vectors) != len(chunks):
         # The same exactness `embed_note` demands. Partial coverage of a
         # version would store a fragment of a past that reads as the whole of

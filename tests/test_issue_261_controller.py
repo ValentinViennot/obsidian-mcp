@@ -211,7 +211,7 @@ async def test_shutdown_wakes_queued_without_grants_and_off_exemption():
     assert (await make().tool("internal", None, None, resource_class="light")).admitted
     with pytest.raises(ValueError): await make().tool("unregistered", 1, 1)
     with pytest.raises(ValueError): await make().tool("internal", 1, 1, resource_class="other")
-    assert len(TOOL_CLASSES) == 28
+    assert len(TOOL_CLASSES) == 31  # `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354)
     assert set(TOOL_CLASSES.values()) == CLASSES == {"embedding", "vector", "write", "scan", "light"}
     assert shadow_metadata(()) is None
 
@@ -221,12 +221,12 @@ def test_class_mapping_is_the_design_table():
     for tool, cls in TOOL_CLASSES.items():
         by_class.setdefault(cls, set()).add(tool)
     assert by_class == {
-        "embedding": {"semantic_search"},
+        "embedding": {"semantic_search", "hybrid_search"},
         "vector": {"find_related"},
         "write": {"create_note", "edit_note", "move_note", "delete_note", "set_frontmatter",
                   "write_file", "delete_file", "import_from_url"},
         "scan": {"keyword_search", "list_notes", "get_tags", "get_neighborhood",
-                 "find_orphans", "list_files", "note_history", "note_blame", "find_when_written"},
+                 "find_orphans", "list_files", "note_history", "note_blame", "find_when_written", "list_tasks", "get_changes"},
         "light": {"read_note", "read_file", "get_recent", "get_vault_guide", "get_backlinks",
                   "get_links", "request_upload", "check_upload", "request_download"},
     }

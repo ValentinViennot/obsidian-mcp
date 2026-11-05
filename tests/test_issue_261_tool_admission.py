@@ -252,7 +252,7 @@ def test_registry_covers_exactly_the_five_classes():
     assert concurrency.CLASSES == {'embedding', 'vector', 'write', 'scan', 'light'}
     assert set(concurrency.TOOL_CLASSES.values()) == concurrency.CLASSES
     assert 'other' not in concurrency.TOOL_CLASSES.values()
-    assert len(concurrency.TOOL_CLASSES) == 28
+    assert len(concurrency.TOOL_CLASSES) == 31  # `list_tasks` (#350), `get_changes` (#351), `hybrid_search` (#354)
 
 
 @tools._tracked('read_note', [])
@@ -295,8 +295,12 @@ async def test_sync_cleanup_failure_releases_admission_and_tool_context(configur
         return 'completed'
 
     previous = tools._current_tool_name.get()
-    with pytest.raises(RuntimeError, match='synthetic sync cleanup failure'):
-        await write_probe()
+    permission = tools.current_permission.set('readwrite')
+    try:
+        with pytest.raises(RuntimeError, match='synthetic sync cleanup failure'):
+            await write_probe()
+    finally:
+        tools.current_permission.reset(permission)
     assert controller.tools.active == controller.writers.active == 0
     assert not controller.tenants.entries and not controller.principals.entries
     assert tools._current_tool_name.get() == previous

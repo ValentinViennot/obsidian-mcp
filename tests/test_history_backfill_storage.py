@@ -192,7 +192,8 @@ async def test_a_short_provider_response_refuses_to_store_a_partial_version(
     """The exactness `embed_note` already demands. Partial coverage of a
     version stores a fragment of a past that reads as the whole of it, and
     nothing downstream could tell."""
-    async def _short(chunks):
+    async def _short(chunks, *, kind):
+        assert kind == "document"
         return [[0.0] * 8] * (len(chunks) - 1)
 
     monkeypatch.setattr(history_indexer, "get_embeddings_batch", _short)
@@ -287,7 +288,7 @@ async def test_a_note_is_committed_once(stub_reads):
 
 @pytest.mark.asyncio
 async def test_a_dry_run_writes_nothing_and_calls_no_provider(monkeypatch, stub_reads):
-    async def _explode(_chunks):
+    async def _explode(_chunks, *, kind):
         raise AssertionError("a dry run must not reach the provider")
 
     monkeypatch.setattr(history_indexer, "get_embeddings_batch", _explode)

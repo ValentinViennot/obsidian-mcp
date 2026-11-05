@@ -80,7 +80,8 @@ async def corpus(sessionmaker, monkeypatch):
     """
     monkeypatch.setattr(settings, "embedding_dimensions", DIM, raising=False)
 
-    async def _embed_query(_text):
+    async def _embed_query(_text, *, kind):
+        assert kind == "query"
         return list(PENGUIN)
 
     monkeypatch.setattr(embeddings_service, "get_embedding", _embed_query)
@@ -393,7 +394,8 @@ async def test_search_after_a_backfill_still_only_sees_the_present(
     root, _note_id = git_vault
     await backfill_vault_history(sessionmaker, root)
 
-    async def _embed_query(_text):
+    async def _embed_query(_text, *, kind):
+        assert kind == "query"
         return list(GLACIER)
 
     monkeypatch.setattr(embeddings_service, "get_embedding", _embed_query)
@@ -413,7 +415,8 @@ async def test_an_ordinary_re_embed_does_not_erase_the_history(
     root, note_id = git_vault
     await backfill_vault_history(sessionmaker, root)
 
-    async def _batch(chunks):
+    async def _batch(chunks, *, kind):
+        assert kind == "document"
         return [list(GLACIER) for _ in chunks]
 
     monkeypatch.setattr(embeddings_service, "get_embeddings_batch", _batch)
@@ -439,9 +442,19 @@ async def test_upstream_chunk_reuse_never_licenses_historical_vectors(corpus, se
 
     async with sessionmaker() as session:
         await index_state.set_state(session, KEY_EMBEDDING_FINGERPRINT, index_state.embedding_fingerprint())
+        # Give both slices valid heading-era metadata: only validity may
+        # distinguish their eligibility, not the legacy NULL-prefix guard.
+        await session.execute(text(
+            "UPDATE notes_metadata SET embedded_chunking_version = :version WHERE id = :id"
+        ), {"version": embeddings_service.CHUNKING_VERSION, "id": corpus})
+        await session.execute(text(
+            "UPDATE note_embeddings SET embed_prefix = 'alpha', heading_path = '{}', "
+            "section_ordinal = 0 WHERE note_id = :id"
+        ), {"id": corpus})
         await session.commit()
         reusable = await embeddings_service._lookup_reusable_vectors(session, corpus)
-        assert set(reusable) == {"alpha now talks about glaciers"}
+        formatter = embeddings_service.EMBEDDED_TEXT_FORMATTERS[embeddings_service.CHUNKING_VERSION]
+        assert set(reusable) == {("alpha", formatter("alpha now talks about glaciers"))}
 
 
 async def test_historical_row_cannot_pass_the_reuse_generation_interlock(corpus, sessionmaker):
@@ -454,7 +467,14 @@ async def test_historical_row_cannot_pass_the_reuse_generation_interlock(corpus,
         historical = (await session.execute(select(NoteEmbedding).where(
             NoteEmbedding.note_id == corpus, NoteEmbedding.valid_to.is_not(None)
         ))).scalar_one()
-        reused = {historical.id: historical.chunk_text}
+        # Match the new (chunk, prefix) interlock shape. A string would fail
+        # even if the SQL accidentally included historical rows.
+        reused = {historical.id: (historical.chunk_text, historical.embed_prefix)}
+        current = (await session.execute(select(NoteEmbedding).where(
+            NoteEmbedding.note_id == corpus, NoteEmbedding.valid_to.is_(None)
+        ))).scalar_one()
+        current_reused = {current.id: (current.chunk_text, current.embed_prefix)}
         await session.commit()
+        assert await embeddings_service._generation_matches(session, note, current_reused) is True
         assert await embeddings_service._generation_matches(session, note, reused) is False
         await session.rollback()

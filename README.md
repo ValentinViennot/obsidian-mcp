@@ -5,31 +5,40 @@
 [![MCP](https://img.shields.io/badge/MCP-compatible-7C3AED)](https://modelcontextprotocol.io)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16%20%2B%20pgvector-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
-**A memory system for your AI agents — stored as plain markdown you
-can open in Obsidian.**
+**Your agents' memory, in the vault you already have, reachable from
+claude.ai, ChatGPT, Claude Code and your phone.**
 
 A self-hosted [Model Context Protocol](https://modelcontextprotocol.io)
-server that gives every agent you connect a durable, shared place to
-remember things. The storage isn't a vector database you can't see
-into: it's a folder of markdown files in your Obsidian vault, backed
-by full-text and semantic search and by your own wikilink graph.
-Obsidian is the human window onto it — open a note, read exactly what
-an agent wrote about you, correct it, delete it, or take the whole
-folder somewhere else. Self-describing, too —
-agents read what you read, link what you link, and pick up your folder
-layout, frontmatter schema, and tag conventions on the first call
-instead of being briefed from scratch every session.
+server over an Obsidian vault. Three things it does that the
+alternatives mostly don't:
 
-To be precise about the scope: what the server supplies is
-MCP-accessible storage, keyword and semantic search, and graph
-operations over markdown notes, for whatever MCP clients you connect.
-The agents direct their own reads and writes. There is no automatic
-extraction, consolidation, or decay pipeline running behind them — an
-agent remembers something because it wrote a note, and forgets it
-because someone deleted one.
+- **Your existing vault, served in place.** No imposed note format, no
+  sidecar syntax, no "memory" folder you have to adopt. Agents read what
+  you read, follow your wikilinks, and pick up your folder layout,
+  frontmatter schema and tag conventions from the vault itself.
+- **Remote and multi-user.** OAuth 2.0 PKCE and API keys, so claude.ai,
+  Claude Desktop, Claude mobile, ChatGPT, Claude Code and n8n all read
+  and write the same files, each user confined to their own vault root.
+- **Writes cannot clobber.** `expected_hash` preconditions refuse an
+  edit made from a stale read, every publish is atomic and
+  no-clobber by default, deletes go to `.trash/`, and `dry_run` returns
+  the diff before anything lands.
+
+Connect from Claude Code:
+
+```bash
+claude mcp add obsidian --transport http \
+  --url "https://obsidian-mcp.<your-domain>/mcp" \
+  --header "Authorization: Bearer omcp_..."
+```
+
+In claude.ai, Claude Desktop or ChatGPT, add a custom connector at
+`https://obsidian-mcp.<your-domain>/mcp` and sign in through the OAuth
+consent page. [Connect a client](#4-connect-a-client) has the rest.
 
 Stack: Python 3.12, FastAPI, PostgreSQL with pgvector. Pluggable
-embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
+embeddings (Ollama — `bge-m3` by default, `qwen3-embedding:0.6b` in the
+reference deployment — or OpenAI `text-embedding-3-{small,large}`).
 
 ![Dashboard](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/dashboard.png)
 
@@ -45,6 +54,7 @@ embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
 - [Who this is for](#who-this-is-for)
 - [Control panel](#control-panel)
 - [Quick start](#quick-start)
+- [Versioning and compatibility](#versioning-and-compatibility)
 - [Upgrading](#upgrading)
 - [Cost expectations](#cost-expectations)
 - [The self-describing vault](#the-self-describing-vault)
@@ -90,6 +100,22 @@ some chat history I can't search.
 The semantic search and wikilink graph still work over that material,
 so retrieval is fast and conceptual. But the substrate is files you
 own, not a black box.
+
+To be precise about the scope: what the server supplies is
+MCP-accessible storage, keyword and semantic search, and graph
+operations over markdown notes, for whatever MCP clients you connect.
+The agents direct their own reads and writes. There is no extraction
+or decay pipeline running behind them, and nothing rewrites a note
+because a model judged it stale: an agent remembers something because
+it wrote a note, and forgets it because someone deleted one. By late
+2026 that is less of a contrarian position than it sounds. Every
+vendor's consolidation step (the "dreaming" or "sleep-time" job) has
+turned into a separate process you can inspect, rather than silent
+extraction inside the write path. This server keeps the agent as the
+author. The consolidation help it will grow is a hygiene report that
+proposes merges and flags duplicates, and never writes
+([#359](https://github.com/maxkuminov/obsidian-mcp/issues/359)), not
+a pipeline that edits your notes while you are not looking.
 
 <a id="1-a-shared-memory-layer-between-you-and-your-agents"></a>
 
@@ -236,21 +262,116 @@ looks the way it does.
 
 ## What's in the box
 
-The server exposes 28 MCP tools across six families, plus the auth
+The server exposes 31 MCP tools across six families, plus the auth
 and ops layer around them.
+
+Every tool is published with a `title` and MCP `ToolAnnotations`, all
+four hints set explicitly: `readOnlyHint` on the twenty-one tools that only
+read (search, read, list, graph, `list_tasks`, `get_changes`, `check_upload`), `destructiveHint` on
+the eight that can replace or remove something (`edit_note`,
+`move_note`, `delete_note`, `set_frontmatter`, `write_file`,
+`delete_file`, `import_from_url`, and `request_upload`, whose link can
+overwrite on redemption), `openWorldHint` on `import_from_url` only.
+`create_note` and `request_download` are additive. Clients that honour
+annotations run read-only tools without a per-call confirmation (Claude
+Code also runs them in parallel) and keep prompting on destructive ones.
+They are hints: the server enforces read-only credentials itself,
+regardless of what a client does with them. The `initialize` result also
+carries a short `instructions` paragraph — what the vault is, which tool
+to reach for, and the write-safety rules — for clients that load only
+tool names at session start. No description exceeds 4,000 characters on
+the wire, so none is cut off by a client's description limit.
 
 ### Search and discovery
 - `keyword_search(query, folder?, tags?, frontmatter?, limit=20)`,
-  full-text via PostgreSQL `tsvector`; the text-search config(s) are
+  full-text via PostgreSQL `tsvector`. A note's title and frontmatter
+  `aliases` rank above its body, so a query that is a note's title finds
+  that note first; its tags (frontmatter and inline `#tags`, a nested
+  `#a/b` also as `a` and `b`) are indexed below the title and above the
+  body, and `matched_in` names which of `title`, `tags` and `body`
+  matched; bare terms are ANDed, and when the full matches do not
+  fill the page, partial matches follow tagged `match: any`; every row
+  carries a `snippet:` with the matches highlighted (or `head:`, the
+  note's opening words, for a title or tags match). The text-search config(s) are
   configurable via `FTS_CONFIGS` (see
   [Full-text search language(s)](#full-text-search-languages))
-- `semantic_search(query, folder?, tags?, frontmatter?, limit=15)`,
-  vector similarity via pgvector, one preview chunk per note
-- `list_notes(folder?, limit=50)`, sorted by modified time
-- `get_recent(folder?, limit=20)`, recently changed
+- `semantic_search(query, folder?, tags?, frontmatter?, limit=15, rerank=false)`,
+  vector similarity via pgvector, one one-line preview chunk per note.
+  Notes are chunked at their headings, and each chunk is embedded under a
+  `Title > Heading > Subheading` context prefix. A fresh row names the
+  section it matched: `§ "Plan/Risks" (#7)` or `§ (top of note)`, and
+  `read_note(path, section="#7")` reads exactly that section. Previews start
+  on a word; a section too short to stand alone (under 200 characters) is
+  grouped with its neighbour, so a preview can include an inner heading line
+  and its `§` names the enclosing section. Stale rows,
+  and rows not yet re-embedded since the upgrade to heading-aware chunks,
+  carry no locator. While any of your notes is still on the old chunking,
+  each response says so on an `index_transition:` line under its header
+- `hybrid_search(query, limit=10, folder?, tags?, frontmatter?, rerank=false)`, both
+  of the above fused by reciprocal rank fusion over each arm's top 50, one
+  line per note with its fused score, each arm's rank and the `1/(k+rank)`
+  terms behind the score. The three are peers, and every description
+  carries the same routing sentence: exact identifiers, code symbols,
+  titles or known phrases go to `keyword_search`; conceptual or
+  paraphrased questions to `semantic_search`; unsure which, `hybrid_search`.
+  A single arm can beat the fusion on its own kind of query. If the
+  embedding provider is down, `hybrid_search` returns the keyword ranking
+  marked `arms: keyword-only (semantic unavailable: …)`, never silently
+  degraded: the marker is on every return path, so a keyword-only page
+  cannot pass for a fused one.
+- Every page of `semantic_search` and `hybrid_search` carries a
+  `confidence: ok | low` header token. `low` means no keyword note matched
+  all the terms and the closest semantic candidate is under
+  `SEARCH_LOW_CONFIDENCE_SIMILARITY`, with a one-line hint to try
+  `keyword_search` or `get_neighborhood` when it costs no row. Nothing is
+  filtered. The threshold ships at 0 (off: always `ok`) until you calibrate
+  it.
+- `rerank=true` on either of the last two asks an optional,
+  operator-configured reranker (`RERANK_URL`) to reorder the candidates
+  the call already fetched (at most 50 notes). Each note is scored on the
+  best of up to four of its fetched chunks, sent as the same text they were
+  embedded from (title, heading path and tags, then the chunk); a reranked
+  row's preview and `§` locator show the chunk that scored. The response is either
+  fully reranked (`reranked: true (candidates: N)`, a `rerank_score` per
+  row) or the unreranked page marked `reranked: false (<reason>)`;
+  without a reranker it answers `reranked: false (not_configured)`. Its
+  rows are one-line quoted objects, like `hybrid_search`'s
+- `list_notes(folder?, limit=50, since?, until?, order_by?, cursor?)`,
+  sorted by modified time
+- `get_recent(folder?, limit=20, since?, until?, order_by?, cursor?)`,
+  recently changed, with each modification time in UTC
+  (`YYYY-MM-DD HH:MM UTC`). On both, `order_by="content_changed"` with
+  `since` lists notes whose *content* changed (a touch or a re-sync that
+  keeps the bytes does not count); `since` is inclusive and `until`
+  exclusive, each a UTC date (`YYYY-MM-DD`, the whole day) or an ISO 8601
+  datetime with an explicit offset. Any of the four switches to keyset
+  paging with a `more: cursor=…` footer; a call with none of them is
+  unchanged
+- `get_changes(since, folder?, kinds?, by="any", limit=50)`, the change
+  feed: one line per note created, modified, moved or deleted after a
+  cursor, oldest first, each attributed to the API key or OAuth client
+  that made it (`(you)` for your own credential) or `human/sync` for an
+  edit the index discovered (Obsidian, a sync client, git). It returns
+  `next_since`, an exact `ev:<n>` cursor an agent stores in its own notes
+  for the next session; `by` is `any | me | agents | human`. Deletions say
+  why (`removed`, `not_indexable`, `quarantined`); `gap` and `reset` lines
+  say when the view is incomplete
 - `get_tags(limit=50)`, tag and count
+- `list_tasks(folder?, status="open", due_by?, scheduled_by?, tags?, limit=100, cursor?)`,
+  checkbox tasks (`- [ ]`, `- [x]`, `- [-]`, `- [/]`, …) across the vault
+  from the index, never reading a note: one line per task with its path
+  and line, Tasks-plugin dates (📅 ⏳ 🛫 ✅), priority, the task's own
+  `#tags`, its heading path and its text. Ordered by due date (undated
+  last), paged with a `next` cursor; `due_by` / `scheduled_by` mean "on
+  or before". Tasks-plugin query blocks are not evaluated. The header
+  always counts notes not yet scanned for tasks and notes whose tasks
+  could not be indexed, so an empty list is never a silent "nothing open"
 - `get_vault_guide()`, the Obsidian primer plus this vault's
   `CLAUDE.md`, served live
+- Retrieval changes are measured with `make search-eval` against
+  judgments mined from the operator's own usage log (a search followed by
+  a read of one of its results); see the
+  [search evaluation harness](docs/architecture/search.md#search-evaluation-harness-356)
 
 ### Read and write
 - `read_note(path, section?, offset=0, limit?, include_relationships=false, relationship_limit=10)` returns a **structured
@@ -423,7 +544,8 @@ origin the mint tools refuse rather than emit a localhost link.
 - `get_neighborhood(path, depth=1, limit=50)`, undirected BFS over the
   resolved-link graph, capped at depth ≤ 5 and limit ≤ 200
 - `find_related(path, limit=10)`, semantic neighbors via averaged
-  chunk embeddings and pgvector cosine distance, deduped per note
+  chunk embeddings and pgvector cosine distance, deduped per note, with
+  the same section locator and `index_transition:` line as `semantic_search`
 - `find_orphans(folder?, limit=50)`, notes with zero in or out
   resolved links
 
@@ -488,7 +610,10 @@ import ran.
 - OAuth 2.0 PKCE (S256) flow for public and confidential clients,
   including ChatGPT, Claude Desktop, and claude.ai. Dynamic registration
   defaults to both vault permission levels; the user chooses the actual
-  grant on the consent screen.
+  grant on the consent screen. A read-only grant lists 19 tools — the
+  nine write tools are left out of `tools/list` (and still refused if
+  called by name); choose read + write at consent for all 28, and
+  reconnect the client after changing a grant's scope.
 - Control panel (Jinja2, hand-written CSS, vendored Chart.js, nonce-based
   CSP) for keys, usage logs,
   indexer status, embedding-provider info, and a danger-zone reset.
@@ -531,36 +656,63 @@ See [System requirements](#system-requirements).
 
 ## vs. other Obsidian MCP servers
 
-There are several existing MCP servers for Obsidian, and most of them
-solve a different problem than this one. The lightweight ones are
-glue over Obsidian's Local REST API plugin or the filesystem: they
-let an agent reach the files, but don't build any infrastructure of
-their own. They're great if "I just want Claude to read my notes"
-is the goal and you keep Obsidian running locally.
+The field has sorted itself into two shapes since this README was
+first written, and the axis that matters is not "lightweight versus
+heavy" but **where the agent runs relative to the Obsidian app**.
 
-This server is on the other end of the spectrum: a real backend with
-a persistent index, semantic retrieval, a wikilink graph, OAuth, and
-an admin UI. The cost is Postgres and Docker. The benefit is
-everything you can build on top of that.
+**Desktop-local.** The tool talks to a running Obsidian. The [Local
+REST API plugin][rest] has shipped its own Streamable HTTP MCP server
+since 4.0.0 (2026-05-15), and 5.5.0 (2026-10-17) added `If-Match`
+conditional writes and result caps, so it is no longer "glue" but a
+real local MCP endpoint. The official [Obsidian CLI][cli] (1.12)
+reads, writes, searches and walks backlinks, and requires the app to
+be running. In-app agent plugins sit in the same group. All of these
+get the app's own metadata cache for free; none of them work on a
+headless box, and none give claude.ai or a phone a way in without you
+exposing your desktop.
 
-|  | This server | [MarkusPfundstein/mcp-obsidian][mp] | [StevenStavrakis/obsidian-mcp][sg] | [jacksteamdev/obsidian-mcp-tools][js] |
-| --- | --- | --- | --- | --- |
-| Persistent index (Postgres) | ✅ | — | — | — |
-| Semantic search (vectors) | ✅ | — | — | — |
-| Wikilink graph queries | ✅ | — | — | partial |
-| Runs without Obsidian open | ✅ | — | ✅ | — |
-| OAuth 2.0 client flow | ✅ | — | — | — |
-| Multi-user / per-user vaults | ✅ | — | — | — |
-| Admin UI + usage logs | ✅ | — | — | — |
-| Atomic writes + dry-run diffs | ✅ | — | — | — |
-| Setup tax | Postgres + Docker | Obsidian + REST plugin | Python only | Obsidian plugin |
+**Headless and remote.** The server works on the vault files directly,
+wherever they are mounted, with no Obsidian process. This server is one. [Vault Cortex][vc] (aliasunder,
+September 2026) is a single container with OAuth 2.1, SQLite FTS5 plus
+sqlite-vec fused by RRF and a local reranker, tasks and daily-note
+helpers, and a bundled Obsidian Headless Sync client; one vault per
+container, no multi-user. [StevenStavrakis/obsidian-mcp v2][sg]
+(2026-08) is a stdio server with journaled atomic writes,
+etag/`if_match` preconditions and 30-day recovery snapshots, and no
+semantic search. [jacksteamdev/obsidian-mcp-tools][js] was archived on
+2026-05-13 and is dropped from the table.
 
-[mp]: https://github.com/MarkusPfundstein/mcp-obsidian
+If Obsidian is open on the machine the agent runs on and you need no
+remote access, the official CLI or the REST plugin is the lighter
+choice. This server is for the headless, remote, multi-client and
+semantic case: nothing on the box but a container and Postgres, and
+every client you own hitting the same vault.
+
+As of 2026-10-28:
+
+|  | This server | [REST plugin MCP][rest] | [Obsidian CLI][cli] | [Vault Cortex][vc] | [StevenStavrakis v2][sg] |
+| --- | --- | --- | --- | --- | --- |
+| Runs without Obsidian | ✅ | — | — | ✅ | ✅ |
+| Semantic search | ✅ pgvector | — | — | ✅ sqlite-vec + RRF + reranker | — |
+| Wikilink graph | ✅ backlinks, neighborhood, orphans, related | backlinks | backlinks, orphans, dead ends | backlinks, outgoing, orphans | — |
+| Atomic / journaled writes | ✅ staged, fsync, no-clobber publish | ? | ? | ✅ temp + rename | ✅ journaled, rollback, snapshots |
+| Write preconditions (hash / etag) | ✅ `expected_hash` | ✅ `If-Match` (5.5.0) | — | — | ✅ `if_match` |
+| Dry-run diff | ✅ | — | — | — | — |
+| Soft-delete to trash | ✅ `.trash/` | ? | ✅ | ✅ | ✅ 30-day snapshots |
+| Multi-user vault roots | ✅ | — | — | — | — (multi-vault, one user) |
+| OAuth for claude.ai / ChatGPT | ✅ 2.0 PKCE + API keys | — (API key) | n/a | ✅ 2.1 PKCE + DCR | n/a (stdio) |
+| Audit log | ✅ per call, in the panel | ? | — | server logs | transaction journal |
+| Setup tax | Postgres + Docker | Obsidian + plugin | Obsidian 1.12 | one container (Sync subscription for the remote image) | Node 22 |
+
+[rest]: https://github.com/coddingtonbear/obsidian-local-rest-api
+[cli]: https://obsidian.md/help/cli
+[vc]: https://github.com/aliasunder/vault-cortex
 [sg]: https://github.com/StevenStavrakis/obsidian-mcp
 [js]: https://github.com/jacksteamdev/obsidian-mcp-tools
 
-Comparison reflects each project's documented features at time of
-writing; verify the specifics before betting on them.
+The table reflects each project's documented features on that date,
+read from their READMEs and release notes; a `?` means I could not
+confirm it either way. Verify the specifics before betting on them.
 
 ### vs. hosted memory systems
 
@@ -572,7 +724,32 @@ people usually reach for. What follows is about that architecture —
 memory behind a service boundary — not about any one product's current
 feature list, which moves faster than a README can track.
 
-The difference is where the memory lives and who can open it.
+One thing has changed since that paragraph was first true: files
+plus search is now the mainstream substrate, not the odd one out.
+Letta's MemFS is git-backed markdown; Claude Code's auto-memory is a
+`MEMORY.md` index plus topic files; Anthropic's memory tool is a file
+directory; OpenClaw and Hermes keep markdown workspaces. "Readable
+markdown memory" on its own no longer sets this server apart. The
+closest comparables are [Basic Memory][bm] (markdown plus a SQLite or
+Postgres index, hybrid search, an optional reranker, structured
+frontmatter filters; its own folder and note format, AGPL, with a paid
+cloud) and [doobidoo/mcp-memory-service][dm] (self-hosted, remote MCP
+over OAuth, opaque memory records rather than files). Against those,
+the differences are five, and plain:
+
+1. The existing vault, served in place, with no imposed folder or
+   note format.
+2. Remote and multi-user over OAuth, one vault root per user.
+3. Destructive-write guards: `expected_hash`, atomic no-clobber
+   publish, `.trash/`, dry-run diffs.
+4. MIT.
+5. No hosted tier, and none planned.
+
+[bm]: https://github.com/basicmachines-co/basic-memory
+[dm]: https://github.com/doobidoo/mcp-memory-service
+
+The difference from memory-as-a-service is where the memory lives and
+who can open it.
 
 - **Readability.** When memory sits behind a service API, reading it
   means whatever endpoint or console the service exposes, in whatever
@@ -606,6 +783,8 @@ reconciling ones that contradict each other, and scoring relevance or
 decaying old memories so they stop crowding out new ones. Here an
 agent remembers something because it decided to write a note, and the
 judgment about what's worth keeping is the agent's, not the server's.
+The consolidation help planned here is a report that proposes and
+never writes ([#359](https://github.com/maxkuminov/obsidian-mcp/issues/359)).
 If you want memory that curates itself, that's a fair reason to pick
 the other shape.
 
@@ -670,8 +849,11 @@ vault was in git at all.
 ### Who this isn't for
 
 - "I just want Claude to read my notes" with the lightest possible
-  setup. Use one of the filesystem-glue projects above; you don't
-  need this.
+  setup. Use one of the desktop-local tools above; you don't need
+  this.
+- Obsidian is open on the machine the agent runs on and you need no
+  remote access. The official CLI or the Local REST API plugin's MCP
+  server is the lighter choice.
 - Anyone unwilling to run a database. There is no SQLite fallback;
   pgvector is doing real work, and a managed Postgres with
   pgvector support is part of the stack.
@@ -701,6 +883,21 @@ separate OAuth 2.0 PKCE flow for clients like ChatGPT, Claude Desktop,
 and claude.ai that expect a proper authorization-code dance. The OAuth
 server supports public (`none`) and confidential (`client_secret_post`)
 token-endpoint authentication plus refresh tokens.
+
+Clients identify themselves in one of two ways:
+- **A Client ID Metadata Document** (CIMD, the MCP 2026-07-28 default). The
+  client's `client_id` is an `https` URL to a JSON document it publishes, and
+  the server fetches it through the same hardened, SSRF-guarded client as
+  `import_from_url`. Claude (claude.ai, Desktop, mobile), Claude Code and
+  ChatGPT use this whenever the server advertises it, which it does by default.
+  Claude Code's loopback callback (`http://localhost:<any port>/callback`) works
+  this way.
+- **Dynamic Client Registration** (`/register`, RFC 7591, deprecated by MCP but
+  kept) remains the fallback for any client that sends no URL.
+
+The consent page names a CIMD client by the **host** its document was fetched
+from, never by the name the document gives itself. Every authorization
+response carries the RFC 9207 `iss` parameter.
 
 Each client's page lists its grants — one row per `/authorize` approval,
 not per token — with a Revoke control and a permission select per grant,
@@ -752,9 +949,11 @@ The bundled Caddy configuration fails closed on `/admin`, `/api`, and
 - Docker and Docker Compose
 - A PostgreSQL 16 instance reachable from the container, with
   `pgvector` **0.8.0 or newer** installed
-- Either an Ollama instance running `bge-m3`, or an OpenAI API key.
-  Anything that speaks the OpenAI embeddings protocol works (Azure
-  OpenAI, OpenRouter, Together, etc.).
+- Either an Ollama instance running an embedding model (`bge-m3`, the
+  default, or `qwen3-embedding:0.6b`, which the reference deployment
+  runs; see [Embedding model choice](#embedding-model-choice)), or an
+  OpenAI API key. Anything that speaks the OpenAI embeddings protocol
+  works (Azure OpenAI, OpenRouter, Together, etc.).
 - Linux, kernel 5.6 or newer (see below)
 
 ### System requirements
@@ -848,7 +1047,11 @@ EMBEDDING_DIMENSIONS=1024
 ```
 
 This is the default. Omitting `EMBEDDING_PROVIDER` falls back to
-Ollama.
+Ollama. On a new install, consider `qwen3-embedding:0.6b` (also 1024
+dimensions) with a query instruction, which is what the reference
+deployment runs; read [Embedding model choice](#embedding-model-choice)
+before the first index pass, because changing the model later means a
+full re-embed.
 
 The embedding URL must be `https`, or `http` to a loopback host
 (`localhost`, `127.x`, `::1`). Plaintext `http` to any other host —
@@ -871,6 +1074,12 @@ make deploy     # build, push to local registry, run migrations, recreate contai
 The first deploy backfills the index, the wikilink graph, and the
 embeddings. For a 2 to 3k-note vault on Ollama with a GPU this takes
 a few minutes. On `text-embedding-3-small` it's seconds.
+
+Prebuilt images are public at `ghcr.io/maxkuminov/obsidian-mcp`
+(`:v<release>` per release tag, `:main` for the tip), built and scanned
+by CI; a release tag is the image CI proved for that commit, retagged,
+never rebuilt. `docker pull ghcr.io/maxkuminov/obsidian-mcp:v<release>`
+needs no token. Or build locally as above.
 
 ### 4. Connect a client
 
@@ -906,11 +1115,280 @@ The first thing any agent should do in a new session is call
 `get_vault_guide()`. That's how it learns your folder structure,
 naming conventions, and YAML schema before it writes anything.
 
+## Versioning and compatibility
+
+From 1.0 the version number is a promise about the MCP tool contract:
+the 28 tools' names, their argument schemas, the shape of their result
+lines, and the `MCP-REFUSAL` codes. An agent written against 1.0 keeps
+working against every 1.x.
+
+- **The wire form is pinned.** `tests/fixtures/tools_list_full_v1.json`
+  is the complete `tools/list` result an API key or a `readwrite` OAuth
+  grant sees (every field of all 28 tools), and
+  `tests/fixtures/tools_list_readonly_oauth.json` pins the 19 names a
+  read-only OAuth grant lists. CI fails on any drift; a deliberate change
+  regenerates the fixture and says so in its spec. Result line shapes
+  are specified in `openspec/specs/` and pinned by each tool's tests,
+  not by one fixture.
+- **Refusal codes are a closed set.** Every code an `MCP-REFUSAL` line can
+  carry is declared in `src/services/refusals.py` (`CODES`), and a refusal
+  with any other code cannot be constructed. That module is the catalogue;
+  there is no separate list. The transport 429s (failed authentication,
+  transfer redemption, `body_memory`) are outside that line by design.
+- **Within 1.x, additions only:** new tools, new optional arguments whose
+  default leaves the old result byte-identical, new header tokens or
+  trailing fields, new refusal codes. Never a rename, a removal, a changed
+  default that alters an existing result, or a changed meaning of an
+  existing field or code. A change of that kind is 2.0, announced one
+  minor release earlier in the release notes. Unknown arguments are
+  refused, so a client that sends a newer argument to an older server gets
+  a refusal, not a silently ignored filter.
+- **Settings.** A new setting ships with a default that keeps the previous
+  behaviour. Every setting change is in the release's upgrade notes, in
+  the [Configuration](#configuration) table and in `.env.example`.
+- **Schema.** Every release names its migrations and says whether they
+  refuse startup or need a rebuild or re-embed, and
+  [`DEPLOYMENT.md`](./DEPLOYMENT.md) documents each one's downgrade (it
+  does so for every migration from 033 on).
+
+Not part of the contract: the control panel and its `/api/*` endpoints,
+log fields, the search-evaluation harness (`scripts/search_eval/`), the
+internal MCP SDK version, and ranking quality. Which notes come back, and
+in what order, moves with the index, the embedding model and the
+reranker; the harness measures it
+([docs/architecture/search.md](./docs/architecture/search.md#search-evaluation-harness-356)).
+`MCP_SANDBOX_MODE`, the registry-evaluation switch, is outside the promise
+too.
+
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
-run on start. Read this first when upgrading across the internal-transport
-and panel-CSP release:
+run on start.
+
+Across the OIDC account-linking release (migration 037, #416):
+
+- **Migration 037** adds six nullable link columns and five
+  constraints to `users`, with no backfill, and takes seconds. With
+  SSO off nothing else changes. Its downgrade drops every link.
+- **`OIDC_SUBJECT_USER_IDS` is retired.** A deployment that still sets
+  it refuses to start. If yours did, do this in order (it is also in
+  the startup message): (1) on the old release, confirm a local admin
+  password works; (2) set `LOCAL_LOGIN_ENABLED=true`; (3) copy the
+  map's subject-to-user pairs, then remove the `OIDC_SUBJECT_USER_IDS`
+  line (delete it; an empty `OIDC_SUBJECT_USER_IDS=` fails to parse at
+  startup); (4) deploy and start; (5) sign in with the password and, on each
+  user's edit page, **Single sign-on → Bind subject** with their
+  former subject; (6) verify an SSO sign-in per user and one MCP
+  client's `/authorize` consent; (7) optionally set
+  `LOCAL_LOGIN_ENABLED=false` again, once the startup log shows no
+  CRITICAL lockout line. Details:
+  [docs/native-oidc.md, "Upgrading from OIDC_SUBJECT_USER_IDS"](./docs/native-oidc.md#upgrading-from-oidc_subject_user_ids).
+- **Wider provider profile.** RS256, PS256 and ES256 ID tokens (as
+  advertised by discovery), `client_secret_post` via
+  `OIDC_TOKEN_AUTH_METHOD`, `OIDC_EXTRA_SCOPES`, `OIDC_DISPLAY_NAME`
+  and `OIDC_CA_FILE` are new. `OIDC_REQUIRED_GROUP` is now optional;
+  set, it works as before. The requested scopes become
+  `openid email profile`. A provider that advertises RFC 9207 must now
+  return `iss` on the callback.
+- SSO logins now stamp the user's last-login time.
+
+Across the reranker-documents release (#402):
+
+- **No migration, nothing re-derived or re-embedded.** `rerank=true` now
+  sends each candidate note's embedding input (title, heading path, tags,
+  then the chunk) for its cosine-best chunk and up to three more of its
+  already-fetched chunks, at most `RERANK_MAX_DOCUMENTS` per call (new,
+  default 100, 50–200; `50` restores the previous count); a note scores
+  the best of its documents. `rerank=false` is byte-identical. The usage
+  row gains `rerank_documents`.
+- **`RERANK_TIMEOUT_MS` accepts 100–30000**; the default stays 1,500.
+  Size it with the document budget: `RERANK_TIMEOUT_MS ≥
+  RERANK_MAX_DOCUMENTS × average characters × per-character cost`,
+  doubled when the GPU is shared with the embedding model. The
+  reference deployment runs `20000`
+  ([DEPLOYMENT.md, "Reranker (optional)"](./DEPLOYMENT.md#reranker-optional)).
+  Under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below
+  `MCP_CONCURRENCY_WAIT_SECONDS × 1000` unless `make concurrency-report`
+  passes with `rerank=true` traffic.
+- **Rollback** is a redeploy of the previous image. Set
+  `RERANK_TIMEOUT_MS` to 10000 or less first: the previous image's range
+  ends there and refuses to start above it.
+
+Across the Client ID Metadata Documents release (migration 036, #357):
+
+- **Migration 036** adds one nullable column and one CHECK to
+  `oauth_clients`, with no backfill, and takes seconds. Its downgrade refuses while CIMD clients
+  exist (delete them in the panel first).
+- **Connectors switch to CIMD on their next connection.** Existing DCR
+  grants keep working. claude.ai, Claude Code and ChatGPT stop calling
+  `/register`. `OAUTH_CIMD_ENABLED=false` is the rollback lever.
+- **Every authorization redirect now carries `iss`** (RFC 9207). A client
+  that compares it does so against the metadata `issuer`, which is
+  unchanged.
+- **`resource` (RFC 8707) is logged, not enforced.** Each `/authorize` and
+  `/token` request is classified (`resource_class`) in the security log.
+  Refusing a foreign `resource` is a later change, gated on 14 days of these
+  logs ([DEPLOYMENT.md](./DEPLOYMENT.md#oauth-cimd-and-the-resource-gate-357)).
+- **The consent page's CSP** gains `form-action http://localhost:* http://127.0.0.1:*`
+  for native loopback callbacks.
+
+Across the scoped tools/list release (#358):
+
+- **No migration and no setting.** An OAuth grant without `readwrite`
+  now lists 19 tools: the nine write-required tools (`create_note`,
+  `edit_note`, `move_note`, `delete_note`, `set_frontmatter`,
+  `write_file`, `delete_file`, `import_from_url`, `request_upload`) are
+  left out. API keys of either permission and `readwrite` grants still
+  list all 28, byte-identical to before. A read-only client that cached
+  the 28 and calls a hidden tool gets `permission_denied`, as before.
+- **No `list_changed` is sent.** After a grant's scope is changed in the
+  panel, the connector sees the new list when it reconnects.
+- **One refusal changes for read-only callers.** The refusals
+  `write_file` / `delete_file` made before their permission check (a
+  malformed `expected_hash`, `no_incumbent` for
+  `write_file(overwrite=false)`) are now `permission_denied`; a
+  `readwrite` caller's refusals are unchanged.
+
+Across the keyword-tags release (migration 035, #391):
+
+- **Tags become searchable at once.** Migration 035 adds each note's tags
+  to its keyword vector in place, in SQL, under the index generation lock
+  (tens of seconds on a few thousand notes); nothing is re-embedded or
+  re-derived and no setting is new. `make deploy` stops the app before
+  the migration; on a hand-driven compose stack: stop → `alembic upgrade
+  head` → start.
+- **Run the read-only check first.** 035 aborts with nothing written if a
+  tagged vector would cross PostgreSQL's 1 MiB tsvector limit; under
+  Kubernetes `Recreate` that is downtime until the digest is reverted.
+  [DEPLOYMENT.md, "Upgrading across migration 035"](./DEPLOYMENT.md#upgrading-across-migration-035-tags-in-keyword-search-391)
+  has the statement to run against the live database before merging and
+  the remedy.
+- **Rollback**: `alembic downgrade 034` with the new image strips the
+  tags part, then deploy the previous image.
+
+Across the chunk-minimum release (`CHUNKING_VERSION` 2, #390):
+
+- **No migration and no new setting, but a second gradual re-embed.**
+  Chunks shorter than 200 characters are no longer stored (a short
+  section is grouped with its neighbours), windows are cut at a line or
+  word start, and long whitespace runs are sent collapsed. Startup does
+  not refuse; every note is selected again in the background under the
+  per-tenant embed budgets.
+- **Until your notes drain**, the `index_transition: N notes not yet
+  re-chunked; …` line returns on `semantic_search`, `find_related` and
+  `hybrid_search`, and `/health` reads `indexer.rechunk: "in_progress"`,
+  then `"complete"`. A section that did not change keeps its vector;
+  each pass logs `Embedding complete: N notes, X chunks (S submitted, R
+  reused)`.
+- **Rollback** is a redeploy of the previous image, which re-embeds
+  every note stamped 2 in full
+  ([DEPLOYMENT.md](./DEPLOYMENT.md#upgrading-to-chunking-version-2-390-minimum-chunk-length)).
+
+Across the search-confidence release (#389):
+
+- **No migration.** Every `semantic_search` and `hybrid_search` page gains
+  one header token: ` — confidence: ok` (at the default threshold 0 that is
+  the only byte that changes). A parser that matched the old header
+  exactly needs to allow it. Usage rows gain `confidence`,
+  `top_similarity` and (hybrid) `keyword_all`. One optional setting,
+  `SEARCH_LOW_CONFIDENCE_SIMILARITY` (default 0 = off); leave it at 0 until
+  the calibration recipe in `DEPLOYMENT.md` passes for both tools.
+- **The search-eval harness** reports recall@20 and recall@50, runs at
+  `--depth` 50 by default and writes `report.json` `schema_version` 2; a
+  `runfile:` baseline staged at depth 20 scores a null recall@50, so re-run
+  it for a delta. It gains a `confidence` subcommand.
+- **Rollback** is a redeploy of the previous image; the new usage keys stay
+  and are ignored.
+
+Across the reranker release (#367):
+
+- **No migration, nothing re-derived or re-embedded.** `semantic_search`
+  and `hybrid_search` gain an optional `rerank` argument (default false,
+  output unchanged), and four optional settings (`RERANK_URL`,
+  `RERANK_MODEL`, `RERANK_TIMEOUT_MS`, `RERANK_ALLOW_PLAINTEXT`). Nothing
+  changes until you set `RERANK_URL`. The concurrency class mapping is
+  unchanged, so readiness evidence carries over. A reference setup is in
+  [Reranker reference setup](#reranker-reference-setup).
+- **Rollback** is a redeploy of the previous image. A client that keeps
+  sending `rerank` is then refused by the unknown-argument rule, which is
+  the normal cost of rolling back a new argument.
+
+Across the hybrid-search release (#354):
+
+- **No migration, nothing re-derived or re-embedded.** A new tool,
+  `hybrid_search`, and one optional setting, `HYBRID_RRF_K` (default 60).
+- **A new concurrency-readiness epoch.** `hybrid_search` shares the
+  `embedding` class with `semantic_search`, so `CLASS_MAPPING_VERSION`
+  moves to 5 and `make concurrency-report` evidence gathered before the
+  upgrade does not carry over.
+- **Rollback** is a redeploy of the previous image; the tool's usage rows
+  stay and are ignored.
+
+Across the change-feed release (migration 033, #351):
+
+- **One migration, no re-derive.** 033 adds
+  `notes_metadata.content_changed_at` (backfilled from each note's
+  modification time) and three change-feed tables. Nothing is re-parsed
+  or re-embedded. The feed starts with the first pass after the upgrade;
+  nothing before 033 has events.
+- **The feed tables are durable.** `make db-backup` and the Kubernetes
+  backup Job dump their rows (history, cursors and retention watermarks
+  cannot be rebuilt from the vault). A restore rolls the feed back to the
+  dump, so a cursor taken after it is refused and the agent restarts from
+  a date.
+- **A new concurrency-readiness epoch.** `get_changes` joins the `scan`
+  class, so `CLASS_MAPPING_VERSION` moves to 4 and `make
+  concurrency-report` evidence gathered before the upgrade does not carry
+  over.
+- **Four new settings**, all with working defaults:
+  `CHANGE_FEED_RETENTION_DAYS`, `CHANGE_FEED_MAX_EVENTS_PER_SCOPE`,
+  `CHANGE_FEED_MAX_EVENTS_PER_PASS`, `CHANGE_FEED_LOCK_TIMEOUT_MS` (see
+  [Configuration](#configuration)).
+- **Rollback**: the previous image neither reads nor writes any of these
+  objects; `alembic downgrade 032` drops them and loses only the feed's
+  history.
+
+Across the task-listing release (migration 032, #350):
+
+- **One full re-derive pass after the upgrade, and no re-embedding.**
+  The extraction version moves to 4, so the first pass re-parses every
+  note once and stores its checkbox tasks for the new `list_tasks` tool
+  — the same cost as the earlier extraction-version bumps. Version 4
+  shares version 3's embedding cleaner, so nothing is re-embedded and no
+  provider call is made. Until that pass finishes, `list_tasks` reports
+  the notes it has not scanned yet in its header, and
+  `move_note(rewrite_links=True)` refuses with `index_not_ready` as it
+  does after every bump.
+- **A new concurrency-readiness epoch.** `list_tasks` joins the `scan`
+  class, so `CLASS_MAPPING_VERSION` moves to 3 and
+  `make concurrency-report` evidence gathered before the upgrade does not
+  carry over.
+- **Rollback is roll-forward.** A bare redeploy of the previous image
+  re-extracts every note once, and because it has no version-4 cleaner it
+  also clears every note's embedding certification; the embed pass then
+  re-chunks every note and reuses every stored vector (no provider calls),
+  with `semantic_search` marking those notes stale until it catches up.
+  Rolling forward again is one more re-derive pass.
+- No new setting.
+
+Read this first when upgrading across the keyword-ranking release
+(migration 031, #344):
+
+- **Keyword ranking changes at once; snippets need one rebuild.**
+  Migration 031 rewrites every keyword vector in place so titles and
+  aliases rank above bodies — no operator step, and `make deploy` now
+  **stops the app before a pending migration** and recreates it after
+  (on a hand-driven compose stack: stop → `alembic upgrade head` →
+  start; Kubernetes already `Recreate`s). Snippets come from an excerpt
+  that only a write stores, so notes indexed before 031 show no snippet
+  (the header counts them and startup logs the count) until they are
+  edited or you run **`make rebuild-tsvectors` once** (on Kubernetes,
+  `deploy/kubernetes/base/rebuild-tsvectors-job.example.yaml` with the
+  app scaled to zero). No embeddings are touched, no API calls are made.
+- **New optional settings:** `RANK_WEIGHTS`, `KEYWORD_EXCERPT_CHARS`,
+  `KEYWORD_SNIPPET_ROWS`. See [Configuration](#configuration).
+
+And across the internal-transport and panel-CSP release:
 
 - **Breaking: the server refuses to run as a PostgreSQL superuser
   (#324).** A Compose install created from `docker-compose.yml` or
@@ -992,9 +1470,11 @@ authoritative about its own rules.
 
 `get_vault_guide()` does exactly this. It returns a generic Obsidian
 primer (wikilink syntax, embed syntax, tag conventions, common plugin
-literals) plus the vault's `CLAUDE.md` live. The hint to call it first
-is baked into the write-tool descriptions so the agent gets pulled
-into the right behavior even without prompting.
+literals) plus the vault's `CLAUDE.md` live. The write-tool
+descriptions and the server's `instructions` both point at it — as a
+description of where the vault's conventions live, not as an order —
+so the agent gets pulled into the right behavior even without
+prompting.
 
 ## Multi-user mode
 
@@ -1074,6 +1554,42 @@ session cookies disappear, and the panel falls back to its
 Traefik-OAuth-only mode. The schema stays in place, so flipping back
 to multi-user later resumes where you left off without re-bootstrapping
 (the `users` table is non-empty, so `/admin/register` is closed).
+
+### Single sign-on (optional)
+
+Multi-user deployments can add "Sign in with SSO" through any
+standards-compliant OpenID Connect provider (Keycloak, Authentik,
+Authelia, Zitadel, Kanidm, Okta, Entra ID, …). It is off by default
+(`OIDC_ENABLED=false`), and with it off nothing changes.
+
+- **It signs in existing accounts only.** An admin links each account
+  on its edit page, **Single sign-on** card: **Expect email** (the
+  first sign-in within 7 days whose provider-*verified* email matches
+  links the account, once) or **Bind subject** (paste the provider's
+  `sub`, linked immediately). After that only the provider's issuer
+  and subject identify the user; a renamed or re-addressed provider
+  account changes nothing. An identity that is not linked is refused
+  with a page that does not say why.
+- **No provisioning, no role mapping.** Signing in never creates a
+  user, changes the admin flag or assigns a vault, and
+  `/admin/register` is closed while SSO is on. Create users first.
+- **The server stays the OAuth server for MCP clients.** SSO only
+  changes how the panel session is made; that session also covers the
+  consent page, so connecting a client can go through SSO. API keys,
+  grants and tokens are unchanged.
+- **Password login stays** unless you set `LOCAL_LOGIN_ENABLED=false`.
+  While it is off, the panel refuses any change that would leave no
+  active admin linked to SSO, and startup logs a CRITICAL line if
+  there is none. Re-enabling it and restarting is the recovery path.
+- **Unlinking** clears the link and signs that user out everywhere.
+  Removing someone at the provider stops new logins but does not end
+  their existing sessions, keys or grants: deactivate the local
+  account for that.
+
+[docs/native-oidc.md](./docs/native-oidc.md) has the provider
+requirements, every setting, a click-by-click Keycloak walkthrough,
+the setup order, break-glass recovery and troubleshooting by refusal
+reason.
 
 ### Constraints and known limits
 
@@ -1278,6 +1794,10 @@ the same fail-closed state a local user with no assignment is already in.
 | `VAULT_PATH` | `/obsidian` | In-container vault mount |
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
+| `CHANGE_FEED_RETENTION_DAYS` | `90` | How long `get_changes` history is kept, in days (1–3650). `null` (or empty) disables the age limit; `0` is refused at startup. Pruned by the periodic tick, never during a pass; a cursor older than what survives reads `history_truncated: true`. |
+| `CHANGE_FEED_MAX_EVENTS_PER_SCOPE` | `100000` | The most change-feed events kept per user (minimum 1,000). Always applies, even with the age limit off, so the table stays bounded; a scope's newest event is never pruned. |
+| `CHANGE_FEED_MAX_EVENTS_PER_PASS` | `2000` | Events one index pass itemises per user (100–50,000); the rest become one `gap` line pointing at `get_recent(order_by="content_changed", since=…)`. |
+| `CHANGE_FEED_LOCK_TIMEOUT_MS` | `2000` | How long an event write waits for the user's feed lock (100–30,000). A timeout never fails a pass or a tool: a pass records a durable `gap`, a tool's change is recorded unattributed by the next pass. |
 | `INDEXER_DEGRADED_AFTER_FAILURES` | `3` | Consecutive failures of any indexer counter (a scope's index passes, its embed passes, its incomplete re-derives, or the tick's own user enumeration) at which `/health` reports `degraded` and one CRITICAL "manual intervention required" line is logged. |
 | `INDEXER_QUARANTINE_RETRIES_PER_TICK` | `5` | How many times one index pass may roll back and re-run a scope after quarantining a note the database refuses (a data-exception or program-limit error on its row, keyword vector, move or links). Beyond it the pass fails as an ordinary failure; the notes already found stay quarantined for the next tick. |
 | `MULTI_USER_MODE` | `false` | In-app login, per-user vaults. See [Multi-user mode](#multi-user-mode). |
@@ -1295,15 +1815,33 @@ the same fail-closed state a local user with no assignment is already in.
 | `ALLOWED_HOSTS` | derived | Accepted `Host` headers, JSON list. `localhost` is always added. |
 | `SESSION_MAX_AGE` | `604800` | Panel session lifetime, seconds (multi-user mode). Absolute — the server-side row is never extended, so a session used daily still expires |
 | `SESSION_COOKIE_NAME` | `omcp_session` | Panel session cookie name |
+| `LOCAL_LOGIN_ENABLED` | `true` | The panel's password form (multi-user mode). `false` hides it and refuses its POST; multi-user mode needs this or `OIDC_ENABLED`. Setting it back to `true` and restarting is the recovery path when SSO is unavailable. See [docs/native-oidc.md](./docs/native-oidc.md#recovery-break-glass). |
+| `OIDC_ENABLED` | `false` | Browser SSO through an OpenID Connect provider ([Single sign-on](#single-sign-on-optional)). Requires multi-user mode and an HTTPS `BASE_URL`; refused in sandbox mode. The `OIDC_*` settings below are validated only when it is `true`, without contacting the provider. |
+| `OIDC_ISSUER` | — | Required with SSO. HTTPS issuer URL exactly as the provider's discovery `issuer` states it; no query or fragment; at most 2,048 characters. |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | — | Required with SSO. The confidential client registered at the provider, redirect URI `<BASE_URL>/admin/auth/oidc/callback`. Keep the secret in your secret store. |
+| `OIDC_TOKEN_AUTH_METHOD` | `client_secret_basic` | `client_secret_basic` (Authorization header) or `client_secret_post` (form body). A login is refused when discovery lists auth methods without this one. |
+| `OIDC_REQUIRED_GROUP` | — | Optional. When set (at most 512 characters), the ID token's `groups` array must contain this exact, case-sensitive string. Empty means no group check. |
+| `OIDC_EXTRA_SCOPES` | — | Extra scopes requested after `openid email profile`: space-separated RFC 6749 scope tokens, at most 8 of at most 64 characters. `offline_access` is refused at startup. |
+| `OIDC_DISPLAY_NAME` | `SSO` | The login button reads "Sign in with {name}". 1–40 printable characters. |
+| `OIDC_CA_FILE` | — | PEM CA file trusted for the provider requests only, for an issuer behind a private CA; when set, only this file is trusted for them. Unset, empty or `off` uses the certifi bundle. Refused if unreadable or holding no CA. |
+| `OIDC_SUBJECT_USER_IDS` | — | **Retired.** Any non-empty value refuses startup; links are made in the panel. See [Upgrading](#upgrading) and [docs/native-oidc.md](./docs/native-oidc.md#upgrading-from-oidc_subject_user_ids). |
 | `PANEL_CSP` | `enforce` | Content-Security-Policy on the panel, login and consent pages: `enforce`, `report-only` (same policy, reports only), or `off`. A rollback lever — change it and recreate the container, no rebuild. Anything but `enforce` logs a WARNING at each start. |
 | `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may get before a validated `GET`/`HEAD` rewrites it. Telemetry only — nothing authorizes on it. Must be ≥ 1. |
 | `SESSION_PURGE_RETAIN_DAYS` | `7` | How long a dead panel session row is kept, measured from the *later* of its expiry and its revocation, so a revocation stays visible for the full window. Must be ≥ 1. |
 | `OAUTH_KNOWN_REDIRECT_HOSTS` | `claude.ai,chatgpt.com` | Redirect **hosts** the consent screen badges as known connector destinations. JSON or CSV. Matched by exact host equality — no wildcards, no suffixes; entries containing `*`, `/`, `@` or internal whitespace are refused at startup. An empty list means every client is shown as unverified. |
+| `OAUTH_CIMD_ENABLED` | `true` | Accept OAuth Client ID Metadata Documents (an `https` URL as `client_id`) and advertise `client_id_metadata_document_supported`. `false` removes the flag, so clients fall back to `/register`; existing CIMD grants keep refreshing. |
+| `OAUTH_CIMD_CACHE_MAX_SECONDS` | `86400` | Ceiling on how long a fetched client metadata document is cached (its `Cache-Control: max-age`; 300 s when absent; `no-store` is honoured). 0–86400; `0` never caches. |
+| `OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE` | `10` | Client metadata document fetches one client address may start per minute (1–120). Cache hits and requests joining an in-progress fetch spend nothing. Fetches are also capped at one in flight per address and eight per server. |
 | `OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS` | `90` | Absolute lifetime of an OAuth grant, in whole days (1–365), counted from when the application first receives its tokens. Refresh never extends it; after it the user must approve again. Stated on the consent page. **No off value** — empty, `null`, `none` and `0` refuse to start. Lowering it applies to every grant at its next request; raising it extends existing grants. |
 | `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds what the server reads from disk |
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
 | `FTS_CONFIGS` | `english` | Keyword-search text-search config(s). JSON or CSV. See [Full-text search language(s)](#full-text-search-languages). |
+| `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weight array `{D, C, B, A}`: the title and aliases are indexed at `A`, the tags at `B`, the body at `D` (`C` is unused). At the default one two-word title match outweighs fifty body repetitions, and one tag match ranks below a title match and equals twenty body matches; PostgreSQL's own `D=0.1` lets ten body repetitions tie the title. Four finite numbers, each in [1e-6, 1]; body-only order never moves. |
+| `KEYWORD_EXCERPT_CHARS` | `20000` | Leading characters of each note's indexed text stored for `keyword_search` snippets (1000–100000). Applies to notes indexed afterwards; `make rebuild-tsvectors` rewrites the rest. The snippet cost grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
+| `KEYWORD_SNIPPET_ROWS` | `20` | Rows per `keyword_search` page that get a snippet, whatever `limit` is (0–100; 0 turns snippets off). Bounds the per-call `ts_headline` cost, which grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
+| `SEARCH_LOW_CONFIDENCE_SIMILARITY` | `0` | Where `semantic_search` and `hybrid_search` start reading `confidence: low` (#389): no keyword note matched all terms and the best similarity of the call's candidates is strictly below this value. **0 is off** (the shipped default: the token is still on every page and always reads `ok`, which means "not judged"). Range 0–1; out of range or non-finite refuses to start. Model-dependent: bge-m3's candidate value is 0.50 (live probes: gibberish 0.36–0.49, paraphrases 0.61–0.67; not calibrated for `qwen3-embedding:0.6b`), OpenAI `text-embedding-3-*` cosines run lower, so re-choose it when the embedding model changes. Ranks nothing and is not part of the retrieval fingerprint. Set it only after both tools pass the calibration recipe in `DEPLOYMENT.md`, "Calibrating search confidence". |
+| `HYBRID_RRF_K` | `60` | `hybrid_search`'s reciprocal-rank-fusion constant (1–1000; out of range refuses to start): a note scores the sum over the two arms of `1/(k + rank)`. Smaller lets each arm's top ranks dominate; larger flattens toward counting votes. Measure a change with the harness arms `scripts.search_eval_arms.hybrid:make_arm` / `make_arm_alt` (`ARM_OPTS="hybrid_k=60 hybrid_alt_k=20"`, see `DEPLOYMENT.md`, "Measuring search quality"); there is no per-call argument. |
 | `TRANSFER_TOKEN_TTL_SECONDS` | `600` | Default life of a transfer link. Per-call `expires_in` is clamped to 60–3600. |
 | `TRANSFER_MAX_UPLOAD_SECONDS` | `600` | How long one claimed upload may stream before the token is spent |
 | `TRANSFER_MAX_CONCURRENT_UPLOADS` | `4` | Simultaneous upload streams |
@@ -1318,12 +1856,18 @@ the same fail-closed state a local user with no assignment is already in.
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | `http://ollama:11434` | Used when provider is Ollama. Must be `https`, loopback `http`, or covered by `EMBEDDING_ALLOW_PLAINTEXT`. |
-| `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
+| `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. `bge-m3` stays the default and fully supported; the reference deployment runs `qwen3-embedding:0.6b` (also 1024-d) with the query instruction below, see [Embedding model choice](#embedding-model-choice). Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
+| `EMBEDDING_QUERY_INSTRUCTION` | empty | Prepended verbatim, with no separator, to every **search query** sent to the embedding provider, and never to a note. For instruction-tuned embedders such as Qwen3-Embedding, e.g. `"Instruct: Given a question, retrieve the notes that answer it\nQuery: "` (double quotes, so `.env` turns `\n` into a newline). Up to 1,000 characters; NUL and control characters other than newline and tab are refused. It is **not** in the stored embedding fingerprint, so changing it needs no reset and re-embeds nothing; changing the model still does. The default model is unchanged (bge-m3, which wants no instruction); the template above is the one the reference deployment runs with `qwen3-embedding:0.6b`. |
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident. `-1` pins it; a Go duration (`30m`) frees VRAM when idle. Ollama only. |
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies. Same transport rule as `OLLAMA_URL` when this provider is active. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
 | `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
+| `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: on the reference vault it improves `semantic_search` and makes `hybrid_search` worse (see [Reranker reference setup](#reranker-reference-setup)); measure it with the harness on your own judgments, and a CPU reranker will time out at the default deadline. Since [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it scores each note on up to four of its fetched chunks, sent with their heading path (`RERANK_MAX_DOCUMENTS`). See [Reranker reference setup](#reranker-reference-setup) and `DEPLOYMENT.md`, "Reranker (optional)". |
+| `RERANK_MODEL` | — | Sent as `model` in the rerank request (≤ 200 characters). `llama-server` serves one model and ignores it. |
+| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–30000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its `embedding` concurrency slot: under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below `MCP_CONCURRENCY_WAIT_SECONDS` unless `make concurrency-report` passes with rerank traffic (a long hold delays, or under `enforce` refuses, concurrent vector searches). The reference deployment (GPU `llama-server`, see [Reranker reference setup](#reranker-reference-setup)) runs `20000`, because a hybrid `rerank=true` call there sends 67–68 documents and takes about 9–10 s; size it together with `RERANK_MAX_DOCUMENTS`, which since #402 can double the documents per call (`DEPLOYMENT.md`). |
+| `RERANK_MAX_DOCUMENTS` | `100` | The most documents one rerank call sends (50–200). Every candidate note (at most 50) is sent its best chunk first, then up to three more of its already-fetched chunks in distance order; a note scores the best of its documents. Rerank latency multiplies with it and `RERANK_TIMEOUT_MS`; `50` restores the pre-#402 count. |
+| `RERANK_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback reranker host. Separate from `EMBEDDING_ALLOW_PLAINTEXT`, which does not cover it. An `https` reranker is verified against `EMBEDDING_CA_FILE` when set, else certifi's bundle. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
@@ -1331,10 +1875,10 @@ the same fail-closed state a local user with no assignment is already in.
 | `MCP_AUTH_FAILURE_LIMIT` | `60` | Failed `/mcp` authentications one client address may make per window before a 429. Checked before the credential lookup, so a refused probe costs no query. Null disables. See [Rate limits](#rate-limits). |
 | `MCP_AUTH_FAILURE_WINDOW_SECONDS` | `300` | The window that budget is counted over. |
 | `MCP_AUTH_FAILURE_TABLE_SIZE` | `4096` | Counter slots in the fixed-size, per-process-salted address table. Memory is O(size); collisions only make the control stricter. |
-| `MCP_RATE_LIMIT_PER_MINUTE` | `120` | Sustained tool calls per minute per principal (an API key, or an OAuth *grant*). Null — with the burst — disables the general bucket. |
-| `MCP_RATE_LIMIT_BURST` | `30` | Capacity of the general bucket. Must be set together with its rate or nulled together with it. |
-| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `60` | Sustained vault-mutating calls per minute per principal — the eight write tools, plus `PUT /transfer/upload` charged to the principal that minted the capability. |
-| `MCP_WRITE_RATE_LIMIT_BURST` | `15` | Capacity of the write bucket. |
+| `MCP_RATE_LIMIT_PER_MINUTE` | `600` | Sustained tool calls per minute per principal (an API key, or an OAuth *grant*). Null — with the burst — disables the general bucket. |
+| `MCP_RATE_LIMIT_BURST` | `120` | Capacity of the general bucket. Must be set together with its rate or nulled together with it. |
+| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `120` | Sustained vault-mutating calls per minute per principal — the eight write tools, plus `PUT /transfer/upload` charged to the principal that minted the capability. |
+| `MCP_WRITE_RATE_LIMIT_BURST` | `30` | Capacity of the write bucket. |
 | `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals holding their own limiter entry before further ones share one overflow entry. |
 | `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one rate/slot-refusal coalescing window stays open. Inside it a refusal writes nothing; the row that lands stands for `1 + suppressed` refusals. |
 | `MCP_CONCURRENCY_MODE` | `shadow` | `off`, `shadow`, or `enforce`. Shadow observes pressure without rejecting or waiting. See [Concurrency admission](#concurrency-admission). |
@@ -1374,6 +1918,81 @@ container too small to admit one maximum-size body (about 1.1 GiB with the
 defaults). The `MCP_BODY_*` settings in `.env.example` only allow the safe
 direction.
 
+### Embedding model choice
+
+Two local models are documented here. Both are multilingual and produce
+1024-dimensional vectors, so `EMBEDDING_DIMENSIONS=1024` fits either.
+
+- **`bge-m3`** is the code default (`EMBEDDING_MODEL=bge-m3`) and stays a
+  fully supported choice. It needs no query instruction
+  (`EMBEDDING_QUERY_INSTRUCTION` empty). The default is not changing: the
+  stored-fingerprint guard refuses to start a deployment whose model
+  changed, so a new default would stop every existing install that relies
+  on it.
+- **`qwen3-embedding:0.6b`** is what the reference deployment has run since
+  2026-10-31, with a query instruction. The instruction is applied to
+  queries only (notes are embedded without one) and is outside the stored
+  fingerprint:
+
+  ```env
+  EMBEDDING_PROVIDER=ollama
+  EMBEDDING_MODEL=qwen3-embedding:0.6b
+  EMBEDDING_DIMENSIONS=1024
+  EMBEDDING_QUERY_INSTRUCTION="Instruct: Given a question, retrieve the notes that answer it\nQuery: "
+  ```
+
+What was observed after the switch, on one user's vault (not a
+benchmark): cross-language recall between English and Russian queries and
+notes was strong, and `hybrid_search` became the day-to-day default. **No
+harness A/B was run for the switch**, so no quality gain is claimed. To
+measure it on your own vault, use the search-evaluation recipe in
+[`DEPLOYMENT.md`](./DEPLOYMENT.md#measuring-search-quality).
+
+Switching an existing install is a full re-embed (the procedure is
+[below](#switching-providers-or-models)). For scale: on an 8 GiB Quadro
+P4000 shared by Ollama and the reranker, ~4,200 notes re-embedded in about
+84 minutes. `SEARCH_LOW_CONFIDENCE_SIMILARITY` is model-dependent: its
+0.50 candidate was measured on `bge-m3`, so re-calibrate after a switch.
+
+### Reranker reference setup
+
+`rerank=true` is opt-in. Before [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402)
+the reranker scored one heading-less chunk per note, which demoted some
+notes both search arms ranked first; it now scores each note on the
+embedded text (title, heading path, tags, chunk) of up to four of its
+fetched chunks (`RERANK_MAX_DOCUMENTS`). The #402 real-data gate ran on
+2026-10-31 against the previous reranker documents and passed 4 of 6
+reports (the owner waived one near-miss cell). Measured against
+`rerank=false` on the reference vault (2026-11-01, 196 queries), it
+improves `semantic_search` (overall recall@10 0.505 → 0.582, nDCG@10
+0.389 → 0.442) and makes `hybrid_search` worse (MRR 0.533 → 0.465,
+nDCG@10 0.519 → 0.474), because plain hybrid is already the strongest
+ranking there. Keep `rerank=false` as the default, use `rerank=true`
+with `semantic_search` when the top few rows matter, and call
+`hybrid_search` without it. The intervals and the method are in
+[`DEPLOYMENT.md`](./DEPLOYMENT.md#reranker-optional); measure on your
+own judgments after a model or reranker change.
+
+Ollama has no rerank endpoint
+([ollama/ollama#3368](https://github.com/ollama/ollama/issues/3368)), so
+the reference deployment runs llama.cpp's `llama-server` (image
+`ghcr.io/ggml-org/llama.cpp:server-cuda12-*`, pinned to a build) serving
+`bge-reranker-v2-m3` as a Q8_0 GGUF with `--reranking`, behind TLS:
+
+```env
+RERANK_URL=https://<host>:<port>/v1/rerank
+RERANK_TIMEOUT_MS=20000
+```
+
+Measured on the same P4000 with nothing else running: 50 documents of ~410
+characters in 1.6 s, 50 documents of 2,000 characters in 7.3 s. Candidates
+are cut to 2,048 characters, so the 1,500 ms default deadline is too short
+for this card. A hybrid `rerank=true` call sends 67–68 documents on the
+reference vault and takes about 9–10 s uncontended (68 documents of 2,000
+characters measured 9.1 s), so the reference runs 20,000 ms since
+2026-11-01; the setting accepts 100–30000. Details, the sizing table and
+the startup checks are in [`DEPLOYMENT.md`](./DEPLOYMENT.md#reranker-optional).
+
 ### Switching providers or models
 
 Different models produce vectors in different spaces, and cosine
@@ -1387,6 +2006,14 @@ provider switch. That is every one of:
   the dimension guard cannot see
 - `EMBEDDING_DIMENSIONS`
 - `CHUNK_SIZE` and `CHUNK_OVERLAP`
+
+Two things are deliberately **not** on that list. `EMBEDDING_QUERY_INSTRUCTION`
+touches only queries, so no stored vector depends on it. And the chunking
+format itself (heading-aware sections, the context prefix, and the
+200-character minimum chunk length, which is a constant tied to the chunking
+version rather than a setting) is versioned per note: when it changes, the
+indexer re-embeds notes in the background over several passes, without a
+refused startup or a reset.
 
 The server stores a fingerprint of that configuration and compares it at
 startup. On a mismatch it logs both fingerprints and the fields that
@@ -1441,8 +2068,8 @@ record — while the server is running (pauses the indexer, runs the SQL,
 resumes).
 
 > **The fingerprint records the configuration, not the model artifact.**
-> `bge-m3` is a mutable Ollama tag, so `ollama pull` can replace the
-> weights behind it, and `OLLAMA_URL` / `OPENAI_BASE_URL` are
+> `bge-m3` is a mutable Ollama tag (so is `qwen3-embedding:0.6b`), so
+> `ollama pull` can replace the weights behind it, and `OLLAMA_URL` / `OPENAI_BASE_URL` are
 > deliberately excluded from the fingerprint — repointing at another host
 > or proxy is usually an infrastructure move that serves the identical
 > artifact, and including it would demand a full re-embed for one.
@@ -1460,6 +2087,20 @@ resumes).
 configuration* it uses — the stemmer and stop-word dictionary — is
 controlled by `FTS_CONFIGS`. It defaults to `english`, which reproduces
 the historical behavior exactly, so existing deployments need no action.
+
+The vector holds the note's **title and frontmatter `aliases` at weight
+`A`**, its **tags at weight `B`** (frontmatter `tags` and inline `#tags`;
+a nested tag also as each `/`-segment, so `#ctx/phone` is found by
+`phone`) and its body at weight `D`, per configured config, and ranking
+uses `RANK_WEIGHTS` — so a query that is a note's title ranks that note
+first, where it used to lose to a long note repeating the words, and a
+note tagged with a word ranks above one that only mentions it. Bare
+terms are ANDed; when the full matches do not fill the page, the same
+terms OR-ed fill the rest, tagged `match: any`. Each row carries a
+`snippet:` built from a stored excerpt of the indexed text
+(`KEYWORD_EXCERPT_CHARS`), computed for the first `KEYWORD_SNIPPET_ROWS`
+rows. The excerpt is written with the vector; `make rebuild-tsvectors`
+also stores it for notes indexed before it existed.
 
 `FTS_CONFIGS` is a **list**, settable as JSON
 (`FTS_CONFIGS=["simple","norwegian"]`) or comma-separated
@@ -1639,9 +2280,9 @@ The consumer of this server is an agent, and a retry-storming or
 prompt-injected agent is an ordinary input. Three controls bound how
 fast one credential can create work.
 
-- **A general bucket** — `MCP_RATE_LIMIT_PER_MINUTE` (120) sustained,
-  `MCP_RATE_LIMIT_BURST` (30) capacity — on every tool call.
-- **A write bucket** — 60/min, burst 15 — that the eight vault-mutating
+- **A general bucket** — `MCP_RATE_LIMIT_PER_MINUTE` (600) sustained,
+  `MCP_RATE_LIMIT_BURST` (120) capacity — on every tool call.
+- **A write bucket** — 120/min, burst 30 — that the eight vault-mutating
   tools must pass in addition, and that `PUT /transfer/upload` consumes
   too, charged to the principal that **minted** the capability so the
   write rate cannot be escaped by minting links and redeeming them.
@@ -1659,8 +2300,8 @@ never a protocol error, never a silent empty result set — and it ends
 with one machine-readable line:
 
 ```
-Error: this credential exceeded its general rate limit of 120 calls per minute, so the call was refused before it ran. Nothing was read, written, or counted against the daily quota. Retry in 3 seconds, or slow the calling loop down.
-MCP-REFUSAL {"code":"rate_limited","scope":"principal","limit":120,"limit_unit":"calls_per_minute","retry_after_seconds":3}
+Error: this credential exceeded its general rate limit of 600 calls per minute, so the call was refused before it ran. Nothing was read, written, or counted against the daily quota. Retry in 1 seconds, or slow the calling loop down.
+MCP-REFUSAL {"code":"rate_limited","scope":"principal","limit":600,"limit_unit":"calls_per_minute","retry_after_seconds":1}
 ```
 
 The `MCP-REFUSAL` sentinel is line-initial and the JSON is one line, so
@@ -1857,6 +2498,10 @@ batching and retry behavior, config validation, and the
 dimension-mismatch startup check. Network-bound tests use `respx` to
 mock httpx, so no real network access is required.
 
+Dependencies are exact pins (`==`) in `requirements*.txt`, bumped by
+Renovate; `renovate.json` holds `mcp` below 2.x (the 2.x migration is
+issue #365, not a routine bump) and digest-pins the Docker base image.
+
 To run the server outside Docker:
 
 ```bash
@@ -1878,7 +2523,7 @@ make db-init          Create database, user, and pgvector extension
 make db-migrate       Run alembic migrations
 make db-check         alembic check — schema vs. ORM models (must be clean)
 make test-schema      Schema gate: migrations vs. models on a throwaway pgvector container
-make db-backup        Dump database to backups dir
+make db-backup        Dump full database to backups dir (BACKUP_FULL=0 explicitly omits derived index rows)
 make db-restore FILE=<path>   Restore from a backup
 make reindex          Explain how to trigger a reindex (panel only; there is no headless trigger)
 make reset-embeddings Drop and recreate embedding column at configured dim
@@ -1962,6 +2607,13 @@ Single-author, in active use as the maintainer's personal exocortex
 (2,500+ notes, multiple connecting agents). Public for anyone who
 wants to fork it. Issues and PRs welcome but expect opinionated review.
 This is a working system, not a generic platform.
+
+Listed in the official [MCP Registry](https://registry.modelcontextprotocol.io)
+as `io.github.maxkuminov/obsidian-mcp`, published from
+[`server.json`](./server.json) on every release tag, and on
+[Glama](https://glama.ai/mcp/servers). Both listings carry the tagline
+at the top of this README: a memory system for your AI agents, stored
+as plain markdown you can open in Obsidian.
 
 ## License
 

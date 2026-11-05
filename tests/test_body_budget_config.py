@@ -350,6 +350,7 @@ import src.models.db
 import src.services.vector_index
 import src.services.transport_security
 import src.services.database_role
+import src.services.db_session
 import src.database
 imports_read = len(calls)
 try:
@@ -400,7 +401,8 @@ def test_alembic_env_imports_only_what_the_probe_imports():
             imported.update(alias.name for alias in node.names)
     assert {m for m in imported if m.split(".")[0] == "src"} == {
         "src.config", "src.models.db", "src.services.vector_index",
-        "src.services.transport_security", "src.services.database_role"}
+        "src.services.transport_security", "src.services.database_role",
+        "src.services.db_session"}
 
 
 # ── the lifespan is where the check runs ────────────────────────────────────

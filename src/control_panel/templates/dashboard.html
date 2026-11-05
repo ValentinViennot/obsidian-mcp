@@ -245,7 +245,7 @@
         </div>
 
         <div class="stat-card anim-4">
-            <div class="stat-label">Requests Today</div>
+            <div class="stat-label" title="Requests since 00:00 UTC — the same UTC day the per-key daily limits count.">Requests Today (UTC)</div>
             <div class="stat-num u-color-warning" data-countup="{{ stats.requests_today | default(0) }}">{{ stats.requests_today | default(0) }}</div>
         </div>
 

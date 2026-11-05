@@ -1,8 +1,14 @@
 # Continuous deployment
 
-A merge to `main` publishes an image and rolls production onto it. This note is
-the setup — the secrets a human has to create, what branch protection applies,
-and the parts of the path that are deliberately still manual.
+A merge to `main` publishes an image; it does **not** deploy production.
+Production uses a separately reviewed digest pin in GitOps followed by Komodo
+DeployStack. The `workflow_run` trigger in `deploy.yml` is disabled.
+
+The pipeline below documents the optional GitHub SSH deployment machinery,
+not the active release path. Do not enable it as part of an upstream sync.
+For the November 2026 integration, see [the upgrade constraints](../architecture/upstream-sync-20261105.md):
+stop the old application before data-rewriting migrations, preserve a full
+backup, and verify the runtime database role before starting the new image.
 
 The day-to-day incident procedures are in
 [`runbooks.md`](runbooks.md); this file is about the pipeline itself.
@@ -148,9 +154,10 @@ being deployed. In order:
    procedure use). A failure here aborts before any migration, for the reason
    `make deploy` gives: the backup is the only way back from a bad migration.
 5. **Runs `alembic upgrade head`** with the new image, before the new image
-   serves traffic. Migrations are written to be backward-compatible, so the old
-   container keeps serving correctly for the few seconds in between; the
-   reverse order would put new code in front of an old schema.
+   serves traffic. The old application must be stopped for migrations that rewrite indexed
+   data (including fork revisions 037 and 041); running an old writer during
+   those migrations can invalidate their results. The legacy SSH script
+   needs this sequencing before it can be used for this release.
 6. **`up -d` on the pinned digest.** No `--force-recreate`: an unchanged digest
    is a no-op plus a health check, which is what makes a re-run safe.
 7. **Waits for health.** The container's own healthcheck *is*

@@ -96,13 +96,16 @@ def head_identity(repo):
 # ── One commit per write path ───────────────────────────────────────────────
 
 
-async def test_create_note_commits(vault):
+async def test_create_note_commits(vault, synthetic_connection_author):
     result = await tools.create_note_impl("Notes/Alpha.md", "# Alpha\n")
 
     assert result.startswith("Created note: Notes/Alpha.md")
     assert log_subjects(vault)[0] == "mcp(create_note): create Notes/Alpha.md"
     assert committed_paths(vault) == {"Notes/Alpha.md": "A"}
-    assert head_identity(vault) == "obsidian-mcp agent <agent@test.invalid>"
+    assert head_identity(vault) == (
+        f"{synthetic_connection_author.name} <{synthetic_connection_author.email}>"
+    )
+    assert git(vault, "log", "-1", "--format=%cn <%ce>").stdout.strip() == "obsidian-mcp agent <agent@test.invalid>"
     assert "Tool: create_note" in head_body(vault)
     assert "Principal: laptop-key" in head_body(vault)
     assert porcelain(vault) == ""
@@ -436,14 +439,20 @@ async def test_an_oauth_client_name_is_the_principal(vault):
     assert "Principal: Claude Desktop" in head_body(vault)
 
 
-async def test_a_caller_with_no_credential_is_recorded_as_unknown(vault):
+async def test_a_caller_with_no_named_connection_cannot_write(vault):
+    from src.auth.session import current_connection_author
     token = current_actor.set(None)
+    author_token = current_connection_author.set(None)
     try:
-        await tools.create_note_impl("Alpha.md", "one\n")
+        result = await tools.create_note_impl("Alpha.md", "one\n")
     finally:
+        current_connection_author.reset(author_token)
         current_actor.reset(token)
 
-    assert "Principal: unknown" in head_body(vault)
+    assert result.refusal.code == "connection_name_required"
+    assert not (vault / "Alpha.md").exists()
+    assert len(log_subjects(vault)) == 1
+
 
 
 async def test_a_hostile_client_name_cannot_forge_the_trailers(vault):

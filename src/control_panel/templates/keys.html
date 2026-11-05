@@ -5,6 +5,7 @@
     /* #289: converted from inline style attributes. */
     .keys-new-key-label { font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 10px; opacity: 0.75; }
     .keys-new-key { flex: 1; background: var(--code-bg); padding: 10px 14px; border-radius: 5px; font-size: 12px; word-break: break-all; color: var(--key-text); }
+    .keys-rename-form { min-width: 240px; padding-top: 8px; }
     .keys-field-help { font-size: 11px; color: var(--text-3); margin-top: 6px; line-height: 1.5; }
     .keys-check-hint { color: var(--text-3); font-size: 12px; display: block; margin-top: 2px; }
     /* Cell classes are scoped to beat `.data-table td` and
@@ -75,7 +76,18 @@
             <tbody>
                 {% for key in keys %}
                 <tr>
-                    <td class="keys-td-name">{{ key.name }}</td>
+                    <td class="keys-td-name">{{ key.name }}
+                        <details>
+                            <summary class="keys-field-help">Edit name</summary>
+                            <form method="POST" action="/admin/keys/{{ key.id }}/name" class="keys-rename-form">
+                                {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+                                <label class="field-label" for="key-name-{{ key.id }}">Connection name</label>
+                                <input id="key-name-{{ key.id }}" class="field-input" name="name" value="{{ key.name }}" required maxlength="128">
+                                <p class="keys-field-help">Updates future vault history. Your key stays the same.</p>
+                                <button type="submit" class="btn btn-primary">Save name</button>
+                            </form>
+                        </details>
+                    </td>
                     {% if multi_user_mode %}
                     <td class="keys-td-owner">
                         {% if key.owner_username %}{{ key.owner_username }}{% else %}<span class="u-color-text-3">—</span>{% endif %}
@@ -161,7 +173,7 @@
             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
             <div class="field">
                 <label class="field-label">Name</label>
-                <input type="text" name="name" required class="field-input" placeholder="e.g. Claude Desktop">
+                <input type="text" name="name" required maxlength="128" class="field-input" placeholder="e.g. Claude Desktop">
             </div>
             <div class="field">
                 <label class="field-label">Permission</label>

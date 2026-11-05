@@ -631,6 +631,7 @@ def test_the_generated_authorization_code_never_reaches_a_record(monkeypatch, si
         oauth.authorize_post(
             request=request,
             action="approve",
+            connection_alias="Synthetic test connection",
             client_id="client123",
             redirect_uri=REGISTERED_URI,
             code_challenge=oauth._base64url_sha256("v" * 64),

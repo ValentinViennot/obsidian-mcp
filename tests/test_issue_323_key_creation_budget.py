@@ -257,10 +257,10 @@ def test_validation_failures_and_unlimited_attempts_charge_nothing(budget, event
     user = _user(11)
     store = []
     for _ in range(10):
-        assert "Key name" in _form(user, store, name="bad/name!")[0]
+        assert "Key name" in _form(user, store, name="bad<name!")[0]
         # A bad JSON body is a 422 from the model, before the handler runs.
         with pytest.raises(ValueError):
-            api.CreateKeyRequest(name="bad/name!", permission="admin")
+            api.CreateKeyRequest(name="bad<name!", permission="admin")
         err, _ = _form(user, store, unlimited="1")
         assert "administrator" in err
         r = _json(user, store, daily_request_limit=None)

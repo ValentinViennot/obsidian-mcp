@@ -770,3 +770,36 @@ re-reported:
 - L12 An origin edit inside the freshness window is not seen at the POST.
 - L13 `SECRET_KEY` rotation re-derives ids.
 - L14 A client whose every POST is malformed never reaches the gate's evidence (nor the AS).
+
+## Named connections (fork migration 044)
+
+Every new approval requires a human-editable connection alias, initially filled
+from the application's declared name for both DCR and CIMD. This editable name
+is not verified application identity: CIMD still identifies the application by
+its fetched document host and URL. The normalized alias is NFC, trimmed, 1–128
+characters and excludes Unicode Cc/Cf controls and angle brackets. API-key
+creation uses the same policy; its existing `name` is the alias.
+
+The code stores the chosen alias. Both issued tokens and every refresh rotation
+copy it, preserving the grant's identity independently of application-name
+changes. The OAuth panel shows each grant's alias beside the application name.
+`current_connection_author` is bound and reset by authentication middleware;
+Git attribution uses its normalized name and a stable synthetic address derived
+from the grant ID or API-key ID. Existing actor telemetry continues to identify
+the application, so connection and application labels never overwrite each other.
+
+Migration 044 intentionally revokes all existing unnamed OAuth tokens and marks
+unspent unnamed codes used. Users must reconnect and approve a name. API keys
+are preserved. NULL-alias codes/access/refresh tokens are refused by credential
+queries, including ones an old image might create during rollout. Replaying the
+migration preserves named grants; downgrading does not restore revoked tokens.
+Legacy API keys with invalid names can still read, but expose no Git author and
+write admission refuses them until the owner corrects the name using the API Keys
+panel or `PUT /api/keys/{id}/name`. The owner-scoped, CSRF-protected rename
+changes only the name: the credential hash, key ID and synthetic author address
+stay fixed. Already-minted uploads retain their original author snapshot.
+
+Transfer capabilities snapshot the connection author name and synthetic email
+at mint time, avoiding attribution drift if a credential is subsequently renamed.
+The snapshot columns are nullable for old rows; this does not authorize assigning
+a global or inferred author to an unnamed upload.

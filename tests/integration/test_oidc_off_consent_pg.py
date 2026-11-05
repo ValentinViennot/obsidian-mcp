@@ -253,6 +253,7 @@ async def _approve(env, mode, kind):
     params = authorize_params(kind)
     response = await http.post("/authorize", data={
         "action": "approve", "client_id": params["client_id"],
+        "connection_alias": "Synthetic consent connection",
         "redirect_uri": params["redirect_uri"], "code_challenge": params["code_challenge"],
         "code_challenge_method": "S256", "scope": "read offline_access",
         "state": g.hidden(page.text, "state"), "client_state": "client-state-golden",
@@ -278,6 +279,7 @@ async def test_consent_approval_lineage(env, mode, kind):
     async with sm() as session:
         row = (await session.execute(select(OAuthCode).where(OAuthCode.code_hash == code_hash))).scalar_one()
     assert row.user_id == expected_user
+    assert row.connection_alias == "Synthetic consent connection"
     assert row.grant_id is None and not row.used
 
     exchanged = await http.post("/token", data={

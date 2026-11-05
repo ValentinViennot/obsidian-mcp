@@ -263,6 +263,8 @@ PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(64)) * 4
 @dataclass
 class FakeRow:
     vault_root: str
+    git_author_name: str = "Synthetic test connection"
+    git_author_email: str = "00000000000000000000000000000000@connections.obsidian-mcp.invalid"
     id: int = 1
     public_id: str = "pub-1"
     direction: str = "upload"

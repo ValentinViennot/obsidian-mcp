@@ -220,6 +220,7 @@ async def _seed_identity(session, *, permission="readwrite", vault_path="/obsidi
     # the consent it descends from, and `lookup_by_public_id` scopes an OAuth
     # handle to that family rather than to this one row (#74).
     oauth = OAuthToken(
+        connection_alias="Synthetic test connection",
         user_id=user.id,
         token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
         token_type="access",
@@ -244,6 +245,7 @@ async def _rotate(session, oauth, *, expire_old=True):
     where the agent comes back after the old hour has run out.
     """
     fresh = OAuthToken(
+        connection_alias="Synthetic test connection",
         user_id=oauth.user_id,
         token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
         token_type="access",
@@ -268,6 +270,7 @@ async def _second_consent(session, oauth):
     the first — so its tokens must not see the first one's handles.
     """
     other = OAuthToken(
+        connection_alias="Synthetic test connection",
         user_id=oauth.user_id,
         token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
         token_type="access",
@@ -287,6 +290,8 @@ async def _add_token(session, *, key=None, oauth=None, user=None, direction="upl
                      state="pending", path="Attachments/a.png", root="/obsidian",
                      ttl=600):
     row = TransferToken(
+        git_author_name="Synthetic upload connection",
+        git_author_email="00000000000000000000000000000007@connections.obsidian-mcp.invalid",
         public_id=transfer.new_public_id(),
         token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
         direction=direction,
@@ -884,6 +889,7 @@ async def test_a_grant_id_shared_across_clients_still_cannot_cross(clean):
         session.add(second_client)
         await session.flush()
         impostor = OAuthToken(
+            connection_alias="Synthetic test connection",
             user_id=user.id,
             token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
             token_type="access",
@@ -1391,6 +1397,7 @@ async def _ownerless_credentials(session):
     session.add_all([key, client])
     await session.flush()
     oauth = OAuthToken(
+        connection_alias="Synthetic test connection",
         user_id=None,
         token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
         token_type="access",

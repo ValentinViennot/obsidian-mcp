@@ -161,6 +161,7 @@ def test_missing_bearer_returns_401_with_discovery_header():
 
 def test_inactive_user_oauth_token_is_rejected(monkeypatch):
     oauth_token = OAuthToken(
+        connection_alias="Synthetic test connection",
         grant_issued_at=datetime.now(timezone.utc),
         id=9,
         user_id=42,

@@ -45,8 +45,14 @@ from src.config import settings
 from src.database import get_session
 from src.models.db import User, UserSession
 from src.services import security_events
+from src.services.connection_identity import ConnectionAuthor
 
 logger = logging.getLogger(__name__)
+
+# Authenticated connection identity for Git attribution, distinct from app telemetry.
+current_connection_author: ContextVar[ConnectionAuthor | None] = ContextVar(
+    "current_connection_author", default=None
+)
 
 current_user_id: ContextVar[int | None] = ContextVar("current_user_id", default=None)
 

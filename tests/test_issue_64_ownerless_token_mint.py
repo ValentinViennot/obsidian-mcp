@@ -64,6 +64,7 @@ def _exchange(monkeypatch, *, code_user_id, client_user_id=None, multi_user=True
         user_id=client_user_id,
     )
     code = OAuthCode(
+        connection_alias="Synthetic test connection",
         code_hash=oauth._hash("the-code"),
         client_id=client.client_id,
         redirect_uri=REGISTERED_URI,
@@ -381,6 +382,7 @@ def _drive_middleware(token, *, multi_user, client_owner=None):
 
 def _live_token(user_id, *, client_id="client123", scope="readwrite"):
     return OAuthToken(
+        connection_alias="Synthetic test connection",
         grant_issued_at=datetime.now(timezone.utc),
         id=91,
         token_hash=oauth._hash("live-token"),

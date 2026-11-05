@@ -61,7 +61,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "043"
+HEAD_REVISION = "044"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -366,12 +366,14 @@ def test_drifted_database_is_reconciled():
         assert fetchval(
             url, "SELECT is_active FROM api_keys WHERE name = 'drifted'"
         ) is True
+        # 013 reconciles NULL flags; 044 subsequently invalidates these legacy
+        # unnamed OAuth credentials while preserving the existing API key.
         assert fetchval(
             url, "SELECT used FROM oauth_codes WHERE client_id = 'drifted-client'"
-        ) is False
+        ) is True
         assert fetchval(
             url, "SELECT revoked FROM oauth_tokens WHERE client_id = 'drifted-client'"
-        ) is False
+        ) is True
         assert fetchval(url, "SELECT count(*) FROM usage_logs WHERE created_at IS NULL") == 0
         assert fetchval(
             url, "SELECT count(*) FROM notes_metadata WHERE indexed_at IS NULL"
@@ -8305,7 +8307,8 @@ def test_037_chains_from_036_and_is_head():
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "043"
+    assert script.get_current_head() == HEAD_REVISION == "044"
+    assert script.get_revision("044").down_revision == "043"
     assert script.get_revision("043").down_revision == "042"
 
 

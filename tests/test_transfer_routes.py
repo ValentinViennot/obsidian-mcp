@@ -79,6 +79,8 @@ class FakeRow:
     actor_kind: str | None = None
     actor_label: str | None = None
     actor_ref: str | None = None
+    git_author_name: str | None = "Synthetic upload connection"
+    git_author_email: str | None = "00000000000000000000000000000007@connections.obsidian-mcp.invalid"
 
 
 class FakeSession:
@@ -2117,3 +2119,56 @@ async def test_busy_vault_sync_releases_capability_and_same_upload_retries(clien
     assert retry.status_code == 200, retry.text
     assert harness.row.state == "completed"
     assert (root / harness.row.path).read_bytes() == PNG
+
+
+async def test_unnamed_legacy_upload_refuses_before_reading_body(client, harness, vault):
+    harness.row.git_author_name = None
+    harness.row.git_author_email = None
+    touched = []
+
+    async def body():
+        touched.append(True)
+        yield PNG
+
+    response = await client.put('/transfer/upload', headers=auth(harness), content=body())
+    assert response.status_code == 404
+    assert not touched
+    assert not (vault / harness.row.path).exists()
+
+
+async def test_upload_commits_minted_author_not_redemption_context(client, harness, vault, monkeypatch):
+    from src.services import git_vault
+    from src.services.connection_identity import connection_author
+    from src.auth.session import current_connection_author
+    from tests.test_git_vault import git
+
+    git(vault, 'init', '-q', '-b', 'main')
+    (vault / 'Seed.md').write_text('seed\n')
+    git(vault, 'add', 'Seed.md')
+    git(vault, 'commit', '-qm', 'seed')
+    author = connection_author('Upload owner', 'oauth', 'minted-grant')
+    harness.row.git_author_name, harness.row.git_author_email = author.name, author.email
+    monkeypatch.setattr(git_vault.settings, 'git_vault_enabled', True)
+    monkeypatch.setattr(git_vault.settings, 'git_commit_on_write', True)
+    token = current_connection_author.set(connection_author('Unrelated request', 'api_key', 999))
+    try:
+        response = await client.put('/transfer/upload', headers=auth(harness), content=PNG)
+    finally:
+        current_connection_author.reset(token)
+    assert response.status_code == 200
+    assert git(vault, 'log', '-1', '--format=%an%n%ae').stdout.splitlines() == [author.name, author.email]
+    assert git(vault, 'show', '--pretty=', '--name-only', 'HEAD').stdout.strip() == harness.row.path
+
+
+async def test_upload_git_failure_keeps_successful_bytes(client, harness, vault, monkeypatch):
+    from src.services import git_vault
+    monkeypatch.setattr(git_vault.settings, 'git_vault_enabled', True)
+    monkeypatch.setattr(git_vault.settings, 'git_commit_on_write', True)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError('synthetic git failure')
+
+    monkeypatch.setattr(git_vault, 'commit_paths', fail)
+    response = await client.put('/transfer/upload', headers=auth(harness), content=PNG)
+    assert response.status_code == 200
+    assert (vault / harness.row.path).read_bytes() == PNG

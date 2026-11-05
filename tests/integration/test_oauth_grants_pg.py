@@ -190,6 +190,7 @@ async def seed_grant(sessionmaker, *, client_id="c1", grant_id="g1", scope="read
     async with sessionmaker() as session:
         session.add(
             OAuthToken(
+                connection_alias="Synthetic test connection",
                 token_hash=oauth._hash(secrets.token_hex(32)),
                 token_type="access",
                 client_id=client_id,
@@ -200,6 +201,7 @@ async def seed_grant(sessionmaker, *, client_id="c1", grant_id="g1", scope="read
         )
         session.add(
             OAuthToken(
+                connection_alias="Synthetic test connection",
                 token_hash=oauth._hash(refresh_value),
                 token_type="refresh",
                 client_id=client_id,
@@ -496,6 +498,7 @@ async def _consent(user_id, monkeypatch):
     monkeypatch.setattr(oauth, "get_active_session_user", _resolve)
     return await oauth.authorize_post(
         _Req(signed),
+        connection_alias="Synthetic test connection",
         action="approve",
         client_id="c1",
         redirect_uri=REDIRECT_URI,

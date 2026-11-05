@@ -848,6 +848,18 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
             margin-top: 24px;
         }
 
+        input[name="connection_alias"] {
+            display: block;
+            width: 100%;
+            margin-top: 10px;
+            padding: 10px 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--surface-2);
+            color: var(--text);
+            font: inherit;
+        }
+
         .btn-approve {
             flex: 1;
             padding: 10px;
@@ -1039,9 +1051,18 @@ content-security-policy: default-src 'self'; script-src 'nonce-<NONCE>'; style-s
                 </label>
                 
 
+                <label class="scope-option">
+                    <div>
+                        <div class="scope-option-title">Connection name</div>
+                        <div class="scope-option-desc">Choose how this connection appears in your vault history. The application name stays separate.</div>
+                        <input type="text" name="connection_alias" value="Golden Client"
+                               maxlength="128" required autocomplete="off" aria-label="Connection name">
+                    </div>
+                </label>
+
                 <div class="actions">
                     <button type="submit" name="action" value="approve" class="btn-approve">Approve</button>
-                    <button type="submit" name="action" value="deny"    class="btn-deny">Deny</button>
+                    <button type="submit" name="action" value="deny"    class="btn-deny" formnovalidate>Deny</button>
                 </div>
             </form>
         </div>

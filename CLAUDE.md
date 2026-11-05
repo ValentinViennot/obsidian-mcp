@@ -39,32 +39,30 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
   - MCP routes (`/mcp/*`): API key auth at app level
   - Transfer routes (`/transfer/*`): same router as `/mcp` (no OAuth chain);
     capability-token auth at app level
-- Registry: `localhost:5000` (or change in `Makefile`); CI also publishes to
-  GHCR (`.github/workflows/publish-image.yml`)
-- Deploy: `make deploy` (build → scan → push → backup → migrate → recreate)
-- **CI/CD: a merge to `main` publishes an image. It does NOT deploy.**
-  `publish-image.yml` pushes to GHCR and prints the digest; that is where the
-  automation stops. **`deploy.yml`'s `workflow_run` trigger is commented out
-  on purpose** — a GitHub runner is not on the tailnet, so arming it would put
-  an unlocked, passphrase-less deploy key on a publicly reachable port for a
-  workload whose releases are infrequent and never urgent. The machinery is
-  real and re-armable (four lines, or `tailscale/github-action`), and
-  `workflow_dispatch` still redeploys a known-good SHA by hand.
-
-  **Production is rolled by Komodo**, the fleet's convention: repin
-  `x-obsidian-mcp-image` in the gitops stack to the new digest, merge, then
-  DeployStack. Resolve the digest with `docker buildx imagetools inspect` and
-  **check the image's `org.opencontainers.image.revision` label really is the
-  commit you think it is** before writing it down. Run the `obsidian-mcp-backup`
-  procedure first when the release carries a migration.
-
-  This bullet used to describe the automatic path as if it were live, and it
-  cost a session's worth of wrong conclusions — a merge was reported as a
-  deploy, twice, while production sat untouched. `pr.yml` is the pre-merge
-  gate (`pr-gate` is the one required check) and `scripts/vps-deploy.sh` is
-  the host half that the disarmed workflow would call. See
-  [continuous deployment](docs/operations/continuous-deployment.md), including
-  the three things a rollback does *not* fix.
+- Registry: the production release image is
+  `ghcr.io/valentinviennot/obsidian-mcp`; local `make deploy` may use the
+  registry configured in `Makefile.local`.
+- **CI/CD is one workflow, `.github/workflows/ci.yml`.** `pr-gate` aggregates
+  disjoint offline/schema/PostgreSQL partitions, secret and dependency scans,
+  OpenSpec, Compose validation, and one scanned/smoke-tested runtime image.
+  Docs-only changes skip runtime partitions/image while still resolving the
+  required aggregate. Unknown diffs run all gates.
+- **Publish reuses the exact tested image, never rebuilds it.** A successful
+  main run in this fork downloads its immutable candidate artifact, checks
+  source/revision labels and config identity, pushes and verifies the digest.
+  The release manifest names that digest, exact source, run evidence and the
+  dynamically derived Alembic head. Both image and OCI release manifest are
+  attested with GitHub OIDC. No upstream registry identity is published.
+- **Production is owned by protected GitOps, not GitHub SSH.** With
+  `OBSIDIAN_RELEASE_AUTOMATION_ENABLED=true`, the release job sends its
+  immutable attested `OBSIDIAN_RELEASE_MANIFEST` to the existing GitOps
+  pipeline trigger. GitOps verifies provenance, reviews/promotes the digest,
+  backs up, migrates in order, deploys and verifies runtime state. A published
+  image or accepted trigger is never evidence of a completed deployment.
+  Keep full pre-migration backups: an image rollback cannot undo changed
+  schema/data or vault bytes. The former duplicate image/test publishers and
+  SSH deployment workflows have been removed. See
+  [continuous deployment](docs/operations/continuous-deployment.md).
 
 ## Public repo — host paths live outside the tree
 This repo is published on GitHub. Anything host-specific (paths, secrets,
@@ -137,11 +135,11 @@ specific to this MCP server.
 | Integration suite (real Postgres) | `make test-integration` |
 | Search-quality fixture | `make search-eval` |
 | Search eval (any search-path change) | `make search-eval-snapshot` then `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy>` — attach `report.json` only if `attachable: true` (`USER_ID=` export on multi-user), incumbent as `BASELINE`; `CORPUS_LOSS` invalidates; a change with a mechanical bar adds `python -m scripts.search_eval gate` (PASS/FAIL per metric × slice; exit 64 with no output on a non-attachable or multi-user report) and its table goes in the PR body |
-| Deploy | merge to `main` → publish image; production digest pin and Komodo DeployStack are separate |
+| Deploy | green main CI → attested tested image/manifest → protected GitOps intake and ordered deployment |
 
 **`tests/integration/` skips itself without a database.** Those modules are
 guarded on `PGVECTOR_TEST_ADMIN_URL`, so a local `pytest tests` reports green
-having executed none of them. CI's `tests` job sets it against a
+having executed none of them. CI's disjoint `schema` and `postgres` partitions set it against a
 `pgvector/pgvector:pg16` service, so they do run on every push — but any local
 claim that "the suite passes" is a claim about the offline subset unless
 `make test-integration` ran, which stands up the throwaway container and sets
@@ -149,7 +147,7 @@ the URL. It shares `SCHEMA_TEST_CONTAINER` / `SCHEMA_TEST_PORT` with
 `test-schema`, so do not run the two concurrently. **It is Linux-only and
 refuses elsewhere**: unlike every other local test path it runs the host's own
 `pytest`, because these modules need a docker CLI as well as a Linux kernel
-and the test image has no docker client. On a Mac, CI's `tests` job is the
+and the test image has no docker client. On a Mac, CI's PostgreSQL partitions are the
 gate — do not report "integration passes" from a machine that cannot run it.
 
 **`alembic check` must be clean** — "No new upgrade operations detected." Run

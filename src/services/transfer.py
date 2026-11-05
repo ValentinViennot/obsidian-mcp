@@ -51,12 +51,13 @@ import idna
 from sqlalchemy import and_, delete, literal, select, update
 from sqlalchemy.orm import aliased
 
-from src.auth.session import actor_columns
+from src.auth.session import actor_columns, current_connection_author
 from src.config import settings
 from src.models.db import APIKey, OAuthToken, TransferToken, User
 from src.oauth.grants import grant_deadline
 from src.oauth.scope import token_has_write
 from src.services import vault_fs, vault_overlap
+from src.services.connection_identity import ConnectionAuthor
 from src.services.vault import classify_bytes
 from src.services.note_hash import CanonicalNoteHasher
 
@@ -471,6 +472,10 @@ async def mint_token(
     if direction not in DIRECTIONS:
         raise ValueError(f"Unknown transfer direction: {direction!r}")
 
+    author = current_connection_author.get()
+    if direction == "upload" and not isinstance(author, ConnectionAuthor):
+        raise CredentialNotUsable("Name this connection before requesting an upload.")
+
     # Read the credential and decide the deadline here, in this transaction,
     # immediately before the INSERT: a token that outlives its credential is a
     # link that 404s at a time we advertised as valid, and a window computed
@@ -483,6 +488,8 @@ async def mint_token(
         public_id=new_public_id(),
         token_hash=hash_token(token),
         direction=direction,
+        git_author_name=author.name if direction == "upload" else None,
+        git_author_email=author.email if direction == "upload" else None,
         state=STATE_PENDING,
         path=path,
         vault_root=canonical_vault_root(vault_root),
@@ -2565,3 +2572,12 @@ async def _fetch_hops(
                 current = redirect_to
 
     raise SSRFError(f"More than {max_redirects} redirects")  # pragma: no cover
+
+
+def upload_author(row) -> ConnectionAuthor | None:
+    """Validate a capability's immutable author snapshot; old unnamed uploads refuse."""
+    try:
+        return ConnectionAuthor(getattr(row, "git_author_name", None),
+                                getattr(row, "git_author_email", None))
+    except (TypeError, ValueError):
+        return None

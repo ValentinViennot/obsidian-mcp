@@ -87,6 +87,7 @@ async def test_authorize_post_stale_session_cannot_mint_code(monkeypatch):
     monkeypatch.setattr(oauth_routes.settings, "multi_user_mode", True)
 
     response = await oauth_routes.authorize_post(
+        connection_alias="Synthetic test connection",
         request=request,
         action="approve",
         client_id="client",

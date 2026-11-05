@@ -438,3 +438,23 @@ def test_real_git_invocations_enable_reference_and_object_durability(clones):
     configured = engine.git("config", "--get", "core.fsync").decode().strip().split(",")
     assert {"committed", "index", "reference"} <= set(configured)
     assert engine.git("config", "--get", "core.fsyncMethod").decode().strip() == "fsync"
+
+
+def test_offline_desktop_edits_rejoin_without_rewriting_either_history(clones, tmp_path):
+    bare, live, peer = clones
+    git(live, 'remote', 'set-url', 'origin', str(tmp_path / 'offline.git'))
+    (live / 'Offline.md').write_text('saved while disconnected\n')
+    engine = Reconciler(live, desktop=True)
+    with pytest.raises(ReconcileError, match='git fetch failed'):
+        engine.run()
+    offline_tip = git(live, 'rev-parse', 'HEAD')
+    assert git(live, 'show', 'HEAD:Offline.md') == 'saved while disconnected'
+    incoming(peer, 'Server.md', 'independent server edit\n')
+    server_tip = git(peer, 'rev-parse', 'HEAD')
+    git(live, 'remote', 'set-url', 'origin', str(bare))
+    engine.run()
+    assert (live / 'Offline.md').read_text() == 'saved while disconnected\n'
+    assert (live / 'Server.md').read_text() == 'independent server edit\n'
+    for tip in (offline_tip, server_tip):
+        assert git(live, 'merge-base', '--is-ancestor', tip, 'HEAD') == ''
+    assert git(bare, 'rev-parse', 'main') == git(live, 'rev-parse', 'HEAD')

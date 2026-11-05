@@ -28,6 +28,7 @@ from src.auth.session import (
     revoke_user_sessions,
     start_session,
 )
+from src.services.connection_identity import normalize_connection_alias
 from src.config import settings
 from src.control_panel.flash import ERR, flash, pop_flash
 from src.csrf import generate_csrf_token, verify_csrf
@@ -1182,27 +1183,15 @@ async def keys_page(
 # the operator gets a 500 with no key and no explanation — and a name of pure
 # whitespace produced an unidentifiable row on a page whose only handle on a
 # credential *is* its name.
-_KEY_NAME_MAX = 255
-_KEY_NAME_RE = re.compile(r"^[\w\-. ]+$")
+_KEY_NAME_MAX = 128
 
 
 def _key_name_error(name: str) -> str | None:
-    """Validate a form-submitted key name exactly as the JSON API does.
-
-    Returns the message to show, or None. The strip is this side's own
-    addition: pydantic's `min_length=1` accepts `"   "` because the pattern
-    admits the space character, which is defensible for a name with spaces
-    *in* it and useless as a whole name.
-    """
-    if not name.strip():
-        return "Key name is required."
-    if len(name) > _KEY_NAME_MAX:
-        return f"Key name must be at most {_KEY_NAME_MAX} characters."
-    if not _KEY_NAME_RE.match(name):
-        return (
-            "Key name may contain only letters, digits, spaces, and the "
-            "characters _ - . "
-        )
+    """The same connection-name policy as OAuth and the JSON API."""
+    try:
+        normalize_connection_alias(name)
+    except ValueError:
+        return "Key name must be 1–128 characters, without control characters or < >."
     return None
 
 
@@ -1237,6 +1226,8 @@ async def create_key_form(
     if name_error is not None:
         _flash_key_error(request, name_error)
         return RedirectResponse("/admin/keys", status_code=303)
+
+    name = normalize_connection_alias(name)
 
     # The keys.html <select> only constrains the UI; a scripted/tampered POST
     # can submit any value. Mirror the JSON API's invariant (src/api/routes.py)
@@ -1362,6 +1353,26 @@ async def revoke_key_form(
     api_key = result.scalar_one_or_none()
     _assert_key_owner(api_key, user, request=request)
     api_key.is_active = False
+    await session.commit()
+    return RedirectResponse("/admin/keys", status_code=303)
+
+
+@router.post("/keys/{key_id}/name")
+async def rename_key_form(
+    request: Request,
+    key_id: int,
+    name: str = Form(...),
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    result = await session.execute(select(APIKey).where(APIKey.id == key_id))
+    key = _assert_key_owner(result.scalar_one_or_none(), user, request=request)
+    try:
+        normalized = normalize_connection_alias(name)
+    except ValueError as exc:
+        _flash_key_error(request, str(exc))
+        return RedirectResponse("/admin/keys", status_code=303)
+    key.name = normalized
     await session.commit()
     return RedirectResponse("/admin/keys", status_code=303)
 
@@ -1580,6 +1591,7 @@ def _grant_view(grant_id: str, family: list, now: datetime, active_by_owner: dic
 
     return {
         "grant_id": grant_id,
+        "connection_alias": getattr(family[0], "connection_alias", None),
         "token_id": token_id,
         "scope": scope,
         # Membership, not equality: "offline_access readwrite" is a write grant

@@ -135,6 +135,7 @@ def test_public_client_token_exchange_accepts_pkce_without_client_secret(monkeyp
         scope="read readwrite",
     )
     code = OAuthCode(
+        connection_alias="Synthetic test connection",
         code_hash=routes._hash("authorization-code"),
         client_id=client.client_id,
         redirect_uri=client.redirect_uris[0],
@@ -193,6 +194,7 @@ def test_invalid_pkce_verifier_returns_invalid_grant(monkeypatch):
         scope="read",
     )
     code = OAuthCode(
+        connection_alias="Synthetic test connection",
         code_hash=routes._hash("authorization-code"),
         client_id=client.client_id,
         redirect_uri=client.redirect_uris[0],
@@ -231,6 +233,7 @@ def test_confidential_token_exchange_still_requires_secret(monkeypatch):
         scope="read",
     )
     code = OAuthCode(
+        connection_alias="Synthetic test connection",
         code_hash=routes._hash("authorization-code"),
         client_id=client.client_id,
         redirect_uri=client.redirect_uris[0],

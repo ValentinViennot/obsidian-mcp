@@ -38,7 +38,7 @@ encoding alone, which is what keeps `GET` and `HEAD` agreeing on
 """
 from __future__ import annotations
 
-from src.services import vault_sync
+from src.services import git_vault, vault_sync
 
 import datetime
 import errno
@@ -614,7 +614,8 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         identity_ok, minting_credential = await transfer.resolve_identity(
             session, row, need_write=True
         )
-        if not identity_ok:
+        author = transfer.upload_author(row)
+        if not identity_ok or author is None:
             revalidation = "credential_invalid"
         elif not await transfer.resolve_root_ok(session, row):
             revalidation = transfer.root_refusal(row).reason
@@ -822,15 +823,21 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
 
     try:
         async with vault_sync.writing(row.vault_root):
-            result = await transfer.stream_to_vault(
-                row,
-                request.stream(),
-                max_bytes=_upload_max_bytes(row),
-                content_length=_content_length(request),
-                deadline=_upload_deadline(row),
-                idle_timeout=30.0,
-                before_publish=gate,
-            )
+            try:
+                result = await transfer.stream_to_vault(
+                    row,
+                    request.stream(),
+                    max_bytes=_upload_max_bytes(row),
+                    content_length=_content_length(request),
+                    deadline=_upload_deadline(row),
+                    idle_timeout=30.0,
+                    before_publish=gate,
+                )
+            except transfer.PostPublishFailure:
+                # Bytes already landed even if completion telemetry failed.
+                await git_vault.commit_published(row.vault_root, [row.path], "upload_file", author)
+                raise
+            await git_vault.commit_published(row.vault_root, [row.path], "upload_file", author)
     except vault_sync.VaultSyncBusy as exc:
         # A committed capability claim must actually be restored before we
         # promise same-link retry. Nothing was streamed or published yet.

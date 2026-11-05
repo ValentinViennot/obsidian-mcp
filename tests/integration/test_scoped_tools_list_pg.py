@@ -48,12 +48,14 @@ async def _seed_read_family(maker) -> tuple[str, int]:
     now = datetime.now(UTC)
     async with maker() as session:
         row = OAuthToken(
+            connection_alias="Synthetic test connection",
             token_hash=oauth._hash(access), token_type="access", client_id="c1",
             scope="read offline_access", grant_id="g358", grant_issued_at=now,
             expires_at=now + timedelta(hours=1),
         )
         session.add(row)
         session.add(OAuthToken(
+            connection_alias="Synthetic test connection",
             token_hash=oauth._hash(secrets.token_hex(32)), token_type="refresh",
             client_id="c1", scope="read offline_access", grant_id="g358",
             grant_issued_at=now, expires_at=now + timedelta(days=30),

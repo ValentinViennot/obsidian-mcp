@@ -160,10 +160,10 @@ async def seed_usage(url, users: dict) -> dict:
                              redirect_uris=["https://example.invalid/cb"])
         s.add_all([key, key2, client])
         await s.flush()
-        g1 = OAuthToken(user_id=users["u1"], token_hash="c" * 64, token_type="access",
+        g1 = OAuthToken(connection_alias="Synthetic test connection", user_id=users["u1"], token_hash="c" * 64, token_type="access",
                         client_id="client-a", scope="read", grant_id="grant-g1",
                         grant_issued_at=now, expires_at=now + timedelta(hours=1))
-        g2 = OAuthToken(user_id=users["u1"], token_hash="d" * 64, token_type="access",
+        g2 = OAuthToken(connection_alias="Synthetic test connection", user_id=users["u1"], token_hash="d" * 64, token_type="access",
                         client_id="client-a", scope="read", grant_id="grant-g2",
                         grant_issued_at=now, expires_at=now + timedelta(hours=1))
         s.add_all([g1, g2])

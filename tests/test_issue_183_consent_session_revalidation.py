@@ -141,6 +141,7 @@ async def _authorize_post(session_cookie):
         cookies={"oauth_state": signed_state},
     )
     response = await oauth_routes.authorize_post(
+        connection_alias="Synthetic test connection",
         request=submitting,
         action="approve",
         client_id=CLIENT_ID,

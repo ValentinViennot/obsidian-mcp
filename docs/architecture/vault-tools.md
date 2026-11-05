@@ -1712,3 +1712,9 @@ The fork retains `read_note(include_relationships, relationship_limit)` and
 unchanged; fork-specific schema amendments and full/filtered wire fixtures
 record this deliberate combined surface. Wire descriptions remain capped at
 4,000 characters, with detailed relationship semantics documented above.
+
+Named connections add a body-boundary refusal, `connection_name_required`,
+after the existing write-permission check and before any publication lock or
+body. It applies to every write-required tool regardless of Git configuration.
+The remedy is naming/reconnecting the OAuth connection or naming the API key;
+ordinary reads continue. See [vault synchronization](vault-sync.md).

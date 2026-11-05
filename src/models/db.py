@@ -1256,6 +1256,9 @@ class OAuthClient(Base):
     )
 
 
+_CONNECTION_IDENTITY_MARKER = "named connection identity (044_named_connections)"
+
+
 class OAuthCode(Base):
     __tablename__ = "oauth_codes"
 
@@ -1269,6 +1272,9 @@ class OAuthCode(Base):
     )
     redirect_uri: Mapped[str] = mapped_column(String(2048), nullable=False)
     scope: Mapped[str] = mapped_column(String(50), nullable=False)
+    connection_alias: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, comment=_CONNECTION_IDENTITY_MARKER
+    )
     code_challenge: Mapped[str] = mapped_column(String(128), nullable=False)
     code_challenge_method: Mapped[str] = mapped_column(String(10), nullable=False, default="S256")
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -1375,6 +1381,14 @@ class TransferToken(Base):
     # reader (`src.auth.session.actor_columns`), so the mint and the tool-call
     # log cannot disagree about the caller or truncate differently. The comment
     # is 017's ownership marker, declared here so `alembic check` compares it.
+    # Snapshot the authenticated connection author at capability mint time.
+    git_author_name: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, comment=_CONNECTION_IDENTITY_MARKER
+    )
+    git_author_email: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment=_CONNECTION_IDENTITY_MARKER
+    )
+
     actor_kind: Mapped[str | None] = mapped_column(
         String(20), nullable=True, comment=_TRANSFER_ACTOR_COLUMN_MARKER
     )
@@ -1423,6 +1437,9 @@ class OAuthToken(Base):
         String(64), ForeignKey("oauth_clients.client_id", ondelete="CASCADE"), nullable=False
     )
     scope: Mapped[str] = mapped_column(String(50), nullable=False)
+    connection_alias: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, comment=_CONNECTION_IDENTITY_MARKER
+    )
     # The grant family this token belongs to (migration 014, issue #64). Every
     # row minted from one `/authorize` approval shares it, and every rotation
     # inherits it, so revocation and scope changes can act on the unit the

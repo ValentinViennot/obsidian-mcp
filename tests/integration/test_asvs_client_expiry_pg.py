@@ -259,6 +259,7 @@ async def seed_token(
     async with sessionmaker() as session:
         session.add(
             OAuthToken(
+                connection_alias="Synthetic test connection",
                 token_hash=token_hash or uuid.uuid4().hex * 2,
                 token_type="access",
                 client_id=client_id,
@@ -323,6 +324,7 @@ async def seed_code(sessionmaker, client_id, *, used=False, expires_at=FUTURE):
     async with sessionmaker() as session:
         session.add(
             OAuthCode(
+                connection_alias="Synthetic test connection",
                 code_hash=uuid.uuid4().hex * 2,
                 client_id=client_id,
                 redirect_uri=REDIRECT_URI,
@@ -496,6 +498,7 @@ async def test_a_contended_row_is_deferred_and_its_code_survives(clean, engine):
         assert await oauth._stamp_client_use(authorizing, "in-flight") is True
         authorizing.add(
             OAuthCode(
+                connection_alias="Synthetic test connection",
                 code_hash="r" * 64,
                 client_id="in-flight",
                 redirect_uri=REDIRECT_URI,
@@ -591,6 +594,7 @@ async def test_a_real_authorization_blocked_on_the_sweeps_lock_gets_invalid_clie
         consent = asyncio.create_task(
             oauth.authorize_post(
                 _ConsentRequest(signed),
+                connection_alias="Synthetic test connection",
                 action="approve",
                 client_id="doomed",
                 redirect_uri=REDIRECT_URI,
@@ -642,6 +646,7 @@ async def test_the_naive_conditional_delete_really_does_cascade_the_new_code(
     async with holder() as authorizing:
         authorizing.add(
             OAuthCode(
+                connection_alias="Synthetic test connection",
                 code_hash="n" * 64,
                 client_id="naive-victim",
                 redirect_uri=REDIRECT_URI,
@@ -714,6 +719,7 @@ async def test_the_real_sweep_survives_the_interleaving_the_naive_delete_loses(
         assert await oauth._stamp_client_use(authorizing, "real-survivor") is True
         authorizing.add(
             OAuthCode(
+                connection_alias="Synthetic test connection",
                 code_hash="s" * 64,
                 client_id="real-survivor",
                 redirect_uri=REDIRECT_URI,

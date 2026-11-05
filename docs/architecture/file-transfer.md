@@ -422,3 +422,14 @@ The host is folded to canonical ASCII **first** (NFKC, the alternative full stop
 
 ### Declared filesystem semantics
 Case-sensitive, non-normalising filesystems (ext4/xfs — the production bind mount) on Linux. Hard links must work within the root, and `.trash` must accept a same-device `renameat2(RENAME_NOREPLACE)`; the probes refuse otherwise rather than degrading to an overwriting move. Since #59 this covers the **note** tools too — `create_note`/`write_file` no-clobber publication needs the hard link, and `move_note`/`delete_note` need `renameat2` — so a mount without them loses those tools with a named error, not silently. Case-insensitive or normalising mounts are out of scope, as is any platform without `renameat2` — the non-replacing move has no portable fallback.
+
+## Upload author snapshot
+
+Upload minting requires a valid named connection. `git_author_name` and
+`git_author_email` on the capability snapshot its Git identity. Legacy or
+invalid snapshots refuse redemption with the existing unavailable-capability
+response before any payload is read. Download capabilities do not require an
+author. After upload publication, the route commits the one published path
+inside `vault_sync.writing`, using the snapshot as AUTHOR and the configured
+server as COMMITTER; it never uses redeemer-supplied identity. Commit failures
+remain bookkeeping failures and do not undo bytes or successful HTTP outcomes.

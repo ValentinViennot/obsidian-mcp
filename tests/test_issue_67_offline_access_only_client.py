@@ -182,6 +182,7 @@ def _approve(client_scope, requested="read", monkeypatch=None):
         response = asyncio.run(
             oauth.authorize_post(
                 _FakeRequest(signed),
+                connection_alias="Synthetic test connection",
                 action="approve",
                 client_id="client123",
                 redirect_uri=REGISTERED_URI,
@@ -228,6 +229,7 @@ def _exchange(client_scope, code_scope, monkeypatch):
         scope=client_scope,
     )
     code = OAuthCode(
+        connection_alias="Synthetic test connection",
         code_hash=oauth._hash("the-code"),
         client_id=client.client_id,
         redirect_uri=REGISTERED_URI,

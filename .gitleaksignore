@@ -35,3 +35,10 @@ df613b9e82672779414d8f78c962f499b21315a2:tests/test_body_budget_config.py:generi
 66523567a1d76ed1b30a5324368ed502de61b24a:tests/test_body_budget_config.py:generic-api-key:370
 a18f2f7c9f7708c97176ef655981953851fcdd34:tests/fixtures/transport_tls/client.key:private-key:1
 c3c1ef6d740371169f4aca0fe30e4f4bf066c5c8:tests/fixtures/transport_tls/client.key:private-key:1
+
+# Reviewed 5 November 2026: upstream hybrid-search/change-feed Settings tests
+# use fixed, explicitly synthetic secrets. These are fixture-only values,
+# never production credentials. Exact source-commit findings, no path allowlist.
+1b82c8a020864a09e533142a168681ae1f45bddb:tests/test_hybrid_search_offline.py:generic-api-key:794
+1b82c8a020864a09e533142a168681ae1f45bddb:tests/test_hybrid_search_offline.py:generic-api-key:801
+ed7d3348fa8f1dd1a170752d3ecf79126b704513:tests/test_change_feed_offline.py:generic-api-key:346

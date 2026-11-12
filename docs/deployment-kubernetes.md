@@ -81,7 +81,9 @@ in an overlay copied from `overlays/example/`.
   one route, by header,** plus an SSO / forward-auth provider for the panel.
   See [The front door](#the-front-door).
 - **An embedding endpoint.** OpenAI (or anything that speaks its embeddings API)
-  is the easy choice on a cluster without a GPU. Ollama works too.
+  is the easy choice on a cluster without a GPU. Ollama and Hugging Face TEI
+  work too; TEI can use either its native `/embed` API (`EMBEDDING_PROVIDER=tei`)
+  or its OpenAI-compatible `/v1/embeddings` route (`openai`).
 - `kubectl` 1.27+ (built-in kustomize with `components` and `labels`).
 
 ## Quick start
@@ -248,7 +250,7 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai`. Switching after the first index needs `reset-embeddings` (below). |
+| `EMBEDDING_PROVIDER` | `ollama` | `ollama`, `openai`, or `tei` (Hugging Face Text Embeddings Inference native `/embed`). Switching after the first index needs `reset-embeddings` (below). |
 | `EMBEDDING_DIMENSIONS` | `1024` | Vector size. Must match the stored column. The server refuses to start on a mismatch. |
 | `OPENAI_API_KEY` | unset | **Secret.** Required for `openai`. |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible embeddings endpoint. |
@@ -257,6 +259,9 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `EMBEDDING_MODEL` | `bge-m3` | Ollama model. A change needs a reset. |
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model loaded (`-1` = forever, or a Go duration). |
 | `OLLAMA_EMBED_BATCH_SIZE` | `16` | Chunks per `/api/embed` request (1 to 256). |
+| `TEI_URL` | `http://tei:80` | TEI endpoint for the native `/embed` API. Same transport rule as `OLLAMA_URL`. |
+| `TEI_EMBEDDING_MODEL` | `BAAI/bge-m3` | Must equal the `model_id` TEI reports at `GET /info`, exactly, including a local path; a different value refuses startup. Recorded in the fingerprint; a change needs a reset. Replacing the weights behind the same name also needs the reset, and no startup check detects that case. |
+| `TEI_EMBED_BATCH_SIZE` | `16` | Inputs per `/embed` request (1 to 256). A value above TEI's `--max-client-batch-size` (32 on TEI 1.8.3 unless set) refuses startup; 16 avoids the request timeout on a shared GPU. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Acknowledge a plaintext `http://` embedding URL to a non-loopback host. |
 | `EMBEDDING_CA_FILE` | unset | PEM CA for an `https` embedding endpoint behind a private CA. Replaces the default bundle. |
 | `RERANK_URL` | unset | Optional Jina-compatible `/v1/rerank` endpoint (e.g. `llama-server --reranking`) for `rerank=true`. Receives query and note text. Same `https`/loopback rule; an unreachable reranker never blocks startup. See DEPLOYMENT.md, "Reranker (optional)". |
@@ -296,6 +301,20 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `TRANSFER_MAX_UPLOAD_SECONDS` | `600` | Longest a claimed upload may stream. |
 | `TRANSFER_MAX_CONCURRENT_UPLOADS` | `4` | Simultaneous `PUT /transfer/upload`. |
 | `IMPORT_ALLOW_HTTP` | `false` | Let `import_from_url` fetch plain http (the base NetworkPolicy allows only 443 egress). |
+
+### Task tools
+
+The server defaults for the task tools (#428). Each user overrides them on
+the panel's Tasks card. See the README's
+[Tasks (optional)](../README.md#tasks-optional).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `TASKS_DEFAULT_TIMEZONE` | `UTC` | IANA timezone for "today" and relative task dates. An unknown or host-only name (`localtime`) refuses startup, **in the `migrate` initContainer too**: set it in the ConfigMap, never on the app container alone. |
+| `TASKS_SET_DONE_DATE` | `true` | `complete_task` adds `✅ <date>`. |
+| `TASKS_SET_CANCELLED_DATE` | `true` | Cancelling a task adds `❌ <date>`. |
+| `TASKS_SET_CREATED_DATE` | `false` | New tasks and a recurring task's next occurrence get `➕ <date>`. |
+| `TASKS_NEXT_RECURRENCE_BELOW` | `false` | A recurring task's next occurrence goes below the completed one instead of above. |
 
 ### Rate limits, quotas and concurrency
 
@@ -685,6 +704,49 @@ The procedure:
    `kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic check` should print
    "No new upgrade operations detected."
 
+**Across migration 040 (task rule, #434)** nothing changes until a task
+rule is chosen: the default, `all`, keeps every checkbox a task, and every
+response and outstanding cursor stays as it was. 040 adds three columns and
+two CHECKs to `task_settings` and writes no row, as the non-superuser owner;
+nothing is re-derived or re-embedded. The one check: if the ConfigMap sets
+`TASKS_RULE`, `TASKS_RULE_TAGS` or `TASKS_GLOBAL_FILTER`, the values must
+be valid, and `TASKS_RULE: filter` needs a `TASKS_GLOBAL_FILTER`. A bad
+value fails the `migrate` initContainer as well as the server, and under
+`Recreate` that is downtime until you fix the ConfigMap. Quote a filter text
+that starts with a hash sign (`TASKS_GLOBAL_FILTER: "#task"`): unquoted,
+YAML reads it as a comment. While a rule is in force, `task_agenda` needs a
+response cap of 3,121 characters instead of 2,800. **Rollback:** after 040
+has run, the previous image's `migrate` initContainer cannot start (it does
+not know revision 040), and under `Recreate` no previous-image pod is left
+running. Roll forward, or first run `alembic downgrade 039` with the new
+image (for example
+`kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic downgrade 039`),
+then revert the image at once (the running new-image server's task tools
+fail against the downgraded table until it is replaced); the downgrade drops every saved task rule, task tag
+and filter text, and the previous image lists every checkbox again. The
+details are in [`DEPLOYMENT.md`](../DEPLOYMENT.md#upgrading-across-migration-040-task-rule-434).
+
+**Across migration 039 (task tools, #428)** there is no operator step
+beyond one check: if the ConfigMap sets `TASKS_DEFAULT_TIMEZONE`, it must
+be an IANA timezone the image knows (`Europe/Berlin`), not a misspelling or
+a host-only name such as `localtime`. A bad value fails the `migrate`
+initContainer, and under `Recreate` that is downtime until you fix the
+ConfigMap or revert the image. 039 adds nullable columns, one CHECK and two
+indexes to `note_tasks`, two nullable columns to `notes_metadata`, and the
+durable `task_settings` table; it writes no row and rewrites no table, as
+the non-superuser owner. The first pass after the rollout re-derives every
+note once at extraction version 5 (no re-embedding). Until it finishes,
+`list_tasks` shows `id pending` rows and a `task ids pending` count, its
+`text` / `recurring` filters say they are approximate, and
+`move_note(rewrite_links=True)` returns `index_not_ready`. A `list_tasks`
+cursor from before the rollout is refused once (`invalid_argument`).
+`CLASS_MAPPING_VERSION` moves to 6, which starts a new readiness epoch for
+`make concurrency-report`. The image pins `tzdata`. The backup Job dumps
+`task_settings` with its rows. Rolling the image back is roll-forward, as
+for 032: the previous image re-derives every note and re-chunks with full
+vector reuse. Downgrading 039 drops the saved task settings. The details
+are in [`DEPLOYMENT.md`](../DEPLOYMENT.md#upgrading-across-migration-039-task-tools-428).
+
 **Upgrading to the reranker release (#367)** there is no migration and no
 operator step: `semantic_search` and `hybrid_search` gain an optional
 `rerank` argument whose `false` default leaves their output unchanged, and
@@ -814,7 +876,7 @@ Two things hold state: the **vault** and the **database**.
   `notes_metadata`, `note_embeddings`, `note_links`, `note_tasks`, `indexer_runs`
   and `indexer_state`; their schema remains. Ordinary startup rebuilds current
   data only. Historical embeddings then require a separate history backfill.
-  Credentials, users, usage, quotas and change-feed data are always dumped.
+  Credentials, users, usage, quotas, change-feed data and task settings are always dumped.
 
 [`components/db-backup`](../deploy/kubernetes/components/db-backup/) is a
 nightly CronJob that follows `make db-backup`'s contract. It writes a

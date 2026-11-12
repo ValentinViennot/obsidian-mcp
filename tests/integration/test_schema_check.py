@@ -61,7 +61,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "044"
+HEAD_REVISION = "047"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -72,11 +72,26 @@ MARKER = "created by 013_schema_reconciliation"
 # made explicit, parentheses added — not our guess at it. The migration derives
 # the same string at runtime instead of hard-coding it; this constant is the
 # pin that tells us if either side moves.
-CANONICAL_CONSTRAINTDEF = (
+#
+# This is the definition at any revision from 010 to 037. Migration 038 (#420)
+# replaces it with `CANONICAL_CONSTRAINTDEF`, which keeps both clauses and adds
+# a third, so every case that downgrades to 012 asserts this one and every case
+# at head asserts the successor.
+CANONICAL_CONSTRAINTDEF_010 = (
     "CHECK (((((token_endpoint_auth_method)::text = 'none'::text) "
     "AND (client_secret_hash IS NULL)) "
     "OR (((token_endpoint_auth_method)::text = 'client_secret_post'::text) "
     "AND (client_secret_hash IS NOT NULL))))"
+)
+
+# 038's definition at head, measured the same way.
+CANONICAL_CONSTRAINTDEF = (
+    "CHECK (((((token_endpoint_auth_method)::text = 'none'::text) "
+    "AND (client_secret_hash IS NULL)) "
+    "OR (((token_endpoint_auth_method)::text = 'client_secret_post'::text) "
+    "AND (client_secret_hash IS NOT NULL)) "
+    "OR (((token_endpoint_auth_method)::text = 'private_key_jwt'::text) "
+    "AND (client_secret_hash IS NULL))))"
 )
 
 # The rest of the 010 shape, likewise as PostgreSQL 16 prints it. `alembic
@@ -561,7 +576,7 @@ def test_wrong_column_type_is_reconciled():
         assert constraint_row(url) is not None, (
             "downgrade dropped a constraint 013 did not create"
         )
-        assert constraint_row(url)[1] == CANONICAL_CONSTRAINTDEF
+        assert constraint_row(url)[1] == CANONICAL_CONSTRAINTDEF_010
 
 
 def test_impostor_constraint_does_not_block_the_type_repair():
@@ -700,7 +715,7 @@ def test_downgrade_keeps_a_constraint_013_did_not_create():
         assert alembic_version(url) == "012"
         row = constraint_row(url)
         assert row is not None, "downgrade dropped 010's constraint"
-        assert row[1] == CANONICAL_CONSTRAINTDEF
+        assert row[1] == CANONICAL_CONSTRAINTDEF_010
         # Documented asymmetry: NOT NULL stays. Relaxing it would re-create the
         # very drift 013 exists to remove, and the models still declare it.
         assert all(not_null_flags(url).values())
@@ -6977,7 +6992,7 @@ def test_032_chains_from_031():
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
     assert script.get_current_head() == HEAD_REVISION
-    assert script.get_revision("038").down_revision == "037"
+    assert script.get_revision("045").down_revision == "044"
 
 
 def test_032_backfills_nothing_and_every_row_reads_false():
@@ -8300,16 +8315,25 @@ def refuse_037(url, *, must_mention):
     return combined
 
 
-def test_037_chains_from_036_and_is_head():
+def test_037_chains_from_036():
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "044"
-    assert script.get_revision("044").down_revision == "043"
+    assert script.get_current_head() == HEAD_REVISION == "047"
     assert script.get_revision("043").down_revision == "042"
+
+
+def test_045_chains_from_fork_044():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_revision("045").down_revision == "044"
 
 
 def test_037_fresh_upgrade_has_the_exact_marked_shape():
@@ -8616,6 +8640,1037 @@ def test_downgrade_037_then_reupgrade_recreates_it_identically():
         # The link is lost by design (the docstring says so).
         assert oidc_values(url) == {1: (None,) * 6}
         assert_alembic_check_clean(url, DIM)
+
+
+
+
+# --------------------------------------------------------------------------
+# 038: private_key_jwt for CIMD clients (#420)
+# --------------------------------------------------------------------------
+
+PKJWT_CONSTRAINT = "ck_oauth_clients_private_key_jwt_shape"
+PKJWT_MARKER = "created by 038_oauth_cimd_private_key_jwt (#420)"
+PKJWT_URL = "https://chatgpt.com/oauth/client.json"
+PKJWT_JWKS_URI = "https://chatgpt.com/oauth/jwks.json"
+PKJWT_SNAPSHOT = '{"keys": [{"kty": "RSA", "kid": "k1", "n": "AQAB", "e": "AQAB"}]}'
+
+
+def insert_pkjwt_client(
+    url,
+    client_id,
+    *,
+    metadata_url=PKJWT_URL,
+    secret=None,
+    jwks_uri=PKJWT_JWKS_URI,
+    alg="RS256",
+    snapshot=PKJWT_SNAPSHOT,
+    fetched=True,
+    method="private_key_jwt",
+):
+    sql(
+        url,
+        "INSERT INTO oauth_clients "
+        "(client_id, client_secret_hash, token_endpoint_auth_method, client_name, "
+        " redirect_uris, scope, client_id_metadata_url, jwks_uri, "
+        " token_endpoint_auth_signing_alg, jwks_snapshot, jwks_fetched_at) "
+        "VALUES ($1, $2, $3, 'pkjwt', '[]'::jsonb, 'read', $4, $5, $6, $7::jsonb, "
+        " CASE WHEN $8 THEN now() ELSE NULL END)",
+        client_id,
+        secret,
+        method,
+        metadata_url,
+        jwks_uri,
+        alg,
+        snapshot,
+        fetched,
+    )
+
+
+def pkjwt_constraint_row(url):
+    rows = fetch(
+        url,
+        "SELECT convalidated, obj_description(oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint WHERE conrelid = 'oauth_clients'::regclass "
+        "  AND contype = 'c' AND conname = $1",
+        PKJWT_CONSTRAINT,
+    )
+    return (rows[0]["convalidated"], rows[0]["comment"]) if rows else None
+
+
+def assert_pkjwt_enforced(url):
+    """The four `private_key_jwt` shapes the 038 CHECKs exist to decide."""
+    # With a secret: the replaced auth-method CHECK refuses it.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError) as with_secret:
+        insert_pkjwt_client(url, "cimd_" + "1" * 59, secret="a" * 64)
+    assert "ck_oauth_clients_" in str(with_secret.value)
+
+    # On a DCR id (no metadata URL): the new shape CHECK refuses it.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError) as on_dcr:
+        insert_pkjwt_client(url, "pkjwt-dcr", metadata_url=None)
+    assert PKJWT_CONSTRAINT in str(on_dcr.value)
+
+    # Without a snapshot: the new shape CHECK refuses it.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError) as no_snapshot:
+        insert_pkjwt_client(url, "cimd_" + "2" * 59, snapshot=None)
+    assert PKJWT_CONSTRAINT in str(no_snapshot.value)
+
+    # Well-formed on a cimd_ row: admitted.
+    insert_pkjwt_client(url, "cimd_" + "3" * 59)
+    sql(url, "DELETE FROM oauth_clients WHERE client_id = $1", "cimd_" + "3" * 59)
+
+
+def test_038_private_key_jwt_shapes_on_a_fresh_database():
+    with throwaway_db("schema_038_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert pkjwt_constraint_row(url) == (True, PKJWT_MARKER)
+        # The pre-038 enforcement is unchanged.
+        assert_constraint_enforced(url)
+        assert_pkjwt_enforced(url)
+
+
+def test_038_absent_private_key_jwt_constraint_is_recreated():
+    """#53's shape for the new CHECK: gone from a database stamped past 038."""
+    with throwaway_db("schema_038_absent") as url:
+        sql(url, f"ALTER TABLE oauth_clients DROP CONSTRAINT {PKJWT_CONSTRAINT}")
+        assert pkjwt_constraint_row(url) is None
+        # Absent, a malformed row is admitted: the constraint is the only guard.
+        insert_pkjwt_client(url, "pkjwt-dcr-absent", metadata_url=None)
+        sql(url, "DELETE FROM oauth_clients WHERE client_id = 'pkjwt-dcr-absent'")
+
+        _harness.run_alembic(url, "stamp", "043", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert pkjwt_constraint_row(url) == (True, PKJWT_MARKER)
+        assert_reconciled(url, marker_expected=False)
+        assert_pkjwt_enforced(url)
+
+
+def test_038_keeps_013s_marker_through_upgrade_and_downgrade():
+    """A drifted 012 database: 013 marks the CHECK, 038 replaces it and keeps
+    the mark, and 038's downgrade restores 010's definition with it intact."""
+    with throwaway_db("schema_038_marker", revision="012") as url:
+        drift_to_live_shape(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert constraint_row(url) == (True, CANONICAL_CONSTRAINTDEF, MARKER)
+
+        _harness.run_alembic(url, "downgrade", "043", dimensions=DIM)
+        assert constraint_row(url) == (True, CANONICAL_CONSTRAINTDEF_010, MARKER)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 039 — task ids, the write-time task refresh and task_settings (#428)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Twelve marked `note_tasks` columns, a marked CHECK and two marked indexes on
+# it, two marked `notes_metadata` columns and one marked durable table. No row
+# written. Reconcile or refuse; mark-gated downgrade. Alembic compares neither
+# the CHECK predicate, nor the partial-index predicate, nor NULLS NOT DISTINCT,
+# so all three are asserted here through the catalogue.
+
+M039_TASK_KEY = "task id key and occurrence (039_task_tools)"
+M039_COLUMNS = {
+    # column: (format_type, NOT NULL, default, marker)
+    ("note_tasks", "task_key"): ("character(12)", False, None, M039_TASK_KEY),
+    ("note_tasks", "key_ordinal"): ("integer", False, None, M039_TASK_KEY),
+    ("note_tasks", "key_count"): ("integer", False, None, M039_TASK_KEY),
+    ("note_tasks", "description_key"): (
+        "character(16)", False, None, "task duplicate-detection key (039_task_tools)",
+    ),
+    ("note_tasks", "text_fold"): (
+        "text", False, None, "case-folded task text (039_task_tools)",
+    ),
+    ("note_tasks", "tag_prefixes"): (
+        "character varying(128)[]", False, None,
+        "hierarchical task tag prefixes (039_task_tools)",
+    ),
+    ("note_tasks", "recurrence"): (
+        "character varying(256)", False, None, "task recurrence rule (039_task_tools)",
+    ),
+    ("note_tasks", "recurrence_cut"): (
+        "boolean", True, "false", "task recurrence rule (039_task_tools)",
+    ),
+    ("note_tasks", "created"): (
+        "date", False, None, "task created and cancelled dates (039_task_tools)",
+    ),
+    ("note_tasks", "cancelled"): (
+        "date", False, None, "task created and cancelled dates (039_task_tools)",
+    ),
+    ("note_tasks", "context"): ("text", False, None, "task context lines (039_task_tools)"),
+    ("note_tasks", "context_cut"): (
+        "boolean", True, "false", "task context lines (039_task_tools)",
+    ),
+    ("notes_metadata", "tasks_source_hash"): (
+        "character varying(64)", False, None,
+        "hash of the bytes the task rows describe (039_task_tools)",
+    ),
+    ("notes_metadata", "tasks_refreshed_at"): (
+        "timestamp with time zone", False, None,
+        "task write-time refresh stamp (039_task_tools)",
+    ),
+}
+M039_CHECK = "ck_note_tasks_key_shape"
+M039_CHECK_MARKER = "task id key shape (039_task_tools)"
+M039_INDEXES = {
+    "ix_note_tasks_tag_prefixes": (
+        "CREATE INDEX ix_note_tasks_tag_prefixes ON public.note_tasks "
+        "USING gin (tag_prefixes)",
+        "task tag-prefix filter index (039_task_tools)",
+    ),
+    "ix_note_tasks_open_desc": (
+        "CREATE INDEX ix_note_tasks_open_desc ON public.note_tasks "
+        "USING btree (description_key) WHERE ((state)::text = 'open'::text)",
+        "open-task duplicate lookup index (039_task_tools)",
+    ),
+}
+M039_SETTINGS_MARKER = "task settings per owner scope (039_task_tools)"
+M039_SETTINGS_COLUMNS = [
+    ("id", "integer", True),
+    ("user_id", "integer", False),
+    ("timezone", "character varying(64)", False),
+    ("excluded_folders", "character varying(1024)[]", True),
+    ("excluded_note_tags", "character varying(128)[]", True),
+    ("set_done_date", "boolean", False),
+    ("set_cancelled_date", "boolean", False),
+    ("set_created_date", "boolean", False),
+    ("next_recurrence_below", "boolean", False),
+    ("updated_at", "timestamp with time zone", True),
+]
+M039_SETTINGS_CONSTRAINTS = {
+    "task_settings_pkey": ("p", "PRIMARY KEY (id)"),
+    "uq_task_settings_user_id": ("u", "UNIQUE NULLS NOT DISTINCT (user_id)"),
+    "task_settings_user_id_fkey": (
+        "f", "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE",
+    ),
+}
+
+
+def catalogue_039(url):
+    """Everything 039 owns, read from the catalogue, for before/after
+    comparisons. Absent units read None."""
+    columns = {key: column_state_029(url, *key) for key in M039_COLUMNS}
+    check = fetch(
+        url,
+        "SELECT convalidated, pg_get_constraintdef(oid) AS def, "
+        "       obj_description(oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint WHERE conrelid = 'public.note_tasks'::regclass "
+        "  AND conname = $1",
+        M039_CHECK,
+    )
+    indexes = {
+        r["relname"]: (r["def"], r["usable"], r["comment"])
+        for r in fetch(
+            url,
+            "SELECT ic.relname, pg_get_indexdef(i.indexrelid) AS def, "
+            "       (i.indisvalid AND i.indisready) AS usable, "
+            "       obj_description(ic.oid, 'pg_class') AS comment "
+            "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+            "WHERE ic.relname = ANY($1::text[])",
+            list(M039_INDEXES),
+        )
+    }
+    settings = None
+    if fetchval(url, "SELECT to_regclass('public.task_settings')") is not None:
+        settings = (
+            fetchval(url, "SELECT obj_description('public.task_settings'::regclass, 'pg_class')"),
+            [
+                (r["attname"], r["coltype"], r["attnotnull"], r["coldefault"])
+                for r in fetch(
+                    url,
+                    "SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS coltype, "
+                    "       a.attnotnull, pg_get_expr(d.adbin, d.adrelid) AS coldefault "
+                    "FROM pg_attribute a LEFT JOIN pg_attrdef d "
+                    "  ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+                    "WHERE a.attrelid = 'public.task_settings'::regclass "
+                    "  AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                )
+            ],
+            {
+                r["conname"]: (r["contype"], r["def"], r["convalidated"])
+                for r in fetch(
+                    url,
+                    "SELECT conname, contype::text AS contype, "
+                    "       pg_get_constraintdef(oid) AS def, convalidated "
+                    "FROM pg_constraint WHERE conrelid = 'public.task_settings'::regclass",
+                )
+            },
+        )
+    return {
+        "columns": columns,
+        "check": tuple(check[0]) if check else None,
+        "indexes": indexes,
+        "settings": settings,
+    }
+
+
+def assert_039_shape(url):
+    cat = catalogue_039(url)
+    for key, expected in M039_COLUMNS.items():
+        assert cat["columns"][key] == expected, (key, cat["columns"][key])
+    validated, _definition, comment = cat["check"]
+    assert validated and comment == M039_CHECK_MARKER, cat["check"]
+    for name, (definition_expected, marker) in M039_INDEXES.items():
+        assert cat["indexes"][name] == (definition_expected, True, marker), cat["indexes"]
+    comment, columns, constraints = cat["settings"]
+    assert comment == M039_SETTINGS_MARKER
+    # 040's marked units (#434) are 040's to verify; 039's shape is the rest.
+    columns = [c for c in columns if c[0] not in M040_COLUMNS]
+    constraints = {k: v for k, v in constraints.items() if k not in M040_CHECKS}
+    assert [c[:3] for c in columns] == M039_SETTINGS_COLUMNS
+    defaults = {c[0]: c[3] for c in columns}
+    assert defaults["id"].startswith("nextval(")
+    assert defaults["excluded_folders"] == "'{}'::character varying[]"
+    assert defaults["excluded_note_tags"] == "'{}'::character varying[]"
+    assert defaults["updated_at"] == "now()"
+    assert {k: v[:2] for k, v in constraints.items()} == M039_SETTINGS_CONSTRAINTS
+    assert all(v[2] for v in constraints.values())
+
+
+def insert_task_039(url, note_id, line, *, key=None, ordinal=None, count=None):
+    sql(
+        url,
+        "INSERT INTO note_tasks (note_id, line, status_char, state, text, "
+        " task_key, key_ordinal, key_count) "
+        "VALUES ($1, $2, ' ', 'open', 't', $3, $4, $5)",
+        note_id, line, key, ordinal, count,
+    )
+
+
+def insert_user_039(url, user_id, username):
+    sql(
+        url,
+        "INSERT INTO users (id, username, password_hash, is_admin, is_active, "
+        " session_version) VALUES ($1, $2, 'x', false, true, 1)",
+        user_id, username,
+    )
+
+
+def rows_039(url):
+    return (
+        [tuple(r) for r in fetch(
+            url,
+            "SELECT id, task_key, key_ordinal, key_count, description_key, text_fold, "
+            "       tag_prefixes, recurrence, recurrence_cut, created, cancelled, "
+            "       context, context_cut FROM note_tasks ORDER BY id",
+        )],
+        [tuple(r) for r in fetch(
+            url,
+            "SELECT id, tasks_source_hash, tasks_refreshed_at FROM notes_metadata ORDER BY id",
+        )],
+        [tuple(r) for r in fetch(
+            url,
+            "SELECT id, user_id, timezone, excluded_folders, excluded_note_tags, "
+            "       set_done_date, set_cancelled_date, set_created_date, "
+            "       next_recurrence_below, updated_at FROM task_settings ORDER BY id",
+        )],
+    )
+
+
+def refuse_039(url, *, must_mention):
+    _harness.run_alembic(url, "stamp", "045", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "039 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "045", "nothing should have been recorded"
+    return combined
+
+
+def test_039_chains_from_038_and_is_head():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_revision("046").down_revision == "045"
+    # #434: 040 follows 039 and is head (test_040_chains_from_039_and_is_head).
+    assert script.get_revision("047").down_revision == "046"
+
+
+def test_039_fresh_upgrade_has_the_exact_marked_shape():
+    with throwaway_db("schema_039_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert_039_shape(url)
+        assert fetchval(url, "SELECT count(*) FROM task_settings") == 0
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_039_from_038_writes_nothing_and_existing_rows_read_null_and_false():
+    with throwaway_db("schema_039_from_038", revision="045") as url:
+        insert_stat_note(url, 1, "Projects/Alpha.md", (1, 2, 3, 4))
+        sql(
+            url,
+            "INSERT INTO note_tasks (note_id, line, status_char, state, text) "
+            "VALUES (1, 3, ' ', 'open', 'Pay rent')",
+        )
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        tasks, notes, settings_rows = rows_039(url)
+        assert tasks == [(1, None, None, None, None, None, None, None, False,
+                          None, None, None, False)]
+        assert notes == [(1, None, None)]
+        assert settings_rows == []
+        assert fetchval(url, "SELECT text FROM note_tasks") == "Pay rent"
+        assert_039_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_039_key_shape_is_enforced():
+    with throwaway_db("schema_039_key_shape") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_task_039(url, 1, 1)  # all NULL: a pre-version-5 row
+        insert_task_039(url, 1, 2, key="0123456789ab", ordinal=1, count=1)
+        insert_task_039(url, 1, 3, key="0123456789ab", ordinal=2, count=2)
+        for line, kwargs in enumerate(
+            [
+                dict(key="0123456789ab", ordinal=1, count=None),
+                dict(key="0123456789ab", ordinal=3, count=2),
+                dict(key="0123456789ab", ordinal=0, count=2),
+                dict(key=None, ordinal=1, count=1),
+                dict(key="0123456789ab", ordinal=None, count=None),
+            ],
+            start=10,
+        ):
+            with pytest.raises(asyncpg.CheckViolationError) as refused:
+                insert_task_039(url, 1, line, **kwargs)
+            assert M039_CHECK in str(refused.value), kwargs
+        assert fetchval(url, "SELECT count(*) FROM note_tasks") == 3
+
+
+def test_039_task_settings_scope_is_unique_and_cascades_with_the_user():
+    with throwaway_db("schema_039_settings_scope") as url:
+        insert_user_039(url, 7, "seven")
+        insert_user_039(url, 8, "eight")
+        sql(url, "INSERT INTO task_settings (user_id) VALUES (NULL), (7), (8)")
+        with pytest.raises(asyncpg.UniqueViolationError):
+            sql(url, "INSERT INTO task_settings (user_id) VALUES (NULL)")
+        with pytest.raises(asyncpg.UniqueViolationError):
+            sql(url, "INSERT INTO task_settings (user_id) VALUES (7)")
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            sql(url, "INSERT INTO task_settings (user_id) VALUES (99)")
+        assert fetchval(
+            url, "SELECT excluded_folders = '{}' AND excluded_note_tags = '{}' "
+                 "AND updated_at IS NOT NULL FROM task_settings WHERE user_id = 7"
+        ) is True
+        sql(url, "DELETE FROM users WHERE id = 7")
+        assert [r["user_id"] for r in fetch(
+            url, "SELECT user_id FROM task_settings ORDER BY user_id NULLS FIRST"
+        )] == [None, 8]
+
+
+def _seed_039(url):
+    insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+    insert_task_039(url, 1, 3, key="0123456789ab", ordinal=1, count=1)
+    sql(
+        url,
+        "UPDATE note_tasks SET description_key = '0123456789abcdef', text_fold = 't', "
+        " tag_prefixes = '{waiting-for,waiting-for/x}', recurrence = 'every day', "
+        " recurrence_cut = true, created = '2026-11-01', context = 'c', context_cut = true",
+    )
+    sql(
+        url,
+        "UPDATE notes_metadata SET tasks_source_hash = 'h', tasks_refreshed_at = now()",
+    )
+    insert_user_039(url, 7, "seven")
+    sql(
+        url,
+        "INSERT INTO task_settings (user_id, timezone, excluded_folders, "
+        " excluded_note_tags, set_done_date) VALUES "
+        "(NULL, 'Europe/Berlin', '{Archive/}', '{ticket}', false), (7, NULL, '{}', '{}', NULL)",
+    )
+
+
+def test_039_stamp_back_rerun_reconciles_and_changes_nothing():
+    with throwaway_db("schema_039_rerun") as url:
+        _seed_039(url)
+        before = (catalogue_039(url), rows_039(url))
+        _harness.run_alembic(url, "stamp", "045", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert (catalogue_039(url), rows_039(url)) == before
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_032_rerun_over_a_head_database_leaves_039s_units_to_039():
+    """032 compares `note_tasks` completely; a stamp-back that re-runs it over
+    a head database must not refuse 039's marked columns, CHECK and indexes."""
+    with throwaway_db("schema_039_rerun_from_031") as url:
+        _seed_039(url)
+        before = (catalogue_039(url), rows_039(url))
+        _harness.run_alembic(url, "stamp", "031", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert (catalogue_039(url), rows_039(url)) == before
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_032_still_refuses_an_unmarked_extra_column_at_head():
+    """The leave-it-to-a-later-revision rule is by marker, not by table: an
+    unmarked column on `note_tasks` is still foreign to 032."""
+    with throwaway_db("schema_039_032_still_strict") as url:
+        sql(url, "ALTER TABLE note_tasks ADD COLUMN squat integer")
+        refuse_032(url, must_mention=["its columns are", "Nothing has been changed"])
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            # Regression: any `(NNN_name)` comment with NNN > 032 used to pass.
+            "foreign_marker_column",
+            [
+                "ALTER TABLE note_tasks ADD COLUMN squat integer",
+                "COMMENT ON COLUMN note_tasks.squat IS 'anything (099_whatever)'",
+            ],
+            "its columns are",
+        ),
+        (
+            "foreign_marker_not_valid_check",
+            [
+                "ALTER TABLE note_tasks ADD CONSTRAINT ck_squat CHECK (line > 0) NOT VALID",
+                "COMMENT ON CONSTRAINT ck_squat ON note_tasks IS 'x (040_y)'",
+            ],
+            "ck_squat",
+        ),
+        (
+            "foreign_marker_index",
+            [
+                "CREATE INDEX ix_squat ON note_tasks (line)",
+                "COMMENT ON INDEX ix_squat IS 'x (040_y)'",
+            ],
+            "unexpected index 'ix_squat'",
+        ),
+        (
+            # A 039 name with another comment is not 039's unit either.
+            "039_name_other_marker",
+            ["COMMENT ON COLUMN note_tasks.text_fold IS 'anything (099_whatever)'"],
+            "its columns are",
+        ),
+    ],
+)
+def test_032_leaves_only_039s_exact_units_to_039(label, ddl, fragment):
+    with throwaway_db(f"schema_039_032_allow_{label}") as url:
+        for statement in ddl:
+            sql(url, statement)
+        refuse_032(url, must_mention=[fragment, "Nothing has been changed"])
+
+
+def test_032s_allow_list_is_exactly_039s_units():
+    import importlib.util
+
+    def load(name):
+        path = _harness.ROOT / "alembic" / "versions" / name
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    m032, m039 = load("038_note_tasks.py"), load("046_task_tools.py")
+    assert m032.LATER_COLUMNS == {
+        column: marker for table, _q, column, *_rest, marker in m039.COLUMNS
+        if table == "note_tasks"
+    }
+    assert m032.LATER_CONSTRAINTS == {m039.KEY_SHAPE: m039.KEY_SHAPE_MARKER}
+    assert m032.LATER_INDEXES == {
+        name: marker for name, (_ddl, marker) in m039._index_ddl("note_tasks").items()
+    }
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "unmarked_settings_table",
+            ["COMMENT ON TABLE task_settings IS NULL"],
+            "task_settings already exists but it does not carry 039's comment marker",
+        ),
+        (
+            "settings_fk_not_cascading",
+            [
+                "ALTER TABLE task_settings DROP CONSTRAINT task_settings_user_id_fkey",
+                "ALTER TABLE task_settings ADD CONSTRAINT task_settings_user_id_fkey "
+                "FOREIGN KEY (user_id) REFERENCES users(id)",
+            ],
+            "task_settings already exists but its foreign keys are",
+        ),
+        (
+            "settings_unique_distinct_nulls",
+            [
+                "ALTER TABLE task_settings DROP CONSTRAINT uq_task_settings_user_id",
+                "ALTER TABLE task_settings ADD CONSTRAINT uq_task_settings_user_id "
+                "UNIQUE (user_id)",
+            ],
+            "task_settings already exists but its constraints differ",
+        ),
+        (
+            "settings_extra_column",
+            ["ALTER TABLE task_settings ADD COLUMN squat integer"],
+            "task_settings already exists but its columns differ",
+        ),
+        (
+            "task_key_wrong_type",
+            ["ALTER TABLE note_tasks ALTER COLUMN task_key TYPE varchar(12)"],
+            "note_tasks.task_key is character varying(12), not character(12)",
+        ),
+        (
+            "task_key_unmarked",
+            ["COMMENT ON COLUMN note_tasks.task_key IS NULL"],
+            "note_tasks.task_key does not carry 039's comment marker",
+        ),
+        (
+            "context_cut_default",
+            ["ALTER TABLE note_tasks ALTER COLUMN context_cut SET DEFAULT true"],
+            "note_tasks.context_cut has the server default 'true'",
+        ),
+        (
+            "recurrence_cut_nullable",
+            ["ALTER TABLE note_tasks ALTER COLUMN recurrence_cut DROP NOT NULL"],
+            "note_tasks.recurrence_cut is nullable",
+        ),
+        (
+            "source_hash_wrong_type",
+            ["ALTER TABLE notes_metadata ALTER COLUMN tasks_source_hash TYPE text"],
+            "notes_metadata.tasks_source_hash is text",
+        ),
+        (
+            "impostor_check",
+            [
+                "ALTER TABLE note_tasks DROP CONSTRAINT ck_note_tasks_key_shape",
+                "ALTER TABLE note_tasks ADD CONSTRAINT ck_note_tasks_key_shape CHECK (true)",
+                "COMMENT ON CONSTRAINT ck_note_tasks_key_shape ON note_tasks IS "
+                "'task id key shape (039_task_tools)'",
+            ],
+            "already carries a constraint ck_note_tasks_key_shape that is not 039's",
+        ),
+        (
+            "unmarked_check",
+            ["COMMENT ON CONSTRAINT ck_note_tasks_key_shape ON note_tasks IS NULL"],
+            "marker absent",
+        ),
+        (
+            "index_other_definition",
+            [
+                "DROP INDEX ix_note_tasks_open_desc",
+                "CREATE INDEX ix_note_tasks_open_desc ON note_tasks (description_key)",
+                "COMMENT ON INDEX ix_note_tasks_open_desc IS "
+                "'open-task duplicate lookup index (039_task_tools)'",
+            ],
+            "the index ix_note_tasks_open_desc is",
+        ),
+        (
+            "index_unmarked",
+            ["COMMENT ON INDEX ix_note_tasks_tag_prefixes IS NULL"],
+            "the index ix_note_tasks_tag_prefixes does not carry 039's comment marker",
+        ),
+        (
+            "index_on_another_table",
+            [
+                "DROP INDEX ix_note_tasks_tag_prefixes",
+                "CREATE INDEX ix_note_tasks_tag_prefixes ON note_links (kind)",
+                "COMMENT ON INDEX ix_note_tasks_tag_prefixes IS "
+                "'task tag-prefix filter index (039_task_tools)'",
+            ],
+            "an index named ix_note_tasks_tag_prefixes already exists on another table",
+        ),
+    ],
+)
+def test_039_refuses_a_unit_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_039_foreign_{label}") as url:
+        _seed_039(url)
+        for statement in ddl:
+            sql(url, statement)
+        before = rows_039(url)
+        refuse_039(url, must_mention=[fragment, "Nothing has been changed"])
+        assert rows_039(url) == before
+
+
+def test_039_refuses_an_impostor_table_before_adding_any_column():
+    with throwaway_db("schema_039_impostor_first", revision="045") as url:
+        sql(url, "CREATE TABLE task_settings (id serial PRIMARY KEY)")
+        refuse_039(url, must_mention=["task_settings already exists but"])
+        cat = catalogue_039(url)
+        assert all(v is None for v in cat["columns"].values()), cat["columns"]
+        assert cat["check"] is None and cat["indexes"] == {}
+
+
+def test_downgrade_039_drops_the_marked_units_and_upgrade_rebuilds_them():
+    with throwaway_db("schema_039_downgrade") as url:
+        _seed_039(url)
+        catalogue = catalogue_039(url)
+        result = _harness.run_alembic(url, "downgrade", "045", dimensions=DIM)
+        assert "dropping task_settings with 2 saved settings row(s)" in result.stdout
+        assert alembic_version(url) == "045"
+        cat = catalogue_039(url)
+        assert all(v is None for v in cat["columns"].values()), cat["columns"]
+        assert cat["check"] is None and cat["indexes"] == {} and cat["settings"] is None
+        # 032's table and its rows survive.
+        assert fetchval(url, "SELECT count(*) FROM note_tasks") == 1
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert catalogue_039(url) == catalogue
+        assert fetchval(url, "SELECT task_key FROM note_tasks") is None
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_039_leaves_units_it_did_not_create():
+    with throwaway_db("schema_039_downgrade_foreign") as url:
+        sql(url, "COMMENT ON TABLE task_settings IS 'somebody else'")
+        sql(url, "COMMENT ON CONSTRAINT ck_note_tasks_key_shape ON note_tasks IS NULL")
+        sql(url, "COMMENT ON INDEX ix_note_tasks_tag_prefixes IS 'somebody else'")
+        sql(url, "COMMENT ON COLUMN note_tasks.text_fold IS 'somebody else'")
+        result = _harness.run_alembic(url, "downgrade", "045", dimensions=DIM)
+        out = result.stdout
+        assert "039 downgrade: leaving task_settings in place" in out, out
+        assert "leaving constraint ck_note_tasks_key_shape on note_tasks in place" in out, out
+        assert "leaving index ix_note_tasks_tag_prefixes in place" in out, out
+        assert "leaving note_tasks.text_fold in place" in out, out
+        assert alembic_version(url) == "045"
+        cat = catalogue_039(url)
+        assert cat["settings"] is not None
+        assert cat["check"] is not None
+        assert set(cat["indexes"]) == {"ix_note_tasks_tag_prefixes"}
+        # Kept: the unmarked column, and every column a surviving object reads.
+        kept = {"text_fold", "task_key", "key_ordinal", "key_count", "tag_prefixes"}
+        for (_table, column), state in cat["columns"].items():
+            assert (state is not None) == (column in kept), column
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 040 — the task rule on task_settings (#434)
+# ════════════════════════════════════════════════════════════════════════════
+
+M040_COLUMNS = {
+    "task_rule": ("character varying(8)", False, None, "task rule kind (040_task_rule)"),
+    "task_tags": (
+        "character varying(128)[]", True, "'{}'::character varying[]",
+        "task rule task tags (040_task_rule)",
+    ),
+    "global_filter": (
+        "character varying(64)", False, None, "task rule global filter text (040_task_rule)",
+    ),
+}
+M040_CHECKS = {
+    "ck_task_settings_task_rule": "task rule kinds (040_task_rule)",
+    "ck_task_settings_global_filter": "a filter rule has its filter text (040_task_rule)",
+}
+
+
+def catalogue_040(url):
+    columns = {c: column_state_029(url, "task_settings", c) for c in M040_COLUMNS}
+    checks = {
+        r["conname"]: (r["contype"], r["def"], r["convalidated"], r["comment"])
+        for r in fetch(
+            url,
+            "SELECT conname, contype::text AS contype, pg_get_constraintdef(oid) AS def, "
+            "       convalidated, obj_description(oid, 'pg_constraint') AS comment "
+            "FROM pg_constraint WHERE conrelid = 'public.task_settings'::regclass "
+            "  AND conname = ANY($1::text[])",
+            list(M040_CHECKS),
+        )
+    }
+    return {"columns": columns, "checks": checks}
+
+
+def assert_040_shape(url):
+    cat = catalogue_040(url)
+    assert cat["columns"] == M040_COLUMNS, cat["columns"]
+    assert set(cat["checks"]) == set(M040_CHECKS)
+    for name, (contype, _definition, validated, comment) in cat["checks"].items():
+        assert contype == "c" and validated and comment == M040_CHECKS[name], (name, comment)
+    rule_def = cat["checks"]["ck_task_settings_task_rule"][1]
+    assert "'all'" in rule_def and "'fields'" in rule_def and "'filter'" in rule_def
+    filter_def = cat["checks"]["ck_task_settings_global_filter"][1]
+    assert "btrim" in filter_def and "IS DISTINCT FROM" in filter_def
+
+
+def rows_040(url):
+    return [tuple(r) for r in fetch(
+        url,
+        "SELECT id, user_id, timezone, excluded_folders, excluded_note_tags, "
+        "       set_done_date, set_cancelled_date, set_created_date, "
+        "       next_recurrence_below, updated_at, task_rule, task_tags, global_filter "
+        "FROM task_settings ORDER BY id",
+    )]
+
+
+def _seed_040(url):
+    _seed_039(url)
+    insert_user_039(url, 8, "eight")
+    sql(
+        url,
+        "INSERT INTO task_settings (user_id, task_rule, task_tags, global_filter) VALUES "
+        "(8, 'filter', '{someday}', '#task')",
+    )
+    sql(url, "UPDATE task_settings SET task_rule = 'fields', task_tags = '{waiting-for}' "
+             "WHERE user_id = 7")
+
+
+def refuse_040(url, *, must_mention, stamp="046"):
+    _harness.run_alembic(url, "stamp", stamp, dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "the upgrade should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == stamp, "nothing should have been recorded"
+    return combined
+
+
+def test_040_chains_from_039_and_is_head():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "047"
+    assert script.get_revision("047").down_revision == "046"
+
+
+def test_040_fresh_upgrade_has_the_exact_marked_shape():
+    with throwaway_db("schema_040_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert_040_shape(url)
+        assert_039_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_040_from_039_writes_nothing_and_existing_rows_read_null_empty_null():
+    with throwaway_db("schema_040_from_039", revision="046") as url:
+        _seed_039(url)
+        before = [tuple(r) for r in fetch(
+            url, "SELECT id, xmin::text, updated_at FROM task_settings ORDER BY id")]
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        after = [tuple(r) for r in fetch(
+            url, "SELECT id, xmin::text, updated_at FROM task_settings ORDER BY id")]
+        assert after == before, "no row may have been updated"
+        assert [r[-3:] for r in rows_040(url)] == [(None, [], None), (None, [], None)]
+        assert_040_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize("stamp", ["046", "045"])
+def test_040_stamp_back_rerun_reconciles_and_changes_nothing(stamp):
+    """A stamp-back to 039 re-runs 040 only; to 038 it re-runs 039 over a
+    head database (039's allow-list leaves 040's marked units to 040)."""
+    with throwaway_db(f"schema_040_rerun_{stamp}") as url:
+        _seed_040(url)
+        before = (catalogue_039(url), catalogue_040(url), rows_040(url))
+        _harness.run_alembic(url, "stamp", stamp, dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert (catalogue_039(url), catalogue_040(url), rows_040(url)) == before
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "unmarked_task_rule",
+            ["ALTER TABLE task_settings ADD COLUMN task_rule varchar(8)"],
+            "task_settings.task_rule does not carry 040's comment marker",
+        ),
+        (
+            "task_tags_varchar64",
+            [
+                "ALTER TABLE task_settings ADD COLUMN task_tags varchar(64)[] "
+                "NOT NULL DEFAULT '{}'",
+                "COMMENT ON COLUMN task_settings.task_tags IS "
+                "'task rule task tags (040_task_rule)'",
+            ],
+            "task_settings.task_tags is character varying(64)[], not "
+            "character varying(128)[]",
+        ),
+        (
+            "global_filter_not_null",
+            [
+                "ALTER TABLE task_settings ADD COLUMN global_filter varchar(64) "
+                "NOT NULL DEFAULT 'x'",
+                "COMMENT ON COLUMN task_settings.global_filter IS "
+                "'task rule global filter text (040_task_rule)'",
+            ],
+            "task_settings.global_filter is NOT NULL",
+        ),
+    ],
+)
+def test_040_refuses_an_impostor_column_and_changes_nothing(label, ddl, fragment):
+    with throwaway_db(f"schema_040_impostor_{label}", revision="046") as url:
+        _seed_039(url)
+        for statement in ddl:
+            sql(url, statement)
+        refuse_040(url, must_mention=[fragment, "Nothing has been changed"])
+        cat = catalogue_040(url)
+        assert cat["checks"] == {}
+        assert alembic_version(url) == "046"
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "unmarked_rule_check",
+            ["COMMENT ON CONSTRAINT ck_task_settings_task_rule ON task_settings IS NULL"],
+            "constraint ck_task_settings_task_rule that is not 040's",
+        ),
+        (
+            "unmarked_filter_check",
+            ["COMMENT ON CONSTRAINT ck_task_settings_global_filter ON task_settings IS NULL"],
+            "constraint ck_task_settings_global_filter that is not 040's",
+        ),
+        (
+            "impostor_filter_check",
+            [
+                "ALTER TABLE task_settings DROP CONSTRAINT ck_task_settings_global_filter",
+                "ALTER TABLE task_settings ADD CONSTRAINT ck_task_settings_global_filter "
+                "CHECK (true)",
+                "COMMENT ON CONSTRAINT ck_task_settings_global_filter ON task_settings IS "
+                "'a filter rule has its filter text (040_task_rule)'",
+            ],
+            "constraint ck_task_settings_global_filter that is not 040's",
+        ),
+    ],
+)
+def test_040_refuses_an_impostor_check(label, ddl, fragment):
+    with throwaway_db(f"schema_040_check_{label}") as url:
+        _seed_040(url)
+        for statement in ddl:
+            sql(url, statement)
+        before = rows_040(url)
+        refuse_040(url, must_mention=[fragment, "Nothing has been changed"])
+        assert rows_040(url) == before
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        ("unmarked_extra_column", ["ALTER TABLE task_settings ADD COLUMN squat integer"],
+         "task_settings already exists but its columns differ"),
+        (
+            "040_name_other_comment",
+            ["COMMENT ON COLUMN task_settings.task_rule IS 'anything (099_whatever)'"],
+            "task_settings already exists but its columns differ",
+        ),
+        (
+            "040_check_other_comment",
+            ["COMMENT ON CONSTRAINT ck_task_settings_task_rule ON task_settings IS "
+             "'x (040_y)'"],
+            "task_settings already exists but its constraints differ",
+        ),
+    ],
+)
+def test_039_still_refuses_unmarked_units_on_task_settings_at_head(label, ddl, fragment):
+    """039's allow-list leaves out only 040's five units, each with its exact
+    marker: anything else on `task_settings` is still foreign to 039."""
+    with throwaway_db(f"schema_040_039_strict_{label}") as url:
+        for statement in ddl:
+            sql(url, statement)
+        refuse_039(url, must_mention=[fragment, "Nothing has been changed"])
+
+
+def test_039s_settings_allow_list_is_exactly_040s_units():
+    import importlib.util
+
+    def load(name):
+        path = _harness.ROOT / "alembic" / "versions" / name
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    m039, m040 = load("046_task_tools.py"), load("047_task_rule.py")
+    assert m039.LATER_SETTINGS_COLUMNS == {c: marker for c, *_r, marker in m040.COLUMNS}
+    assert m039.LATER_SETTINGS_CONSTRAINTS == {
+        name: marker for name, _p, marker, _cols in m040.CHECKS
+    }
+    assert m039.LATER_SETTINGS_COLUMNS == {k: v[3] for k, v in M040_COLUMNS.items()}
+    assert m039.LATER_SETTINGS_CONSTRAINTS == M040_CHECKS
+
+
+@pytest.mark.parametrize(
+    "values,check",
+    [
+        ("(7, 'any', NULL)", "ck_task_settings_task_rule"),
+        ("(7, 'filter', NULL)", "ck_task_settings_global_filter"),
+        ("(7, NULL, '  ')", "ck_task_settings_global_filter"),
+        ("(7, 'fields', '')", "ck_task_settings_global_filter"),
+    ],
+)
+def test_040_checks_refuse_an_unevaluable_rule(values, check):
+    with throwaway_db("schema_040_checks") as url:
+        insert_user_039(url, 7, "seven")
+        with pytest.raises(asyncpg.CheckViolationError) as refused:
+            sql(url, f"INSERT INTO task_settings (user_id, task_rule, global_filter) "
+                     f"VALUES {values}")
+        assert check in str(refused.value)
+        sql(url, "INSERT INTO task_settings (user_id, task_rule, global_filter) "
+                 "VALUES (7, 'filter', '#task')")
+        sql(url, "UPDATE task_settings SET task_rule = 'fields', global_filter = NULL")
+        with pytest.raises(asyncpg.CheckViolationError):
+            sql(url, "UPDATE task_settings SET task_rule = 'filter'")
+
+
+def test_040_a_previous_image_insert_and_update_still_save():
+    """The v1.3.0 settings save names only its own columns; against 040 the
+    new columns keep NULL, empty and NULL, which both CHECKs admit."""
+    with throwaway_db("schema_040_previous_image") as url:
+        insert_user_039(url, 7, "seven")
+        sql(url, "INSERT INTO task_settings (user_id, timezone, excluded_folders, "
+                 "excluded_note_tags, set_done_date) VALUES (7, 'UTC', '{A/}', '{}', true) "
+                 "ON CONFLICT ON CONSTRAINT uq_task_settings_user_id DO UPDATE SET "
+                 "timezone = excluded.timezone, updated_at = now()")
+        sql(url, "UPDATE task_settings SET set_done_date = false, updated_at = now() "
+                 "WHERE user_id = 7")
+        assert [r[-3:] for r in rows_040(url)] == [(None, [], None)]
+
+
+def test_040_downgrade_round_trip():
+    with throwaway_db("schema_040_round_trip") as url:
+        _seed_040(url)
+        before_039 = [r[:10] for r in rows_040(url)]
+        result = _harness.run_alembic(url, "downgrade", "046", dimensions=DIM)
+        assert "discarding the task rule, task tags or global filter text of 2" \
+            in result.stdout, result.stdout
+        assert alembic_version(url) == "046"
+        cat = catalogue_040(url)
+        assert all(v is None for v in cat["columns"].values()) and cat["checks"] == {}
+        # Exactly 039's shape, which 039's own reconcile accepts.
+        assert_039_shape(url)
+        _, columns, constraints = catalogue_039(url)["settings"]
+        assert [c[:3] for c in columns] == M039_SETTINGS_COLUMNS
+        assert {k: v[:2] for k, v in constraints.items()} == M039_SETTINGS_CONSTRAINTS
+        assert rows_039(url)[2] == before_039
+        _harness.run_alembic(url, "stamp", "045", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "046", dimensions=DIM)
+        assert rows_039(url)[2] == before_039
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert_040_shape(url)
+        assert [r[10:] for r in rows_040(url)] == [(None, [], None)] * 3
+        assert [r[:10] for r in rows_040(url)] == before_039
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_040_downgrade_leaves_units_it_did_not_create():
+    with throwaway_db("schema_040_downgrade_foreign") as url:
+        sql(url, "COMMENT ON CONSTRAINT ck_task_settings_global_filter ON task_settings "
+                 "IS 'somebody else'")
+        sql(url, "COMMENT ON COLUMN task_settings.task_tags IS NULL")
+        result = _harness.run_alembic(url, "downgrade", "046", dimensions=DIM)
+        out = result.stdout
+        assert "leaving constraint ck_task_settings_global_filter on task_settings" in out
+        assert "leaving task_settings.task_tags in place" in out
+        assert "leaving task_settings.global_filter in place" in out
+        assert alembic_version(url) == "046"
+        cat = catalogue_040(url)
+        assert set(cat["checks"]) == {"ck_task_settings_global_filter"}
+        # task_rule is read by the surviving CHECK, so it stays as well.
+        assert {c for c, v in cat["columns"].items() if v is not None} == {
+            "task_rule", "task_tags", "global_filter"}
 
 
 # Retained fork OIDC and temporal schema tests (identities025/026).

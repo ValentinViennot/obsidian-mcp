@@ -2,3 +2,6 @@
 # the command. Keep them LF in every checkout, including Windows ones with
 # core.autocrlf=true.
 *.sh text eol=lf
+
+# Exact HTTP-response snapshots retain template-generated whitespace as data.
+tests/golden/**/*.golden -whitespace

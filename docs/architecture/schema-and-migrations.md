@@ -26,7 +26,10 @@ that their migrations left nullable (`api_keys.is_active/created_at`,
 `ck_oauth_clients_auth_method_secret` that migration 010 creates was **absent
 on the live database** while `alembic_version` read 012 — `alembic check`
 cannot see that at all, and neither can a lookup by constraint name, which a
-same-named `CHECK (true)` would satisfy while enforcing nothing.
+same-named `CHECK (true)` would satisfy while enforcing nothing. (038, #420,
+later replaces that CHECK's definition to admit `private_key_jwt` with no
+secret, keeping 013's COMMENT marker so this downgrade still reads it; see
+[038](#038-private_key_jwt-columns-on-oauth_clients-420).)
 
 Migration `013_schema_reconciliation` fixes both and enforces the *complete*
 010 shape rather than just the missing piece, because how the live database
@@ -766,6 +769,9 @@ after each.
 - `note_tasks` is **derived** for backups (#348): schema-only in `make
   db-backup` and the Kubernetes backup Job.
 - `change-feed` (#351) owns 033.
+- **Since 039, 032 carries an allow-list** (see "039" below): its complete
+  comparison of `note_tasks` leaves out exactly 039's named units with their
+  exact markers.
 
 ## The session TimeZone is UTC
 
@@ -1042,7 +1048,7 @@ the backup stops being a backup.
 
 ### Derived vs durable tables (#348)
 
-Twenty-one tables, two kinds. **Six are a cache of the vault plus
+Twenty-two tables, two kinds. **Six are a cache of the vault plus
 settings** and are dumped schema-only by `make db-backup` and the Kubernetes
 backup Job (`pg_dump --exclude-table-data=<table>` for each; `BACKUP_FULL=1`
 dumps their rows too):
@@ -1060,7 +1066,7 @@ The schema (DDL, the `halfvec` expression index, `alembic_version`) is still
 in the dump, so a restore followed by `alembic check` is clean, and an empty
 index over a non-empty vault is the ordinary first-start case — the #309
 guard refuses the *inverse* (an empty root over a populated index). The
-other **fifteen are durable and are why backups and alembic cannot go away**:
+other **sixteen are durable and are why backups and alembic cannot go away**:
 `users` (including the index-provenance columns, which survive a restore and
 let the first pass classify the root), `api_keys`, `oauth_clients`,
 `oauth_codes`, `oauth_tokens`, `transfer_tokens`, `user_sessions`,
@@ -1071,7 +1077,8 @@ never reads `indexer_runs`, which is why the pass history can be derived), and
 the change feed's `note_events`, `note_event_scopes` and `note_event_gaps`
 (#351: history, sequence counters and retention watermarks are not in the
 vault, and a cursor survives a restore only if events and counters return
-together). `tests/test_backup_derived_tables.py` pins both lists against
+together), and `task_settings` (#428: a user's saved timezone, exclusions
+and write behaviours exist nowhere else). `tests/test_backup_derived_tables.py` pins both lists against
 `src/models/db.py`; a new table fails it until classified. The restore
 runbook is in `DEPLOYMENT.md` (compose) and `docs/deployment-kubernetes.md`.
 
@@ -1204,7 +1211,8 @@ version (027's vacuum thresholds). Only table ownership is needed
 
 One nullable `VARCHAR(2048)` and one CHECK, `ck_oauth_clients_cimd_shape`.
 The URL is present exactly when `client_id LIKE 'cimd\_%'`, and such a row is
-`token_endpoint_auth_method = 'none'` with no secret hash. There is no backfill:
+`token_endpoint_auth_method = 'none'` with no secret hash. (038 widens the
+method to `none` or `private_key_jwt`, still with no secret.) There is no backfill:
 every existing row is a DCR registration and already satisfies it.
 `client_id` is **not** widened. The synthetic id is `cimd_` + 59 hex of an
 HMAC, so `oauth_codes.client_id`, `oauth_tokens.client_id` and both
@@ -1336,3 +1344,226 @@ and stamp-back replay preserves named grants. Revocation is deliberately not
 reversed by downgrade. `tests/integration/test_named_connections_pg.py` checks
 fresh cutover, key preservation, replay, clean Alembic comparison and real
 code-exchange/refresh inheritance.
+## 038: `private_key_jwt` columns on `oauth_clients` (#420)
+
+Four nullable columns and three CHECKs, so the synthetic CIMD row can pin how
+its client authenticates at `/token` and `/revoke` and which keys it
+authenticates against. There is no backfill, and every existing row reads NULL
+in all four.
+
+| column | type | meaning |
+| --- | --- | --- |
+| `jwks_uri` | `VARCHAR(2048)` | the document's pinned, same-origin JWKS URL |
+| `token_endpoint_auth_signing_alg` | `VARCHAR(16)` | the document's pinned alg, if it declared one |
+| `jwks_snapshot` | `JSONB` | the validated, normalised `{"keys": [...]}` that verification reads |
+| `jwks_fetched_at` | `TIMESTAMPTZ` | the snapshot's **origin** fetch time, which drives the 24 h stale refetch |
+
+**The method is the existing `token_endpoint_auth_method` column** (010,
+reconciled by 013). It already reads `none` on every CIMD row, which is exactly
+what an existing CIMD client is. A second method column would need a backfill
+and would be a second answer to the question `_client_authenticated` already
+asks of this one, and the two could disagree.
+
+**The CHECKs:**
+- `ck_oauth_clients_auth_method_secret` is **replaced**. Its `none` and
+  `client_secret_post` clauses are unchanged, and a third admits
+  `private_key_jwt` with no secret hash. The replacement keeps the
+  constraint's COMMENT. 013 marks this CHECK, and 013's downgrade reads that
+  marker, so dropping the marker here would silently change what a later
+  downgrade to 012 does.
+- `ck_oauth_clients_cimd_shape` (036) is **replaced**. A metadata URL exists
+  exactly when the id starts `cimd_`, and such a row has no secret and a
+  method in (`none`, `private_key_jwt`).
+- `ck_oauth_clients_private_key_jwt_shape` is **new**:
+  - `private_key_jwt` implies a CIMD row with `jwks_uri`, `jwks_snapshot` and
+    `jwks_fetched_at` all set;
+  - any other method implies all four new columns NULL;
+  - the alg is NULL or one of `RS256`, `PS256`, `ES256`.
+
+  A DCR row can never be `private_key_jwt`, and a `private_key_jwt` row
+  without keys cannot be represented. That is the database's half of "a
+  key-holding client never authenticates without its key".
+
+**Re-runnable by reconciliation**, 036's rule. These are the rules:
+- `search_path` is pinned to `public` and asserted, `lock_timeout` /
+  `statement_timeout` are set, and all are `RESET` at the end.
+- Each column carries a comment marker (`created by
+  038_oauth_cimd_private_key_jwt: …`), mirrored byte-identically by the
+  `_OAUTH_CLIENT_PKJWT_*_MARKER` constants in `src/models/db.py`, so
+  `alembic check` compares it. Every column is judged before any is added. A
+  column is adopted only with the exact type, nullable, no default and its
+  marker. Anything else is refused by name, and nothing changes.
+- A replaced CHECK is handled by its current definition:
+  - 038's definition is kept;
+  - its predecessor's definition (left by a stamp-back) is replaced;
+  - an absent CHECK is created;
+  - anything else is refused.
+
+  Definitions are compared with what this server prints for a `NOT VALID`
+  probe constraint created and dropped in the same transaction, never with a
+  hand-written rendering.
+- The new CHECK is adopted only when it has 038's definition, is validated,
+  and carries `CONSTRAINT_MARKER`.
+
+**The downgrade refuses while any `private_key_jwt` row exists**, naming the
+count. Dropping the columns would leave grants whose client can no longer
+authenticate. Delete those clients in the panel first; their grants go with
+them. Otherwise the downgrade drops the new CHECK and the four columns and
+restores 036's exact two CHECK definitions, carrying their comments. 036's own
+downgrade then still refuses while any CIMD row exists. Nothing needs
+superuser: table ownership suffices, and `test_nonsuperuser_migrations_pg.py`
+runs it as the owning role.
+
+**The gate.** `HEAD_REVISION` in `tests/integration/test_schema_check.py` is
+now `"038"`. Its 038 cases:
+- 038 chains from 037 and is head;
+- the `private_key_jwt` shapes on a fresh database;
+- an absent `ck_oauth_clients_private_key_jwt_shape` is recreated (#53's
+  test);
+- 013's marker survives the upgrade and the downgrade.
+
+Every existing `none` / `client_secret_post` enforcement case is kept.
+`tests/integration/test_oauth_cimd_pkjwt_migration_pg.py` covers the rest:
+- the upgrade over DCR and `none` CIMD rows leaves them unchanged and valid;
+- a re-run reconciles, and a predecessor definition left by a stamp-back is
+  replaced;
+- foreign or unmarked columns and constraints of our names are refused;
+- the CHECK matrix;
+- the downgrade refusing with a `private_key_jwt` row present.
+
+## 039: task ids, the refresh columns and `task_settings` (#428)
+
+039 creates exactly what the task tools need and writes no row.
+
+- **`note_tasks`** (derived) gains `task_key char(12)`, `key_ordinal` and
+  `key_count` (`integer`), `description_key char(16)`, `text_fold text`,
+  `tag_prefixes varchar(128)[]`, `recurrence varchar(256)`, `created` and
+  `cancelled` (`date`), `context text`, all NULL until the version-5 pass
+  re-derives the row, plus `recurrence_cut` and `context_cut`
+  (`BOOLEAN NOT NULL DEFAULT false`). `ck_note_tasks_key_shape`: the key
+  triple is all NULL, or all set with `1 ≤ key_ordinal ≤ key_count`. Indexes:
+  `ix_note_tasks_tag_prefixes` (GIN, the hierarchical tag filters) and
+  `ix_note_tasks_open_desc` (`description_key WHERE state = 'open'`, the
+  duplicate lookup). The columns are nullable so a rolling deploy with the
+  previous image keeps working: its inserts write NULLs, which the CHECK
+  admits, and it never reads them.
+- **`notes_metadata.tasks_source_hash varchar(64)`** and
+  **`tasks_refreshed_at timestamptz`**, nullable: which bytes a note's task
+  rows describe, and when a task tool last refreshed them (the invariant and
+  R1–R4 are in [indexing and embeddings](indexing-and-embeddings.md#the-write-time-task-refresh-428)).
+- **`task_settings`** (durable): `id`, `user_id` (FK `users.id`
+  `ON DELETE CASCADE`, `UNIQUE NULLS NOT DISTINCT`, NULL being the
+  single-user scope), `timezone varchar(64)` (NULL: the server default),
+  `excluded_folders varchar(1024)[]` and `excluded_note_tags varchar(128)[]`
+  (`NOT NULL DEFAULT '{}'`, at most 32 each, enforced by the service), four
+  nullable booleans (`set_done_date`, `set_cancelled_date`,
+  `set_created_date`, `next_recurrence_below`; NULL means the environment
+  default) and `updated_at`. No row means every value is the default, so a
+  deployment that never saves the panel card behaves as before. It is dumped
+  with its rows (see "Derived vs durable tables").
+- **No table rewrite.** Every new column is nullable or has a constant
+  default; the CHECK's validation and the two index builds scan
+  `note_tasks` once. `lock_timeout` 10 s and `statement_timeout` 60 s are
+  set and `RESET`, `search_path` is pinned, no extension is created, and
+  nothing needs superuser (`test_nonsuperuser_migrations_pg.py`).
+- **Reconcile or refuse**, 032/038's shape. Every unit carries a
+  `… (039_task_tools)` comment marker, mirrored byte-identically in
+  `src/models/db.py` so `alembic check` stays clean (the partial and GIN
+  indexes are declared with `postgresql_where` / `postgresql_using`). Each
+  column is verified by type, nullability, default and marker; the CHECK by
+  its validated definition against a scratch probe; each index by its full
+  `pg_get_indexdef` against a probe; the table against a TEMP twin of its own
+  DDL plus the foreign key's printed definition. Any other same-named object
+  is refused by name before anything is created.
+- **032's allow-list.** 032 compares `note_tasks` completely, so a stamp-back
+  that re-runs 032 over a head database would refuse 039's units as foreign.
+  032 therefore leaves out **exactly** 039's named columns, CHECK and two
+  indexes, each only with its exact 039 marker (`LATER_COLUMNS`,
+  `LATER_CONSTRAINTS`, `LATER_INDEXES`, byte-identical to 039's literals). Any
+  other name, or the right name with any other comment, is still compared and
+  refused; nothing is inferred from a comment's shape. **A future revision
+  that adds a unit to `note_tasks` must extend those lists on purpose**, or
+  the stamp-back re-run of 032 will refuse it.
+- **Downgrade** drops only marked units, each decided on its own, printing
+  what it leaves and why. It drops `task_settings` **with its rows**,
+  printing the count: the saved task settings are lost, and the previous
+  build does not read them. A column read by a surviving unmarked CHECK or
+  index is kept; but PostgreSQL drops a foreign, unmarked index on a dropped
+  039 column along with it (L20).
+- **The gate.** `tests/integration/test_schema_check.py`'s 039 cases cover a
+  fresh upgrade, the stamp-back to 038 and re-upgrade, and an impostor of
+  each unit. (`HEAD_REVISION` is `"040"` since #434.)
+- **Since 040, 039 carries an allow-list too** (see "040" below), for
+  `task_settings`.
+
+## 040: the task rule on `task_settings` (#434)
+
+040 adds exactly three columns and two CHECKs to `task_settings` and writes
+no row. Why the rule exists is in [vault tools](vault-tools.md), "The task
+rule (#434)".
+
+- **Columns**: `task_rule varchar(8)` (nullable; NULL means "the server's
+  rule", `TASKS_RULE` / `TASKS_RULE_TAGS` / `TASKS_GLOBAL_FILTER` as one
+  unit), `task_tags varchar(128)[] NOT NULL DEFAULT '{}'` (≤ 32, enforced by
+  the service, mirroring `excluded_note_tags`) and `global_filter
+  varchar(64)` (nullable; NULL rather than empty means none).
+- **CHECKs**, which make an unevaluable stored rule unrepresentable:
+  `ck_task_settings_task_rule` (`task_rule IN ('all','fields','filter')`,
+  NULL passes) and `ck_task_settings_global_filter` (`(global_filter IS NULL
+  OR btrim(global_filter) <> '') AND (task_rule IS DISTINCT FROM 'filter' OR
+  global_filter IS NOT NULL)`). The service also takes a per-scope advisory
+  lock before reading the row and treats a violation of the second at flush
+  as its readable refusal; the query side still treats any rule it cannot
+  evaluate as `all` and says so, so a manual edit cannot drop rows uncounted.
+- **No data written.** No row is updated; `ADD COLUMN … DEFAULT '{}'` is
+  metadata-only on PostgreSQL 16, and both CHECKs admit every existing row
+  (NULL, `'{}'`, NULL). `search_path` pinned, `lock_timeout` /
+  `statement_timeout` set and `RESET`, no superuser, no extension
+  (`test_nonsuperuser_migrations_pg.py` covers 040).
+- **Reconcile or refuse**, 039's shape. Every unit carries an exact
+  `… (040_task_rule)` comment marker (`task rule kind`, `task rule task
+  tags`, `task rule global filter text`, `task rule kinds`, `a filter rule
+  has its filter text`), mirrored byte-identically in `src/models/db.py`
+  (both CHECKs in `TaskSettings.__table_args__`) so `alembic check` stays
+  clean. A column is verified by type, nullability, default and marker; a
+  CHECK by its validated definition against a TEMP-table probe and its
+  marker; a same-named object of another shape, or without the marker, is
+  refused by name before anything is created. `downgrade()` drops only
+  marked units, the CHECKs first.
+- **039's allow-list, the second after 032's.** 039 compares `task_settings`
+  completely against a TEMP twin of its own DDL, so a stamp-back to 038 that
+  re-runs 039 over a 040 database would refuse the table as foreign. 039
+  therefore leaves out **exactly** 040's three columns and two CHECKs, each
+  only with its exact 040 marker (`LATER_SETTINGS_COLUMNS`,
+  `LATER_SETTINGS_CONSTRAINTS` in `039_task_tools.py`, byte-identical to
+  040's literals), exactly as 032 does for 039's `note_tasks` units. Any
+  other extra column or constraint, or one of these names with another
+  comment, is still compared and refused. 032's list is untouched (040 adds
+  nothing to `note_tasks`). **A future revision that adds a unit to
+  `task_settings` must extend 039's lists on purpose.**
+- **The previous image.** An already-running v1.3.0 process keeps working
+  against 040 (it never reads the new columns; its inserts leave them NULL,
+  `'{}'`, NULL, which the CHECKs admit). A restarted v1.3.0 image cannot
+  start: its migration step ends at 039 and 040 is an unknown revision.
+  Rollback is roll-forward, or `alembic downgrade 039` **with the 040-aware
+  image** first, which drops the columns and with them every saved task
+  rule, task tag and filter text (L6).
+- **The gate.** `HEAD_REVISION` is `"040"`. The 040 cases cover a fresh
+  upgrade, stamp-backs to 039 and to 038 over head (both reconcile, 039's
+  allow-list exercised), impostors (an unmarked `task_rule`, a
+  `task_tags varchar(64)[]`, an unmarked CHECK), both CHECKs refusing their
+  bad rows, and the upgrade → `downgrade 039` → upgrade round trip, which
+  asserts 039's exact `task_settings` shape after the downgrade and
+  `alembic check` clean at the end. Running `alembic check` under the
+  039-era models after the downgrade is not available in this tree and is
+  not claimed.
+
+
+## Fork integration, 12 November 2026
+
+The current combined contract and append-only migration map are recorded in
+[the integration note](upstream-sync-20261112.md).
+Fork extraction version 6 derives task ids without changing embedding input;
+classification epoch 7 includes the four new task tools. The fork exposes
+35 tools, 23 to read-only OAuth grants, preserving named Git attribution and
+recoverable synchronization. Ollama remains selected; TEI is optional.

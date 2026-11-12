@@ -435,8 +435,8 @@ to unwind — plaintext requests simply go back to being redirected.
 The app also opens two connections of its own: to PostgreSQL and to the
 embedding endpoint. Both are held to a transport policy at startup.
 
-**Upgrade note.** If the active embedding URL (`OLLAMA_URL`, or
-`OPENAI_BASE_URL` with the OpenAI provider) is `http://` to anything other
+**Upgrade note.** If the active embedding URL (`OLLAMA_URL`, `TEI_URL` with
+the TEI provider, or `OPENAI_BASE_URL` with the OpenAI provider) is `http://` to anything other
 than loopback — the `http://ollama:11434` default included — add this to
 `.env` **before** deploying, or the server refuses to start with a message
 naming it:
@@ -911,6 +911,18 @@ deployment; on a compose-file deployment the equivalents are plain
   `docker compose exec obsidian-mcp alembic check`
   should print "No new upgrade operations detected."
 
+  **Upgrading across migration 040 (task rule, #434)** has its own
+  section, [below](#upgrading-across-migration-040-task-rule-434): new
+  boot refusals for the three task-rule settings (they stop the migration
+  step too), nothing changed until a rule is chosen, and a rollback that
+  needs `alembic downgrade 039` first.
+
+  **Upgrading across migration 039 (task tools, #428)** has its own
+  section, [below](#upgrading-across-migration-039-task-tools-428): a new
+  boot refusal for an invalid `TASKS_DEFAULT_TIMEZONE` (it stops the
+  migration step too), one re-derive pass with nothing re-embedded, and a
+  new concurrency-readiness epoch.
+
   **Upgrading to `hybrid_search` (#354).** No migration and nothing
   re-derived or re-embedded. The release adds a 28th tool, `hybrid_search`,
   and one optional setting, `HYBRID_RRF_K` (default 60, 1–1000; an
@@ -1002,7 +1014,7 @@ deployment; on a compose-file deployment the equivalents are plain
   schema-only data for the six index tables (`notes_metadata`, `note_embeddings`,
   `note_links`, `note_tasks`, `indexer_runs`, `indexer_state`). That smaller dump
   requires reindexing and an explicit historical backfill after restore.
-  Credentials, users, usage, quotas and change-feed records are always included.
+  Credentials, users, usage, quotas, change-feed records and task settings are always included.
   The pre-migration dump is always full. `make db-restore` accepts either kind.
 
   **Restore runbook.** `make db-restore FILE=<dump.sql.gz>` loads a dump
@@ -1440,6 +1452,247 @@ argument is new and optional. Rolling back is a redeploy of the previous
 image; a client still sending `rerank` is then refused by the
 unknown-argument rule.
 
+## Upgrading across migration 040 (task rule, #434)
+
+This release adds a per-user **task rule**: which markdown checkboxes count
+as tasks in default `list_tasks` and `task_agenda` listings and in
+`add_task`'s duplicate check across the index. `all` (every checkbox, the
+behaviour before this release) is the default; `fields` and `filter`
+narrow it. Why, and how to choose, is in the README's
+[Which checkboxes are tasks](README.md#which-checkboxes-are-tasks). What an
+operator has to know:
+
+- **Nothing changes until a rule is chosen.** With the settings unset and
+  no rule saved on any Tasks card, every response, every write and every
+  outstanding `list_tasks` cursor is byte-identical to the previous
+  release. No tool, argument or schema is added; the descriptions of
+  `list_tasks`, `task_agenda` and `add_task` gain a sentence about the
+  rule.
+- **Migration 040.** It adds to `task_settings` the columns `task_rule
+  varchar(8)` (nullable; NULL means "use the server's rule"), `task_tags
+  varchar(128)[] NOT NULL DEFAULT '{}'` and `global_filter varchar(64)`
+  (nullable), and the CHECKs `ck_task_settings_task_rule` (one of `all`,
+  `fields`, `filter`) and `ck_task_settings_global_filter` (a filter text
+  is never blank, and a `filter` rule always has one). It writes no row:
+  the default is metadata-only on PostgreSQL 16 and both CHECKs admit
+  every existing row. Nothing is re-derived or re-embedded. It runs as
+  the database's owning role, needs no superuser, creates no extension,
+  and sets and resets its own `lock_timeout` and `statement_timeout`.
+  Run `make test-schema` before merging; afterwards `alembic check` must
+  print "No new upgrade operations detected."
+- **Three new settings, and new boot refusals for each.** `TASKS_RULE`
+  (`all`; or `fields`, `filter`), `TASKS_RULE_TAGS` (empty;
+  comma-separated task tags for `fields`, at most 32) and
+  `TASKS_GLOBAL_FILTER` (empty; the filter text for `filter`, 1–64
+  characters on one line, with no backtick, Tasks field emoji, `%%`,
+  `<!--` or `-->`, and not beginning like a list item, checkbox, heading
+  or quote). They are the server's rule for every user who has not chosen
+  one on the panel's Tasks card, and are inherited as one unit. An
+  invalid value stops the app with a message naming the variable, and
+  `TASKS_RULE=filter` with an empty `TASKS_GLOBAL_FILTER` stops it naming
+  both. The validation runs wherever the settings are loaded, so it also
+  stops `alembic upgrade head` (the compose `run --rm … alembic` step,
+  `make deploy`'s migrate step, the Kubernetes `migrate` initContainer).
+  Set the values in the `.env` (or ConfigMap) that every one of those
+  reads, or leave them unset.
+- **Quote the filter text.** In `.env`, write
+  `TASKS_GLOBAL_FILTER="#task"`. Unquoted, a hash sign after a space
+  starts a comment, so `TASKS_GLOBAL_FILTER= #task` reads as empty (and,
+  with `TASKS_RULE=filter`, refuses startup) and `TODO #task` reads as
+  `TODO`. In YAML (a ConfigMap) the value must be quoted too, or `#task`
+  is read as a comment.
+- **`task_agenda`'s minimum response cap** is 3,121 characters while a
+  rule other than `all` is in force for the caller (2,800 otherwise),
+  because the response carries one more header line of at most 320
+  characters. It binds only if `MAX_READ_RESPONSE_CHARS` (default 40,000)
+  was lowered below that; such a call is refused `response_cap_too_small`.
+- **Backups.** The new columns belong to `task_settings`, which is
+  already durable and dumped with its rows; nothing changes in
+  `make db-backup` or the Kubernetes backup Job.
+- **Rollback is roll-forward.** Two cases differ:
+  - a server process of the previous image that is **already running**
+    during a rolling deploy keeps working against 040: it never reads the
+    new columns, and its inserts leave them NULL, `'{}'` and NULL, which
+    both CHECKs admit;
+  - a previous image that is **restarted or newly scheduled cannot
+    start**: its migration step runs `alembic upgrade head`, its scripts
+    end at 039, and a database at 040 is an unknown revision to it.
+
+  To run the previous image, first run `alembic downgrade 039` **with the
+  new image** (for example
+  `docker compose run --rm obsidian-mcp alembic downgrade 039` before
+  switching the image), then start the previous image. The downgrade
+  drops only the five marked units, the CHECKs first, and with them
+  **every saved task rule, task tag and filter text**; the rest of
+  `task_settings` is untouched. The previous image then lists every
+  checkbox, without any statement, because it knows no rule.
+
+## Upgrading across migration 039 (task tools, #428)
+
+This release adds four tools (`task_agenda`, `complete_task`,
+`update_task`, `add_task`) and new `list_tasks` arguments, for checkbox
+tasks in the vault. A vault without checkboxes is unaffected, and so is
+every other tool. What an operator has to know:
+
+- **Check `TASKS_DEFAULT_TIMEZONE` before deploying: it is a new boot
+  refusal.** Unset, it defaults to `UTC`. When set, it must be an IANA
+  timezone the image knows (`Europe/Berlin`, `America/New_York`).
+  Anything else stops the app with a message naming the variable. That
+  includes a misspelling, a path, and host-only names that only some
+  systems carry: `localtime`, `Factory`, `posixrules`, and anything under
+  `posix/` or `right/`. The validation runs wherever the settings are
+  loaded, so the same value also stops `alembic upgrade head` (the
+  compose `run --rm … alembic` step, `make deploy`'s migrate step, the
+  Kubernetes `migrate` initContainer). Set it in `.env` (or the ConfigMap)
+  that every one of those reads, or leave it unset.
+- **`tzdata` is now pinned in `requirements.txt`.** Timezone names come
+  from that package rather than the image's OS zone files, so the set of
+  valid names is the same on every host. `make audit` covers it.
+- **Migration 039.** It adds to `note_tasks` the nullable columns
+  `task_key`, `key_ordinal`, `key_count`, `description_key`,
+  `text_fold`, `tag_prefixes`, `recurrence`, `created`, `cancelled` and
+  `context`, plus `recurrence_cut` and `context_cut` (`NOT NULL DEFAULT
+  false`), the CHECK `ck_note_tasks_key_shape`, and two indexes
+  (`ix_note_tasks_tag_prefixes`, GIN; `ix_note_tasks_open_desc`, partial).
+  It adds `notes_metadata.tasks_source_hash` and `tasks_refreshed_at`
+  (nullable), and creates the table `task_settings`. It writes no row,
+  and nothing rewrites a table: every new column is nullable or has a
+  constant default, and only the CHECK and the two indexes scan
+  `note_tasks` once. It runs as the database's owning role, needs no
+  superuser and creates no extension. It sets `lock_timeout = 10s` and
+  `statement_timeout = 60s` for itself. Run `make test-schema` before
+  merging; afterwards `alembic check` must print "No new upgrade
+  operations detected."
+- **One re-derive pass, nothing re-embedded.** The extraction version
+  moves to 5, so the first index pass after the upgrade (the startup
+  full-hash pass) parses every note once, at the cost of the earlier
+  version bumps, and fills the new columns. Version 5 shares version 4's
+  embedding cleaner, so no note is re-embedded and no provider call is
+  made. Until that pass finishes:
+  - `list_tasks` rows not yet re-derived show `id pending`, and the
+    header counts them as `task ids pending: N tasks`;
+  - the `text` and `recurring` filters fall back to the older columns
+    and add an `Incomplete list: … approximate until the next index
+    pass` notice; every other filter is exact;
+  - `move_note(rewrite_links=True)` answers `index_not_ready`, as after
+    every extraction-version bump.
+
+  The task write tools work during the window, because they read the
+  note itself.
+- **`list_tasks` cursors issued before the upgrade are refused once**,
+  with `invalid_argument` (the cursor format is now version 2). The
+  caller lists again without a cursor. Other visible changes for an
+  existing `list_tasks` caller: rows gain ` — id <id>`, the header gains
+  `task ids pending`, `tags=` matches nested tags case-insensitively
+  (every row that matched before still matches) and the `tags:` header
+  echo is lower-cased, a `tags` value outside the tag grammar (`["2024"]`,
+  `["a.b"]`, a non-ASCII tag) that used to return an empty page is now
+  refused `invalid_argument`, a path containing a backtick is now shown
+  with the backtick escaped as `\u0060` (it was printed raw), and `due_by` /
+  `scheduled_by` also accept relative dates, which changes the wording of
+  the malformed-date refusal.
+- **A new concurrency-readiness epoch.** `complete_task`, `update_task`
+  and `add_task` join the `write` class and `task_agenda` the `scan`
+  class, so `CLASS_MAPPING_VERSION` moves from 5 to 6. The mapping
+  version is part of the readiness epoch, and `make concurrency-report`
+  evaluates only the configured epoch: evidence gathered before the
+  upgrade does not count, and a window that spans the upgrade reads
+  `INSUFFICIENT_DATA`. Collect a fresh window before promoting
+  `MCP_CONCURRENCY_MODE`. The tool ceilings and their defaults are
+  unchanged.
+- **The write bucket now covers eleven tools.** The three task write
+  tools pass the same per-principal write bucket as `edit_note`
+  (`MCP_WRITE_RATE_LIMIT_*`). A read-only OAuth grant lists 20 tools
+  instead of 19, and API keys and `readwrite` grants list 32.
+- **Five new settings**, all optional: `TASKS_DEFAULT_TIMEZONE` (`UTC`),
+  `TASKS_SET_DONE_DATE` (`true`), `TASKS_SET_CANCELLED_DATE` (`true`),
+  `TASKS_SET_CREATED_DATE` (`false`), `TASKS_NEXT_RECURRENCE_BELOW`
+  (`false`). They are the server defaults. Each user overrides them on
+  the panel's Tasks card (the Account page in multi-user mode, the
+  Settings page in single-user mode). See the README's Configuration
+  table and `.env.example`.
+- **Backups.** `task_settings` is durable user data and is dumped with
+  its rows by `make db-backup` and the Kubernetes backup Job.
+  `note_tasks` stays derived and schema-only; the first pass after a
+  restore rebuilds it.
+- **Rollback is roll-forward.** The previous image runs against the 039
+  schema. It never reads the new columns or `task_settings`, and its task
+  rows are inserted with the new columns NULL, which the CHECK allows.
+  Because it does not know extraction version 5, it re-derives every note
+  once and, having no version-5 embedding cleaner, clears every note's
+  embedding certification. Its embed pass then re-chunks every note and
+  reuses every stored vector (#281), so no provider call is made, while
+  `semantic_search` marks those notes stale until it catches up. Rolling
+  forward again is one more re-derive pass. `alembic downgrade 038` drops
+  only objects carrying 039's marker: the new columns, the CHECK, the two
+  indexes and the `task_settings` table **with every saved task
+  setting** (it prints how many rows it dropped). Note that PostgreSQL
+  drops any other index built on a dropped column along with it.
+
+## OAuth CIMD `private_key_jwt` clients: ChatGPT (#420)
+
+**Migration 038** adds four nullable columns to `oauth_clients`
+(`jwks_uri`, `token_endpoint_auth_signing_alg`, `jwks_snapshot`,
+`jwks_fetched_at`). It replaces `ck_oauth_clients_auth_method_secret` and
+`ck_oauth_clients_cimd_shape` and adds `ck_oauth_clients_private_key_jwt_shape`.
+There is no backfill, and it runs in seconds. Run `make test-schema` before
+merging, and `alembic check` must be clean afterwards. The previous image runs
+against the 038 schema, because it writes only `none` rows. The downgrade
+(`alembic downgrade 037`) **refuses while any `private_key_jwt` client row
+exists**, naming the count. Delete those clients on the panel's OAuth page
+first; their grants go with them. There are no new settings.
+
+**What changes.** ChatGPT's metadata document declares
+`token_endpoint_auth_method: private_key_jwt`. Before this release that was
+refused, with `oauth_authorize_refused
+reason=client_metadata.auth_method_unsupported`. ChatGPT now connects through
+CIMD and authenticates at `/token` and `/revoke` with a signed client
+assertion. While `OAUTH_CIMD_ENABLED` is true, the AS metadata adds
+`private_key_jwt` and `token_endpoint_auth_signing_alg_values_supported`.
+
+**Outbound access.** At consent the server also fetches the client's
+`jwks_uri`, which must be on the same origin as its document
+(`https://chatgpt.com/oauth/jwks.json` for ChatGPT). At `/token` and
+`/revoke` it refetches that URL, before opening any database transaction,
+in two cases:
+- the assertion names a key the stored set lacks;
+- the stored set is more than 24 h old.
+
+The refetch happens at most once per URL per minute. If a stale-only refetch
+fails, the request proceeds on the stored keys, so an outage at the client's
+origin does not break refreshes. The refetch runs even while
+`OAUTH_CIMD_ENABLED=false`. Each attempt is one `oauth_client_jwks_refetched`
+record (`trigger`, `outcome`; WARNING on `failed`).
+
+**Verifying a ChatGPT connection.**
+
+```bash
+kubectl logs deploy/obsidian-mcp | grep '"msg": "oauth_consent_granted"' \
+  | jq -c 'select(.cimd_host == "chatgpt.com") | {registration_kind, cimd_host, outcome}'
+# {"registration_kind":"cimd","cimd_host":"chatgpt.com","outcome":"created"}
+```
+
+**A ChatGPT connector created before this release must be deleted and
+re-added in ChatGPT.** Reconnecting is not enough. ChatGPT caches the AS
+metadata per connector and chooses its token authentication method from that
+copy, using the intersection of its document's
+`token_endpoint_auth_methods_supported` with ours. With the pre-#420 metadata
+the intersection is only `none`, so it sends no assertion. Because the row is
+`private_key_jwt`, the `/token` request is refused with
+`reason=invalid_client.assertion_missing`. A newly added connector re-reads
+the metadata and signs. This was observed on the reference deployment on
+release day. Expect the same after any later change to
+`token_endpoint_auth_methods_supported`.
+
+A refused assertion is an `oauth_token_refused` with
+`reason=invalid_client.<sub>`, for example
+`invalid_client.assertion_not_yet_valid` (the client's clock is more than
+30 s fast) or `invalid_client.assertion_kid_unknown`. `secret_presented` is
+the one sub without the `assertion_` prefix. The reasons are listed in
+`docs/architecture/security-event-logging.md`. A failed assertion never
+revokes anything. The full rules are in `docs/architecture/oauth-and-grants.md`,
+"`private_key_jwt` clients (#420)".
+
 ## OAuth CIMD and the resource gate (#357)
 
 **Migration 036** adds `oauth_clients.client_id_metadata_url` (nullable) and
@@ -1448,7 +1701,9 @@ and it runs in seconds. Run `make test-schema` before merging, as for every
 migration, and `alembic check` must be clean afterwards. The downgrade
 (`alembic downgrade 035`) **refuses while any CIMD client row exists**. Delete
 those clients on the panel's OAuth page first; their grants go with them, and
-their users reconnect.
+their users reconnect. On a database at 038 or later, the downgrade
+passes through 038's first, which refuses while a `private_key_jwt` row exists
+([above](#oauth-cimd-private_key_jwt-clients-chatgpt-420)).
 
 **What changes on the first request.** The AS metadata advertises
 `client_id_metadata_document_supported: true`. On their next fresh connection

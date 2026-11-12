@@ -144,6 +144,59 @@ TASK_TAG_MAX_CHARS = 128
 TASK_MAX_TAGS = 64
 LIST_TASKS_MAX_TAG_ARGS = 32
 
+# The task tools (#428). Constants, not settings: each is part of a stated
+# contract (design D9, D10, D12), and none is an operator's tuning knob.
+#
+# - `TASK_REFRESH_LOCK_WAIT_MS`: the write-time task refresh's `lock_timeout`
+#   on the note's `notes_metadata` row. Past it the write stands and the
+#   response says `index: may lag (lock_timeout)` (D10).
+# - `TASK_SIMILAR_SCAN_MAX`: candidate rows `add_task`'s similar-task scan
+#   reads before it stops and says so (D9).
+# - `TASK_CONTEXT_MAX_LINES`: continuation lines stored and rendered as a
+#   task's context; placement never uses this cap (D8, D12).
+TASK_REFRESH_LOCK_WAIT_MS = 2_000
+TASK_SIMILAR_SCAN_MAX = 2_000
+TASK_CONTEXT_MAX_LINES = 8
+
+
+#: Names `zoneinfo.available_timezones()` can pick up from a host's OS zone
+#: directory that are not portable IANA zones: `localtime` is whatever the
+#: host is set to, `Factory` is a placeholder, `posixrules` a tzcode
+#: internal, and `posix/` / `right/` are alternative trees. A task setting must
+#: mean the same thing on every host, so these are refused everywhere.
+HOST_ONLY_ZONE_NAMES = frozenset({"localtime", "Factory", "posixrules"})
+_HOST_ONLY_ZONE_PREFIXES = ("posix/", "right/")
+
+
+def is_portable_zone_name(name: str) -> bool:
+    """True for a name that is neither a host-only pseudo-zone nor under one
+    of the alternative trees. Membership in the available set is separate."""
+    return name not in HOST_ONLY_ZONE_NAMES and not name.startswith(_HOST_ONLY_ZONE_PREFIXES)
+
+
+def _validate_timezone_name(value: str, *, variable: str) -> str:
+    """A zone name this build can load, or a ValueError naming `variable`.
+
+    Membership in `zoneinfo.available_timezones()` first — `ZoneInfo` alone
+    would also accept a file-system path that is not an IANA key — then a
+    load, so a listed but unreadable zone is refused too.
+    """
+    import zoneinfo
+
+    name = value.strip() if isinstance(value, str) else value
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"{variable} must name an IANA timezone, e.g. UTC or Europe/Berlin")
+    try:
+        if not is_portable_zone_name(name) or name not in zoneinfo.available_timezones():
+            raise KeyError(name)
+        zoneinfo.ZoneInfo(name)
+    except (KeyError, ValueError, OSError, zoneinfo.ZoneInfoNotFoundError):
+        raise ValueError(
+            f"{variable}={name!r} is not a timezone available to this build. "
+            "Use an IANA name such as UTC, Europe/Berlin or America/New_York."
+        ) from None
+    return name
+
 # Chunks embedded and stored for a single note. Unbounded, the arithmetic is
 # `MAX_NOTE_BYTES` (10 MiB) ÷ `CHUNK_SIZE` (512 tokens, ~4 characters each) ≈
 # 5,120 chunks for one legal note, each of them one sequential, 30 s-bounded
@@ -671,13 +724,29 @@ class Settings(BaseSettings):
     # docs/architecture/search.md.
     search_low_confidence_similarity: float = Field(0.0, ge=0.0, le=1.0, allow_inf_nan=False)
 
-    embedding_provider: Literal["ollama", "openai"] = "ollama"
+    embedding_provider: Literal["ollama", "openai", "tei"] = "ollama"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_embedding_model: str = "text-embedding-3-small"
+    # Hugging Face Text Embeddings Inference (TEI) native API. TEI serves
+    # `POST /embed` with `{"inputs": [...], "truncate": true}` and answers a
+    # bare array of vectors. It takes no model field; the served model is
+    # fixed by the container's `--model-id`. Some TEI builds also expose
+    # `/v1/embeddings`; use the OpenAI provider for those, and this one when
+    # the endpoint has only the native protocol.
+    tei_url: str = "http://tei:80"
+    tei_embedding_model: str = "BAAI/bge-m3"
+    # Inputs per native `/embed` request. A request above the server's
+    # `--max-client-batch-size` is a 413, and a value above the limit `/info`
+    # reports refuses startup. Large full-size batches can exceed the request
+    # timeout on a shared GPU (measured ~0.6 s per 512-token input). The
+    # default matches Ollama's safe 16; the limit stays available for a
+    # faster endpoint.
+    tei_embed_batch_size: int = Field(16, ge=1, le=256)
     # ── Embedding transport (#185) ─────────────────────────────────────────
     #
-    # The **active** provider's URL (`OLLAMA_URL` or `OPENAI_BASE_URL`) must be
+    # The **active** provider's URL (`OLLAMA_URL`, `OPENAI_BASE_URL`, or
+    # `TEI_URL`) must be
     # `https`, or `http` to a literal loopback host — or `http` to anything
     # else only when this override is true. Default false (owner decision
     # 2026-09-22): an `http://` URL never becomes encrypted by itself, so the
@@ -885,6 +954,107 @@ class Settings(BaseSettings):
     # Default **false**, so enabling this change is a no-op for every existing
     # client. Env: WRITE_PRECONDITION_REQUIRED.
     write_precondition_required: bool = False
+
+    # ── Task tools defaults (#428, design D14) ─────────────────────────────
+    #
+    # The values a scope's `task_settings` row falls back to, field by field,
+    # when the row (or the field) is NULL — which is every scope until someone
+    # saves the panel's Tasks card. The four booleans mirror the Obsidian
+    # Tasks plugin's own defaults, so with nothing configured the task tools
+    # write what the plugin would.
+    #
+    # `TASKS_DEFAULT_TIMEZONE` resolves "today" and relative dates. Validated
+    # here, so an unknown name refuses startup naming the variable (and refuses
+    # the migration init container too, which imports these settings: the same
+    # image carries the same zone data, so a name it refuses the app would
+    # refuse as well). `tzdata` is pinned in requirements.txt.
+    tasks_default_timezone: str = "UTC"
+    # "Set done date on every completed task" (✅ <date>).
+    tasks_set_done_date: bool = True
+    # "Set cancelled date on every cancelled task" (❌ <date>).
+    tasks_set_cancelled_date: bool = True
+    # "Set created date on every added task" (➕ <date>).
+    tasks_set_created_date: bool = False
+    # "Next recurrence appears on the line below".
+    tasks_next_recurrence_below: bool = False
+
+    @field_validator("tasks_default_timezone", mode="before")
+    @classmethod
+    def _validate_tasks_default_timezone(cls, v):
+        return _validate_timezone_name(v, variable="TASKS_DEFAULT_TIMEZONE")
+
+    # ── The task rule's server default (#434, design D8, D9) ───────────────
+    #
+    # Which checkboxes count as tasks for a scope whose `task_settings` row
+    # has no rule of its own (`task_rule` NULL, or no row). Inherited as ONE
+    # unit — kind, task tags and filter text together — never field by field:
+    # a row that sets its own rule ignores all three.
+    #
+    # - `TASKS_RULE`: `all` (default; every checkbox, exactly as before),
+    #   `fields` (a task field or a task tag) or `filter` (contains
+    #   `TASKS_GLOBAL_FILTER`, case-sensitively, like the Tasks plugin's
+    #   "Global task filter").
+    # - `TASKS_RULE_TAGS`: comma-separated task tags for `fields` (≤ 32, each
+    #   `#` optional, lower-cased, the tag grammar, no trailing `/`).
+    # - `TASKS_GLOBAL_FILTER`: the filter text for `filter` (1–64 characters,
+    #   one line, no backtick, no field emoji, no `%%`, `<!--` or `-->`, no
+    #   leading list marker / checkbox / heading marker / `>`).
+    #
+    # Validated here by the same functions the panel's save uses
+    # (`task_rule.normalise_*`, imported inside each validator so loading this
+    # module imports nothing that imports it back): an invalid value refuses
+    # startup naming the variable — and refuses the migration init container
+    # too, which imports these settings. That is deliberate: the values are
+    # image-independent text, so a value the init container refuses the app
+    # would refuse as well, and failing before the migration is the earlier,
+    # clearer failure. `TASKS_RULE=filter` with an empty filter text is
+    # refused naming both variables.
+    tasks_rule: str = "all"
+    tasks_rule_tags: Annotated[list[str], NoDecode] = []
+    tasks_global_filter: str = ""
+
+    @field_validator("tasks_rule", mode="before")
+    @classmethod
+    def _validate_tasks_rule(cls, v):
+        from src.services import task_rule
+
+        value, error = task_rule.normalise_rule(v)
+        if error:
+            raise ValueError(f"TASKS_RULE {error}")
+        return value
+
+    @field_validator("tasks_rule_tags", mode="before")
+    @classmethod
+    def _validate_tasks_rule_tags(cls, v):
+        from src.services import task_rule
+
+        if v is None:
+            return []
+        items = v.split(",") if isinstance(v, str) else list(v)
+        items = [str(i).strip() for i in items]
+        tags, errors = task_rule.normalise_task_tags([i for i in items if i])
+        if errors:
+            raise ValueError("TASKS_RULE_TAGS: " + " ".join(errors))
+        return tags
+
+    @field_validator("tasks_global_filter", mode="before")
+    @classmethod
+    def _validate_tasks_global_filter(cls, v):
+        from src.services import task_rule
+
+        value, error = task_rule.normalise_filter("" if v is None else v)
+        if error:
+            raise ValueError(f"TASKS_GLOBAL_FILTER: {error}")
+        return value or ""
+
+    @model_validator(mode="after")
+    def _validate_tasks_rule_combination(self):
+        if self.tasks_rule == "filter" and not self.tasks_global_filter:
+            raise ValueError(
+                "TASKS_RULE=filter needs TASKS_GLOBAL_FILTER: set the text every "
+                "task line contains (for example #task), or choose another TASKS_RULE."
+            )
+        return self
 
     # Cap on how much note/file text a single read_note / read_file call may
     # return to the model. The byte caps above stop the server from reading a
@@ -2040,6 +2210,8 @@ class Settings(BaseSettings):
             return self
         if self.embedding_provider == "openai":
             setting, url = "OPENAI_BASE_URL", self.openai_base_url
+        elif self.embedding_provider == "tei":
+            setting, url = "TEI_URL", self.tei_url
         else:
             setting, url = "OLLAMA_URL", self.ollama_url
         endpoint = check_embedding_url_policy(

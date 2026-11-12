@@ -629,7 +629,8 @@ def test_the_concurrency_class_is_unchanged():
 
     assert concurrency.TOOL_CLASSES["semantic_search"] == "embedding"
     assert concurrency.TOOL_CLASSES["hybrid_search"] == "embedding"
-    assert concurrency.CLASS_MAPPING_VERSION == 6
+    # Fork epoch 7 adds the task tools; reranking keeps its class.
+    assert concurrency.CLASS_MAPPING_VERSION == 7
 
 
 # ── #355 merge: the transition line and the locator on rerank=true pages ───

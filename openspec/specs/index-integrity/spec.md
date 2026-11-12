@@ -931,7 +931,7 @@ The rebuild's snapshot SHALL therefore retain each row's owner, relative path an
 
 ### Requirement: A many-chunk note completes, and certifies only on full coverage
 
-The Ollama embedding batch SHALL have no aggregate deadline. Its liveness bound is the per-request timeout: 30 s per provider request, where each request carries at most `OLLAMA_EMBED_BATCH_SIZE` inputs, a fixed size independent of the note. So a note cannot be structurally unable to finish while every request is individually healthy. A note SHALL be certified only when every one of its **requested** chunks has a vector, whether produced by the provider or reused under the chunk-reuse requirement. No partial coverage of the requested chunks may ever be stamped complete.
+The Ollama embedding batch SHALL have no aggregate deadline. Its liveness bound is the per-request timeout: 30 s per provider request, where each request carries at most `OLLAMA_EMBED_BATCH_SIZE` inputs, a fixed size independent of the note. The TEI embedding batch SHALL likewise have no aggregate deadline: its bound is per slice, at most `TEI_EMBED_BATCH_SIZE` inputs, and covers that slice's retries. So a note cannot be structurally unable to finish while every request is individually healthy. A note SHALL be certified only when every one of its **requested** chunks has a vector, whether produced by the provider or reused under the chunk-reuse requirement. No partial coverage of the requested chunks may ever be stamped complete.
 
 **"Requested chunks" is the bounded chunk list**, not every chunk the note's text could yield. The chunker caps a note at `MAX_CHUNKS_PER_NOTE` in document order, and a capped note is certified on full coverage of that capped list. Certification is what makes the cap safe. A capped note left uncertified would be re-selected by the backlog on every pass for ever, and would re-perform every provider call it already made: exactly the never-finishing note that removing the aggregate deadline exists to prevent. The degradation is declared on the row and in every result that names the note; it is not expressed by withholding the stamp.
 
@@ -944,7 +944,7 @@ The Ollama embedding batch SHALL have no aggregate deadline. Its liveness bound 
 
 #### Scenario: A hung provider still fails fast
 
-- **WHEN** the Ollama embedding provider stops responding mid-batch (the OpenAI provider keeps its own pre-existing contract: per-request HTTP timeout with bounded retries)
+- **WHEN** the Ollama embedding provider stops responding mid-batch (the OpenAI provider keeps its own pre-existing contract: per-request HTTP timeout with bounded retries; the TEI provider's bound is its per-slice deadline, which the same scenario applies to at that deadline)
 - **THEN** the in-flight request SHALL time out at the per-request timeout and the note SHALL remain uncertified
 
 #### Scenario: Partial coverage is never certified
@@ -1049,7 +1049,9 @@ Because the link grammar changed and `content_hash` cannot see a grammar change,
 
 ### Requirement: The frozen v0 cleaner is linear and byte-identical
 
-The frozen v0 cleaning function retained for `extraction_version` comparison SHALL run in time linear in the input length, including inputs with many unclosed fence openers, and SHALL produce output byte-identical to the original regex-based implementation for every input. It SHALL split on `\n` only — never on `\r`, `\v`, `\f`, ` ` or any other separator `str.splitlines()` recognises — and SHALL treat a closer line's trailing run under the regex's Unicode `\s` semantics (so NBSP, `\x0b` and ` ` after the fence run close). Equivalence SHALL be established by a differential test that keeps the original regexes as an oracle and compares outputs over generated inputs covering unclosed openers, orphan closers, nested and adjacent mixed backtick/tilde fences, trailing ASCII and Unicode whitespace on closer lines, blank-line runs after closers, CRLF and lone `\r`, indented fences, empty blocks, and closer runs longer than the opener, plus every existing v0/v1 fixture.
+The frozen v0 cleaning function retained for `extraction_version` comparison SHALL run in time linear in the input length, including inputs with many unclosed fence openers, and SHALL produce output byte-identical to the original regex-based implementation for every input. It SHALL split on `\n` only — never on `\r`, `\v`, `\f`, `
+` or any other separator `str.splitlines()` recognises — and SHALL treat a closer line's trailing run under the regex's Unicode `\s` semantics (so NBSP, `\x0b` and `
+` after the fence run close). Equivalence SHALL be established by a differential test that keeps the original regexes as an oracle and compares outputs over generated inputs covering unclosed openers, orphan closers, nested and adjacent mixed backtick/tilde fences, trailing ASCII and Unicode whitespace on closer lines, blank-line runs after closers, CRLF and lone `\r`, indented fences, empty blocks, and closer runs longer than the opener, plus every existing v0/v1 fixture.
 
 #### Scenario: Many unclosed openers
 
@@ -2567,3 +2569,29 @@ The tags text bound to every keyword-vector writer SHALL be `tags_text(tags)` in
 
 - **WHEN** a note's only `#gamma` is inside a fenced code block
 - **THEN** its vector SHALL hold no weight-`B` lexeme for `gamma`, as `notes_metadata.tags` holds no `gamma`
+
+### Requirement: The write-time task refresh SHALL compose with the index pass without a lock cycle and SHALL always converge to disk
+
+The index pass SHALL read the database clock as its scan start before its first file read, once per pass invocation. An earlier instant only makes the pass keep more refreshed rows, and a kept row stays task-dirty. The scan SHALL treat a row whose `tasks_source_hash` differs from its `content_hash` (a task-dirty row) as ineligible for the stat shortcut and read it. The task stage SHALL then derive it even when its content hash is unchanged.
+
+When the pass derives a note, it SHALL keep that note's task rows unchanged in exactly one case: the row's `tasks_refreshed_at` is at or after the attempt's scan start, and its `tasks_source_hash` differs from the buffered body's hash. Otherwise it SHALL replace the task rows, set `tasks_source_hash` to the buffered hash and clear `tasks_refreshed_at`. Keeping rows SHALL NOT be a skip and SHALL NOT be a failure.
+
+The write-time refresh SHALL take only the note's row lock, with a bounded wait, and SHALL never take the index generation lock, so it cannot form a cycle with a pass, which takes the generation lock before row locks.
+
+After the last write to a note, the first pass whose scan starts after both that write and the last refresh SHALL leave the note's task rows derived from its current disk bytes, with `tasks_source_hash` equal to `content_hash`.
+
+#### Scenario: Interleavings converge
+- **WHEN** a pass's scan, a task tool's publication and refresh, and a later generic edit of the same note are interleaved in every order
+- **THEN** after at most two further passes with no write, the note's task rows SHALL equal a fresh extraction of the file, and `tasks_source_hash` SHALL equal `content_hash`
+
+#### Scenario: A task-dirty row is never stuck behind the stat shortcut
+- **WHEN** a note's task rows were refreshed from bytes that differ from the row's `content_hash`, and the file's stat matches the stored stat
+- **THEN** the next pass SHALL read the file and re-derive the note's tasks
+
+#### Scenario: No lock cycle with a running pass
+- **WHEN** a task write refreshes a note while a pass holds the generation lock and has already upserted that note
+- **THEN** the refresh SHALL wait at most its bounded lock wait and either run after the pass commits or report `index: may lag`, and neither transaction SHALL deadlock
+
+#### Scenario: Derivations agree
+- **WHEN** the same note bytes are derived by the pass and by the write-time refresh
+- **THEN** the resulting `note_tasks` rows SHALL be identical, column for column

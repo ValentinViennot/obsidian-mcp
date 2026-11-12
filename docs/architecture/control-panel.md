@@ -1362,6 +1362,99 @@ in both modes.
   raises: the local session is already gone by the time it is consulted, and a
   logout that has ended the session must not become a 500 because the provider
   is unreachable.
+## The Tasks card (#428)
+
+One shared template, `templates/_task_settings_card.html`, edits one
+`task_settings` row (the per-owner-scope settings of the task tools). It has
+two homes, because the scopes differ by mode:
+
+- **Multi-user mode:** on the account page, editing the signed-in user's own
+  row. `GET /admin/account` renders it; `POST /admin/account/tasks` saves it,
+  behind `require_user_panel`, and 404s in single-user mode like every
+  `/account` route (`_require_account_route`).
+- **Single-user mode:** on the Settings page, editing the NULL-scope row that
+  every MCP caller there uses. `POST /admin/settings/tasks` saves it, behind
+  `require_admin_panel`, and 404s in multi-user mode, where nobody reads the
+  NULL row and a route that wrote it would be a control with no effect. A card
+  on `/account` in single-user mode was rejected: that page 404s there by
+  design (#197).
+
+**Neither route takes a scope from the request.** The scope is the session's
+own user id (multi-user) or NULL (single-user), and only the card's own field
+names are passed to `task_settings.save`, so an extra `user_id` field never
+reaches the service. Validation and the upsert (under `FOR UPDATE`) live in
+the service; the route owns the transaction, the flash and the 303. A refused
+save rolls back, writes nothing and flashes every problem; the redirected GET
+shows the values still stored. Both routes take the router-wide CSRF check.
+
+**The controls.**
+
+- **"Which checkboxes are tasks"** (#434), the first block on the card. Why
+  the rule exists and what it does are in [vault tools](vault-tools.md),
+  "The task rule (#434)". Three controls, every one always visible (no
+  show/hide logic, so `panel.js` is untouched), each input labelled with the
+  rule that uses it:
+  - a `task_rule` select, consistent with the card's other three-way
+    selects: *Server default (<the server's rule in words>)* (stored NULL),
+    *Every checkbox is a task* (`all`), *Only checkboxes with task details or
+    a task tag* (`fields`), *Only checkboxes that contain the global filter
+    text* (`filter`);
+  - a `task_tags` textarea, one per line, at most 32, normalised like the
+    excluded note tags (a leading `#` stripped, lower-cased, the tag
+    grammar, no trailing `/`);
+  - a `global_filter` text input, `maxlength="64"`, placeholder `#task`,
+    validated by `task_rule.normalise_filter`, the same function that
+    validates `TASKS_GLOBAL_FILTER` at startup.
+
+  The help text is written for someone who has never installed the Tasks
+  plugin (it lists the emoji fields and names the plugin's "Global task
+  filter"). Under the select, "In use now: <rule in words>[, task tags: …]
+  [, filter: …] (server default | set here)" shows the *effective* rule;
+  with the server default selected, the server's tags or filter appear
+  read-only there. **"Server default" inherits the server's whole rule as
+  one unit** (kind, tags and filter text), never field by field, so what the
+  card says is in use is exactly what the tools use, and a user who picks
+  `filter` can never silently inherit a filter text the card does not show.
+  A stored rule the server cannot apply (only a manual database edit can
+  make one) is shown with a warning, and the tools treat it as "every
+  checkbox". Save rules: an absent `task_rule`, `task_tags` or
+  `global_filter` key leaves the stored value unchanged (a client posting
+  part of the card must not erase a rule); tags or a filter text the chosen
+  rule does not use are stored and kept, so switching rules to compare
+  loses nothing; a merged `filter` rule without a filter text is refused
+  ("The “filter” rule needs a global filter text…"), nothing written. The
+  scope's saves are serialised by `pg_advisory_xact_lock` taken before the
+  row is read (two first saves for a scope with no row cannot interleave),
+  and a `ck_task_settings_global_filter` violation at flush is the same
+  refusal.
+- A timezone `<input list>` with a `<datalist>` of a **fixed** list of 76
+  common IANA names (`TASK_TIMEZONE_SUGGESTIONS` in `routes.py`). The list is
+  fixed rather than `zoneinfo.available_timezones()` because that set is the
+  union of the system zone files and the `tzdata` wheel and differs between
+  hosts, while the account page is pinned byte for byte by
+  `tests/golden/oidc_off/`. Any name the validator accepts may be typed; the
+  validator refuses host-only pseudo-zones (`localtime`, `Factory`,
+  `posixrules`, `posix/…`, `right/…`). A stored zone this build cannot load is
+  shown with a warning and the tools use UTC.
+- Two textareas, one entry per line, at most 32 each: excluded folders
+  (vault-relative, no `..`, `.` or empty segments, no leading `/`, normalised
+  to end in `/`) and excluded note tags (a leading `#` stripped, lower-cased,
+  the tag grammar, no trailing `/`).
+- Four **three-option selects** — *Server default (on/off)*, *On*, *Off* —
+  for the write behaviours, labelled by what they do, with the Tasks plugin's
+  own setting name in the help text. They are not checkboxes because "server
+  default" (stored NULL, following the environment) must stay expressible;
+  `save` reads the literal `default` as exactly that, and a boolean field
+  absent from the form leaves the stored value unchanged.
+
+**CSP posture** (#195, #289): the card has no script, no inline handler, no
+`style=` and no `javascript:` URL; every control is a plain form field, so
+`panel.js` gains nothing. Classes are existing components and generated
+utilities. The #434 rule block keeps that posture unchanged: no script,
+handler or `style=`, only existing classes. The `page_account_*` goldens
+were regenerated deliberately (again for #434); the settings page has no
+golden. The owner walks the card by hand in both modes
+with devtools open, and zero CSP violations is part of the bar.
 
 ## Optional native OIDC (#414, #416)
 

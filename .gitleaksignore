@@ -42,3 +42,18 @@ c3c1ef6d740371169f4aca0fe30e4f4bf066c5c8:tests/fixtures/transport_tls/client.key
 1b82c8a020864a09e533142a168681ae1f45bddb:tests/test_hybrid_search_offline.py:generic-api-key:794
 1b82c8a020864a09e533142a168681ae1f45bddb:tests/test_hybrid_search_offline.py:generic-api-key:801
 ed7d3348fa8f1dd1a170752d3ecf79126b704513:tests/test_change_feed_offline.py:generic-api-key:346
+
+# Reviewed 12 November 2026: upstream task identifiers and description keys
+# are synthetic grammar fixtures (0123456789ab / 0123456789abcdef), not
+# credentials. Exact source-commit findings only; no rule or path exemption.
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/integration/test_schema_check.py:generic-api-key:9015
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/integration/test_schema_check.py:generic-api-key:9016
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/integration/test_schema_check.py:generic-api-key:9019
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/integration/test_schema_check.py:generic-api-key:9020
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/integration/test_schema_check.py:generic-api-key:9021
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/integration/test_schema_check.py:generic-api-key:9023
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/integration/test_schema_check.py:generic-api-key:9056
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/integration/test_schema_check.py:generic-api-key:9059
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/test_task_render.py:generic-api-key:22
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/test_task_tools_e2e.py:generic-api-key:690
+58564cd38da52fcf9db3b8518b5f81fded33ad5d:tests/test_task_line.py:generic-api-key:656

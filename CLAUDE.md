@@ -11,6 +11,8 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
   - `OllamaProvider` — bge-m3 by default, set `OLLAMA_URL` in `.env`
   - `OpenAIProvider` — `text-embedding-3-{small,large}` over httpx, supports
     Azure OpenAI / OpenAI-compatible base URLs
+  - `TeiProvider` — Hugging Face Text Embeddings Inference native `/embed`
+    API, set `TEI_URL` (use `openai` for TEI's `/v1/embeddings` route)
 - Jinja2 control panel; Chart.js vendored under
   `src/control_panel/static/vendor/`, no CDN, hand-written CSS, **nonce-based
   CSP** (`PANEL_CSP`) — see [control panel](docs/architecture/control-panel.md).
@@ -212,7 +214,7 @@ update it in the same change.** What stays here is the short list:
   [vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md).
 - **`/mcp` rate control is in-process, and `--workers 1` is part of the
   contract.** Two per-principal token buckets in `_tracked` (general 600/min
-  burst 120; write 120/min burst 30 on the eight vault-mutating tools *and*
+  burst 120; write 120/min burst 30 on the eleven vault-mutating tools *and*
   `PUT /transfer/upload`, charged to the principal that **minted** the
   capability) plus a per-address budget on failed `/mcp` authentication. The
   principal is `("api_key", id)` or `("oauth", grant_id)` — the **grant**, so a
@@ -325,6 +327,14 @@ update it in the same change.** What stays here is the short list:
   OIDC_SUBJECT_USER_IDS" — change both together. See
   [native OIDC](docs/native-oidc.md) and
   [control panel](docs/architecture/control-panel.md).
+- **A TEI server must prove its identity before it gets a vector request**
+  (#425). `/embed` has no model field, so `verify_tei_server` compares `GET
+  /info` with `TEI_EMBEDDING_MODEL` (exact) and `TEI_EMBED_BATCH_SIZE`, in one
+  5 s `wait_for` (a phase timeout cannot bound a trickling body). The process
+  exits only on a proven mismatch; a vector is requested only after a match.
+  Unreachable or unusable answers serve with embedding withheld, re-checked at
+  most every 30 s (a late mismatch never exits). See
+  [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **Unused dynamically registered OAuth clients expire** (#194).
   `oauth_clients.last_used_at` is stamped by consent approval, code exchange
   and refresh; migration 025 stamped every pre-existing row, so **NULL means
@@ -349,8 +359,8 @@ update it in the same change.** What stays here is the short list:
   to an unknown code — and so does **every failed revalidation of a spent
   code** (reason only in the log). A live code keeps its specific refusals
   and the pre-#325 check order (expiry first). See [oauth and grants](docs/architecture/oauth-and-grants.md).
-- **OAuth Client ID Metadata Documents, DCR as the fallback** (#357,
-  migration 036). An `https://` `client_id` at `/authorize` is fetched through
+- **OAuth Client ID Metadata Documents, DCR as the fallback** (#357, #420,
+  migrations 036/038). An `https://` `client_id` at `/authorize` is fetched through
   `transfer.fetch_url_guarded` (no redirects, 10 s, 64 KiB, the SSRF deny list,
   pinned). Admission: cache, then **join an in-progress fetch before any
   charge**, a 30 s failure cooldown, the failed-auth salted 4,096-slot table
@@ -363,8 +373,25 @@ update it in the same change.** What stays here is the short list:
   `cimd_` id is never caller input, and where it is refused differs by
   endpoint.** At `/authorize` it is refused before any lookup. At `/token`
   the credential and the unchanged #182/#325/#326 processing run first,
-  then it is refused. At `/revoke` it is a concealed 200 (`{}`). `/token` never
-  fetches. Consent shows the document's host and URL, never its
+  then it is refused. At `/revoke` it is a concealed 200 (`{}`). `/token` and
+  `/revoke` never fetch **the document**. **`private_key_jwt` is CIMD-only**
+  (#420; `/register` still refuses it): the declared method is honoured, never
+  downgraded; the document needs a same-origin `jwks_uri`, no inline `jwks`,
+  an optional RS256/PS256/ES256 pin; `/authorize` fetches the JWKS with its
+  own cache and a **second** per-address charge; the approve stores a
+  normalised snapshot with its **origin** fetch time (038's four columns and
+  three CHECKs), and a `private_key_jwt` row never becomes `none` — refused
+  under `FOR UPDATE` *and* by the conflict update's `WHERE` (two first
+  approvals race; L10 owner-accepted) — nor moves its snapshot backwards.
+  `src/oauth/client_assertion.py` verifies the assertion at the one
+  `_client_authenticated` position (one key, one alg; `jku`/`jwk`/`x5*`/`crit`
+  refused; `aud` = issuer or `/token`, single-valued; zero `exp` leeway, 300 s
+  life; `jti` single-use per client URL, a full cache refuses). A failed
+  assertion never revokes; #182 reuse is unchanged (L7 owner-accepted). The
+  JWKS refetch (kid miss, or snapshot > 24 h; 60 s cooldown per URI; a failed
+  stale refetch falls back to the stored snapshot) runs only in a pre-phase,
+  for an eligible credential, **before the main session, with no lock across
+  the hop**, decides no response, and runs while CIMD is disabled. Consent shows the document's host and URL, never its
   `client_name`. Loopback redirects match on any port for CIMD only. `iss` is
   on every authorization redirect. RFC 8707 `resource` is **classified, never
   refused** (`resource_class` on every record; `invalid_target` waits for a
@@ -623,8 +650,9 @@ update it in the same change.** What stays here is the short list:
   marked unhealthy forever. `docker compose config` itself runs in CI's
   `compose-config` job, since the test container has no docker CLI.
 - **Every tool publishes a `title` and all four `ToolAnnotations` hints
-  explicitly** (#343). Eighteen read tools are read-only/idempotent/closed;
-  the destructive set is the write-bucket set minus `create_note` plus
+  explicitly** (#343). Nineteen read tools are read-only/idempotent/closed;
+  the destructive set is the write-bucket set minus `create_note` and
+  `add_task` (#428: inserts one line, removes no byte) plus
   `request_upload` (its `overwrite=True` link overwrites on redemption);
   `import_from_url` alone is open-world. **Hints, not enforcement** — nothing
   server-side reads them; `_tracked` and `_require_write` enforce as before.
@@ -635,12 +663,13 @@ update it in the same change.** What stays here is the short list:
   contract and the reasoning moved to the vault-tools note. See
   [vault tools](docs/architecture/vault-tools.md), "Tool metadata".
   **`tools/list` is scoped by the presented credential** (#358): an OAuth
-  grant without `readwrite` lists 19 — the full list minus
-  `tool_permissions.WRITE_REQUIRED_TOOLS`, the one literal that also drives
+  grant without `readwrite` lists 20 — the full list minus
+  `tool_permissions.WRITE_REQUIRED_TOOLS` (twelve names), the one literal that also drives
   `_tracked`'s body-boundary write gate (after quota, so spend is unchanged);
   API keys of either permission, `readwrite` grants, sandbox and in-process
-  callers list 28, byte-identical to `tests/fixtures/tools_list_full_v1.json`
-  (the 1.0 freeze fixture — regenerate only deliberately). The seam is the
+  callers list 32, byte-identical to `tests/fixtures/tools_list_full_v2.json`
+  (the oracle since #428 — regenerate only deliberately; `tools_list_full_v1.json`
+  stays the 1.0 freeze record, derived from v2 by a test). The seam is the
   public `list_tools()` override (survives SDK 2.x); no setting, no
   `list_changed`, instructions unfiltered.
 - **`hybrid_search` is a third search peer, not a primary** (#354). All three
@@ -671,10 +700,11 @@ update it in the same change.** What stays here is the short list:
 - **Task rows are derived state keyed by note id** (#350, migration 032).
   `note_tasks` has no path and no owner column — both come from the
   `notes_metadata` join, so a task cannot outlive, precede or be listed
-  under another tenant than its note — and is written only by the index
+  under another tenant than its note — and is written by the index
   pass, right after the link rebuild, for the same changed list, from the
   scan's buffered bodies (`src/services/tasks.py`, fence-aware, the #218
-  rule). Extraction version 4 is the backfill (no re-embed). **A
+  rule), and since #428 also by the task tools' write-time refresh (next
+  bullet), never by any other writer. Extraction version 4 is the backfill (no re-embed). **A
   task-derivation failure is isolated to that note's task rows**: per-note
   savepoint, one retry, then `tasks_failed` — never the quarantine, never a
   skip, never a pass failure. `list_tasks` always reports the not-yet-scanned
@@ -682,6 +712,64 @@ update it in the same change.** What stays here is the short list:
   even at zero; its cursor carries an owner discriminator and a filters
   digest, never an id. See [indexing and embeddings](docs/architecture/indexing-and-embeddings.md)
   and [vault tools](docs/architecture/vault-tools.md).
+- **Task writes address a line by `path` + id, re-derived from the bytes
+  being replaced** (#428, migration 039, extraction version 5). The id is
+  `sha256("omcp-task-v1\0" + uncut text)[:12]` (status, indent, marker and
+  quote prefix excluded), suffixed `.<i>of<n>` when identical lines share a
+  key; `note_tasks.task_key` / `key_ordinal` / `key_count` store it. Every
+  write re-reads the note, re-derives every id (`tasks_from_note_text`, the
+  one definition the pass and refresh share), plans, **verifies** (every other
+  line and task unchanged, no line changes owner by the **uncapped**
+  continuation block, tags conserved) and publishes with
+  `write_file_at(expected=existing_bytes)`; no index line number is ever
+  trusted. **A suffixed id always needs `expected_hash`** (every mode); in
+  required mode a bare id satisfies it and `add_task` is exempt. No hash →
+  up to 3 attempts on an in-call conflict, then `concurrent_write`; it
+  narrows nothing about the declared `expected=`→rename window. **Minimal
+  edits**: only the changed field's characters move, never the plugin's
+  whole-line rebuild; ambiguity (duplicated or stranded fields, inline code
+  in the run) is `task_malformed`, never a pick. **Recurrence is a closed
+  grammar** (`task_recurrence.py`, stdlib only, no rrule port); anything
+  else is `recurrence_unsupported`, and nothing completes without its next
+  occurrence. **The write-time refresh** (`task_index.refresh_note_tasks`)
+  rewrites only that note's task rows from the *published* bytes, derived
+  before its transaction, under the note's row lock with a 2 s
+  `lock_timeout` and a byte re-check (`superseded`) — **no generation lock,
+  ever**; `tasks_source_hash` / `tasks_refreshed_at` mark task-dirty rows,
+  which the pass never stat-shortcuts (R3) and keeps only when refreshed at
+  or after its `scan_started_at` (R4), so every row converges and none is
+  stuck. A refresh that cannot run leaves the write standing:
+  `index: may lag (<code>)`. Generic writers do not refresh (L5). Settings
+  are per owner scope in `task_settings` (durable, `UNIQUE NULLS NOT
+  DISTINCT`, NULL fields → `TASKS_*` env defaults); an invalid
+  `TASKS_DEFAULT_TIMEZONE` (or, since #434, `TASKS_RULE`,
+  `TASKS_RULE_TAGS`, `TASKS_GLOBAL_FILTER`) refuses boot, init container
+  included. 032 skips
+  exactly 039's marked units by an allow-list a future `note_tasks` revision
+  must extend on purpose. See [vault tools](docs/architecture/vault-tools.md),
+  "Task tools (#428)", and [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
+- **A checkbox is not a task; the task rule says which are** (#434,
+  migration 040). Per owner scope: `all` (every checkbox — **the default,
+  byte-identical to v1.3.0**, cursors included), `fields` (a date,
+  priority or recurrence field, or a task tag matched like `tags=`) or
+  `filter` (case-sensitive `strpos` of the stored text, the plugin's
+  global filter; reverses #428 L12). Evaluated at query time from indexed
+  columns in **one place**, `task_rule.rule_clause` composed into
+  `task_query.scope_clause` (listing, counts, agenda, `duplicate_scan`);
+  `scope="all"` lifts it. Rows cut at 1,000 text characters or 64 tags
+  are **kept and counted** (`kept though unsure`), never hidden; an
+  unevaluable stored rule is `all`, stated on the rule line (≤ 320) with
+  `excluded by rule` and `pass scope="all"…`. Inherited from
+  `TASKS_RULE` / `TASKS_RULE_TAGS` / `TASKS_GLOBAL_FILTER` as one unit;
+  invalid values (or `filter` without text) refuse boot, init container
+  included. The filter text is validated (no backtick, field emoji,
+  comment marker, leading structure) because `add_task` **prepends** it,
+  and the combined description is structure-checked again before any
+  dry run or publish. The rule never blocks a write; `add_task` /
+  `update_task` state a non-task. The cursor digest carries the rule only
+  when one applies. 039 skips exactly 040's marked units (its own
+  allow-list). See [vault tools](docs/architecture/vault-tools.md),
+  "The task rule (#434)".
 - **The change feed is `note_events`, written at the moment the server
   knows** (#351, migration 033). Tools write attributed events (actor label,
   exact principal, tool) after their confirmed publication; the index pass
@@ -740,7 +828,7 @@ update it in the same change.** What stays here is the short list:
 
 ## MCP tools
 
-31 tools, all registered in `src/mcp_server/server.py` and all wrapped by
+35 tools, all registered in `src/mcp_server/server.py` and all wrapped by
 `_tracked`, which resolves the caller's vault root *before* the tool body runs
 — that decorator is the whole enforcement of "this user has no vault"
 ([vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md)).
@@ -749,12 +837,12 @@ Every registration carries `title=` and `annotations=` (one of four shared
 registration without them, on a description over 4,000 characters, and on a
 destructive set that drifts from the write bucket.
 
-A read-only OAuth grant **sees 19 of the 28** (#358): `tools/list` omits the
-nine names in `src/mcp_server/tool_permissions.py`'s `WRITE_REQUIRED_TOOLS`
-(the write bucket plus `request_upload`). That same literal drives the write
+A read-only OAuth grant **sees 20 of the 32** (#358): `tools/list` omits the
+twelve names in `src/mcp_server/tool_permissions.py`'s `WRITE_REQUIRED_TOOLS`
+(the eleven-tool write bucket plus `request_upload`). That same literal drives the write
 gate `_tracked` runs at the body boundary, so the list and enforcement cannot
 drift; a hidden tool called by name is refused `permission_denied` as before.
-API keys and `readwrite` grants see all 28. See
+API keys and `readwrite` grants see all 32. See
 [vault tools](docs/architecture/vault-tools.md), "Who sees which tools (#358)".
 
 **Search and read** — `keyword_search`, `semantic_search`, `hybrid_search`
@@ -762,7 +850,7 @@ API keys and `readwrite` grants see all 28. See
 paraphrase; it and `semantic_search` take the optional `rerank` argument,
 #367), `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `get_changes`
 (the change feed, after an `ev:<seq>` cursor or a UTC date; `by` =
-`any | me | agents | human`), and `list_tasks` (see **Tasks** below).
+`any | me | agents | human`), and `list_tasks` / `task_agenda` (see **Tasks** below).
 
 **Graph**
 - `get_backlinks(path, limit)` — notes that link TO `path` (resolved links only).
@@ -805,12 +893,19 @@ destructive-write surface: read
 `delete_file`. Pure byte transport, same traversal and dot-dir guards, no
 indexing.
 
-**Tasks** — `list_tasks(folder?, status="open", due_by?, scheduled_by?,
-tags?, limit=100, cursor?)`: checkbox tasks from `note_tasks`, never a file;
-registered after the first 25 (then `get_changes`, then `hybrid_search`), so those keep the 5a391ca
-fixture's order (the rest are in `tools_list_schema_additions.json`; the two
-deliberately amended filter-tool schemas are in
-`tools_list_schema_amendments.json`).
+**Tasks** (optional; plain `- [ ]` checkboxes work, Tasks-plugin emoji
+fields optional) — `list_tasks` and `task_agenda` read `note_tasks`, never a
+file; `complete_task`, `update_task` (both `path` + task id) and `add_task`
+write one line (write bucket, `write` class, `WRITE_REQUIRED_TOOLS`).
+Default listings and `add_task`'s index-side duplicate check apply the
+caller's task rule (#434: `all` | `fields` | `filter`, panel Tasks card or
+`TASKS_RULE*` / `TASKS_GLOBAL_FILTER`); `scope="all"` lists every checkbox.
+`list_tasks` is registered after the first 25 (then `get_changes`, then
+`hybrid_search`), so those keep the 5a391ca fixture's order; the four #428
+tools follow `hybrid_search` in the order `task_agenda`, `complete_task`,
+`update_task`, `add_task`, so the first 28 keep theirs (the rest are in
+`tools_list_schema_additions.json`; the deliberately amended filter-tool
+schemas are in `tools_list_schema_amendments.json`).
 
 **Transfer** — `request_upload`, `check_upload`, `request_download`,
 `import_from_url`, plus the public `/transfer/*` routes. A capability pins
@@ -829,11 +924,11 @@ summaries.
 | [schema-and-migrations.md](docs/architecture/schema-and-migrations.md) | any alembic migration; `alembic check` is the cheap gate, not the whole gate |
 | [oauth-and-grants.md](docs/architecture/oauth-and-grants.md) | `src/oauth/`, the consent page, anything minting/rotating/revoking a token |
 | [vault-roots-and-tenancy.md](docs/architecture/vault-roots-and-tenancy.md) | `APIKeyMiddleware`, `_vault_root`, owner predicates, publication confirmation, the vault-root overlap guard (`src/services/vault_overlap.py`, the snapshot, the five pass entry points) |
-| [vault-tools.md](docs/architecture/vault-tools.md) | any note or file tool: frontmatter, symlinks, anchored writes, section addressing, size caps |
+| [vault-tools.md](docs/architecture/vault-tools.md) | any note or file tool: frontmatter, symlinks, anchored writes, section addressing, size caps; the task tools (`src/services/task_line.py`, `task_write.py`, `task_recurrence.py`, `task_dates.py`, `task_query.py`, `task_settings.py`, `src/mcp_server/task_render.py`) |
 | [file-transfer.md](docs/architecture/file-transfer.md) | `src/transfer/`, `src/services/vault_fs.py`, the publish gate, SSRF policy, the write-bucket charge at redemption |
 | [obsidian-compatibility.md](docs/architecture/obsidian-compatibility.md) | `src/services/links.py`, `extract_tags`, `clean_for_embedding`, any graph tool: which Obsidian syntax is read, which is deliberately not, and why `move_note` resolves more narrowly than the indexer |
 | [search.md](docs/architecture/search.md) | `semantic_search` / `keyword_search` / `find_related` and every `SET LOCAL` they issue; `scripts/search_eval/` (the search evaluation harness) |
-| [indexing-and-embeddings.md](docs/architecture/indexing-and-embeddings.md) | the indexer loop, the embed pass, tsvector writers, provider abstraction |
+| [indexing-and-embeddings.md](docs/architecture/indexing-and-embeddings.md) | the indexer loop, the embed pass, tsvector writers, provider abstraction, the task derivation (`src/services/tasks.py`) and the write-time task refresh (`src/services/task_index.py`) |
 | [security-event-logging.md](docs/architecture/security-event-logging.md) | `src/logging_setup.py`, `src/services/security_events.py`, and any call site that logs a refusal: the field allow-list, the event catalogue, the suppressor |
 | [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/concurrency.py`, `src/services/pool_budget.py`, `src/services/concurrency_counters.py`, `src/services/concurrency_readiness.py`, `src/services/refusals.py`, the pool subclass in `src/database.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, the key-creation budget and active-key cap (`src/services/api_keys.py`), and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `MCP_CONCURRENCY_*` / `KEY_CREATION_*` / `KEY_MAX_ACTIVE_PER_ACCOUNT` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
 | [usage-attribution.md](docs/architecture/usage-attribution.md) | `usage_logs`, `_log_usage`, actor columns |
@@ -842,3 +937,13 @@ summaries.
 
 Formal requirements live in `openspec/specs/`; the change history and its
 reasoning in `openspec/changes/archive/`.
+
+
+## Fork integration, 12 November 2026
+
+The current combined contract and append-only migration map are recorded in
+[the integration note](docs/architecture/upstream-sync-20261112.md).
+Fork extraction version 6 derives task ids without changing embedding input;
+classification epoch 7 includes the four new task tools. The fork exposes
+35 tools, 23 to read-only OAuth grants, preserving named Git attribution and
+recoverable synchronization. Ollama remains selected; TEI is optional.

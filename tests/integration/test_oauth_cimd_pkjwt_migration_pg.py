@@ -248,7 +248,7 @@ def test_rerun_replaces_a_predecessor_definition_left_by_a_stamp_back():
         ("ALTER TABLE oauth_clients ADD COLUMN jwks_uri text", "jwks_uri is text"),
         (
             "ALTER TABLE oauth_clients ADD COLUMN jwks_snapshot jsonb",
-            "jwks_snapshot does not carry 038's comment marker",
+            "jwks_snapshot does not carry 045's comment marker",
         ),
         (
             "ALTER TABLE oauth_clients ADD COLUMN jwks_fetched_at "
@@ -267,7 +267,7 @@ def test_a_foreign_column_of_our_name_is_refused(ddl, fragment):
 def test_a_foreign_new_constraint_of_our_name_is_refused():
     with throwaway_db("pkjwt_038_foreign_ck", revision="043") as url:
         sql(url, f"ALTER TABLE oauth_clients ADD CONSTRAINT {PKJWT_SHAPE} CHECK (true)")
-        refuse(url, must_mention=[f"{PKJWT_SHAPE} already exists but is not 038's"])
+        refuse(url, must_mention=[f"{PKJWT_SHAPE} already exists but is not 045's"])
 
 
 def test_an_unmarked_copy_of_the_new_constraint_is_refused():
@@ -339,7 +339,7 @@ def test_downgrade_refuses_while_a_private_key_jwt_row_exists():
 
         result = _harness.run_alembic(url, "downgrade", "043", dimensions=DIM, check=False)
         assert result.returncode != 0
-        assert "038 downgrade refused: 1 private_key_jwt client row(s)" in (
+        assert "045 downgrade refused: 1 private_key_jwt client row(s)" in (
             result.stdout + result.stderr
         )
         assert version(url) == HEAD_REVISION

@@ -15,10 +15,12 @@ The fork already deployed revisions 038–044. New upstream steps are appended:
 | 039 | 046 | Task ids, write-time refresh and durable task settings |
 | 040 | 047 | Per-account checkbox task rules |
 
-The new chain starts at existing fork 044. Ownership comments and diagnostics
-retain upstream numbers, as in the preceding integrations. Resolve those
-numbers through this table; an upstream database is not a supported fork
-starting point. Older reconciliation steps gain upstream successor awareness
+The new chain starts at existing fork 044. Ownership comments retain the
+upstream marker identities (`038_oauth_cimd_private_key_jwt`, `039_task_tools`,
+`040_task_rule`), as in the preceding integrations. These identify each named
+object, not the global Alembic revision, and do not collide with older fork
+objects. Operator-facing revision headers and diagnostics name actual fork
+045–047. An upstream database is not a supported fork starting point. Older reconciliation steps gain upstream successor awareness
 without replacing the fork's deployed revision identities.
 
 Named connection aliases, OAuth cutover semantics, Pocket ID and separate
@@ -58,6 +60,11 @@ fixtures remain unmodified for their historical contract proof.
 
 ## Qualification boundaries
 
+The 450-case schema suite includes stamp-back reconciliation of the existing
+fork migration history, including fork OIDC and temporal-vector preservation.
+It exercises both predecessor and successor object shapes and refuses foreign
+markers rather than adopting them.
+
 The integration is qualified against disposable synthetic PostgreSQL and vault
 fixtures, including the schema/model suite, task and note search, mutations,
 read-only and tenant boundaries, named attribution and concurrent edit recovery.
@@ -68,3 +75,23 @@ prior settings intact. The captures illustrate layout, not functional proof.
 Production data and backup artifacts are private and never enter this tree.
 Any restored-copy qualification and remaining CI requirements are recorded in
 the pull request. No deployment or live vault mutation is performed here.
+
+
+## Observed qualification
+
+- Linux offline repeat: 10,994 passed, 13 explicit prerequisite or documented skips.
+- Synthetic PostgreSQL schema suite: 450 passed, including existing-fork stamp-back reconciliation.
+- Authentication/task/fork integration: 260 passed initially; the three fork-fixture compatibility failures were corrected, then the affected task/search/readonly modules passed 130 tests.
+- Operator-diagnostic and fork-reconciliation follow-up: 80 passed.
+- Runtime requirements audit and scoped history secret scan passed. Eleven exact upstream synthetic task-key fingerprints were reviewed; no rule or path exemption was added.
+- Daily database snapshot from 2026-11-11 05:00:21 UTC: privately restored on its host, upgraded 044 → 047 twice, clean `alembic check`, all original-column row digests unchanged. Dump SHA-256: `cbb313dbc886ae041ddf62746e7c4d4445ed1a4d66d33c3c4085db9a50aaccb4`.
+
+The restored proof ran candidate source with the incumbent runtime dependency
+set plus the newly pinned timezone-data package. It did not run an application
+lifespan, indexer, provider, or live vault. Separate vault saved-edit/recovery
+behavior was exercised with synthetic native-filesystem tests. The local Linux
+test image lacks Make, Node, Docker Compose and unprivileged mount-namespace
+prerequisites for some checks; protected CI remains the complete partition gate.
+The shared Claude engineering-workflow file and local OpenSpec CLI were absent;
+no unavailable review or CLI gate is claimed. Task-only QA containers and
+networks were stopped; only private non-secret restore metadata was retained.

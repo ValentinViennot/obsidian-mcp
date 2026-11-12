@@ -84,7 +84,7 @@ CANONICAL_CONSTRAINTDEF_010 = (
     "AND (client_secret_hash IS NOT NULL))))"
 )
 
-# 038's definition at head, measured the same way.
+# 045's definition at head, measured the same way.
 CANONICAL_CONSTRAINTDEF = (
     "CHECK (((((token_endpoint_auth_method)::text = 'none'::text) "
     "AND (client_secret_hash IS NULL)) "
@@ -8748,7 +8748,7 @@ def test_038_absent_private_key_jwt_constraint_is_recreated():
 
 def test_038_keeps_013s_marker_through_upgrade_and_downgrade():
     """A drifted 012 database: 013 marks the CHECK, 038 replaces it and keeps
-    the mark, and 038's downgrade restores 010's definition with it intact."""
+    the mark, and 045's downgrade restores 010's definition with it intact."""
     with throwaway_db("schema_038_marker", revision="012") as url:
         drift_to_live_shape(url)
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
@@ -8913,7 +8913,7 @@ def assert_039_shape(url):
         assert cat["indexes"][name] == (definition_expected, True, marker), cat["indexes"]
     comment, columns, constraints = cat["settings"]
     assert comment == M039_SETTINGS_MARKER
-    # 040's marked units (#434) are 040's to verify; 039's shape is the rest.
+    # 047's marked units (#434) are 047's to verify; 046's shape is the rest.
     columns = [c for c in columns if c[0] not in M040_COLUMNS]
     constraints = {k: v for k, v in constraints.items() if k not in M040_CHECKS}
     assert [c[:3] for c in columns] == M039_SETTINGS_COLUMNS
@@ -9095,7 +9095,7 @@ def test_039_stamp_back_rerun_reconciles_and_changes_nothing():
 
 def test_032_rerun_over_a_head_database_leaves_039s_units_to_039():
     """032 compares `note_tasks` completely; a stamp-back that re-runs it over
-    a head database must not refuse 039's marked columns, CHECK and indexes."""
+    a head database must not refuse 046's marked columns, CHECK and indexes."""
     with throwaway_db("schema_039_rerun_from_031") as url:
         _seed_039(url)
         before = (catalogue_039(url), rows_039(url))
@@ -9143,7 +9143,7 @@ def test_032_still_refuses_an_unmarked_extra_column_at_head():
             "unexpected index 'ix_squat'",
         ),
         (
-            # A 039 name with another comment is not 039's unit either.
+            # A 039 name with another comment is not 046's unit either.
             "039_name_other_marker",
             ["COMMENT ON COLUMN note_tasks.text_fold IS 'anything (099_whatever)'"],
             "its columns are",
@@ -9184,7 +9184,7 @@ def test_032s_allow_list_is_exactly_039s_units():
         (
             "unmarked_settings_table",
             ["COMMENT ON TABLE task_settings IS NULL"],
-            "task_settings already exists but it does not carry 039's comment marker",
+            "task_settings already exists but it does not carry 046's comment marker",
         ),
         (
             "settings_fk_not_cascading",
@@ -9217,7 +9217,7 @@ def test_032s_allow_list_is_exactly_039s_units():
         (
             "task_key_unmarked",
             ["COMMENT ON COLUMN note_tasks.task_key IS NULL"],
-            "note_tasks.task_key does not carry 039's comment marker",
+            "note_tasks.task_key does not carry 046's comment marker",
         ),
         (
             "context_cut_default",
@@ -9242,7 +9242,7 @@ def test_032s_allow_list_is_exactly_039s_units():
                 "COMMENT ON CONSTRAINT ck_note_tasks_key_shape ON note_tasks IS "
                 "'task id key shape (039_task_tools)'",
             ],
-            "already carries a constraint ck_note_tasks_key_shape that is not 039's",
+            "already carries a constraint ck_note_tasks_key_shape that is not 046's",
         ),
         (
             "unmarked_check",
@@ -9262,7 +9262,7 @@ def test_032s_allow_list_is_exactly_039s_units():
         (
             "index_unmarked",
             ["COMMENT ON INDEX ix_note_tasks_tag_prefixes IS NULL"],
-            "the index ix_note_tasks_tag_prefixes does not carry 039's comment marker",
+            "the index ix_note_tasks_tag_prefixes does not carry 046's comment marker",
         ),
         (
             "index_on_another_table",
@@ -9322,7 +9322,7 @@ def test_downgrade_039_leaves_units_it_did_not_create():
         sql(url, "COMMENT ON COLUMN note_tasks.text_fold IS 'somebody else'")
         result = _harness.run_alembic(url, "downgrade", "045", dimensions=DIM)
         out = result.stdout
-        assert "039 downgrade: leaving task_settings in place" in out, out
+        assert "046 downgrade: leaving task_settings in place" in out, out
         assert "leaving constraint ck_note_tasks_key_shape on note_tasks in place" in out, out
         assert "leaving index ix_note_tasks_tag_prefixes in place" in out, out
         assert "leaving note_tasks.text_fold in place" in out, out
@@ -9456,7 +9456,7 @@ def test_040_from_039_writes_nothing_and_existing_rows_read_null_empty_null():
 @pytest.mark.parametrize("stamp", ["046", "045"])
 def test_040_stamp_back_rerun_reconciles_and_changes_nothing(stamp):
     """A stamp-back to 039 re-runs 040 only; to 038 it re-runs 039 over a
-    head database (039's allow-list leaves 040's marked units to 040)."""
+    head database (046's allow-list leaves 047's marked units to 040)."""
     with throwaway_db(f"schema_040_rerun_{stamp}") as url:
         _seed_040(url)
         before = (catalogue_039(url), catalogue_040(url), rows_040(url))
@@ -9473,7 +9473,7 @@ def test_040_stamp_back_rerun_reconciles_and_changes_nothing(stamp):
         (
             "unmarked_task_rule",
             ["ALTER TABLE task_settings ADD COLUMN task_rule varchar(8)"],
-            "task_settings.task_rule does not carry 040's comment marker",
+            "task_settings.task_rule does not carry 047's comment marker",
         ),
         (
             "task_tags_varchar64",
@@ -9515,12 +9515,12 @@ def test_040_refuses_an_impostor_column_and_changes_nothing(label, ddl, fragment
         (
             "unmarked_rule_check",
             ["COMMENT ON CONSTRAINT ck_task_settings_task_rule ON task_settings IS NULL"],
-            "constraint ck_task_settings_task_rule that is not 040's",
+            "constraint ck_task_settings_task_rule that is not 047's",
         ),
         (
             "unmarked_filter_check",
             ["COMMENT ON CONSTRAINT ck_task_settings_global_filter ON task_settings IS NULL"],
-            "constraint ck_task_settings_global_filter that is not 040's",
+            "constraint ck_task_settings_global_filter that is not 047's",
         ),
         (
             "impostor_filter_check",
@@ -9531,7 +9531,7 @@ def test_040_refuses_an_impostor_column_and_changes_nothing(label, ddl, fragment
                 "COMMENT ON CONSTRAINT ck_task_settings_global_filter ON task_settings IS "
                 "'a filter rule has its filter text (040_task_rule)'",
             ],
-            "constraint ck_task_settings_global_filter that is not 040's",
+            "constraint ck_task_settings_global_filter that is not 047's",
         ),
     ],
 )
@@ -9564,7 +9564,7 @@ def test_040_refuses_an_impostor_check(label, ddl, fragment):
     ],
 )
 def test_039_still_refuses_unmarked_units_on_task_settings_at_head(label, ddl, fragment):
-    """039's allow-list leaves out only 040's five units, each with its exact
+    """046's allow-list leaves out only 047's five units, each with its exact
     marker: anything else on `task_settings` is still foreign to 039."""
     with throwaway_db(f"schema_040_039_strict_{label}") as url:
         for statement in ddl:
@@ -9638,7 +9638,7 @@ def test_040_downgrade_round_trip():
         assert alembic_version(url) == "046"
         cat = catalogue_040(url)
         assert all(v is None for v in cat["columns"].values()) and cat["checks"] == {}
-        # Exactly 039's shape, which 039's own reconcile accepts.
+        # Exactly 046's shape, which 046's own reconcile accepts.
         assert_039_shape(url)
         _, columns, constraints = catalogue_039(url)["settings"]
         assert [c[:3] for c in columns] == M039_SETTINGS_COLUMNS

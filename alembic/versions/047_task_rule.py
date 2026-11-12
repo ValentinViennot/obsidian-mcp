@@ -17,8 +17,8 @@ metadata-only on PostgreSQL 16, and both CHECKs admit every existing row
 (NULL, `'{}'`, NULL). An already-running previous-image process keeps
 working: its insert names only its own columns (the new ones take NULL,
 `'{}'`, NULL) and its update touches only its own. A restarted previous image
-cannot start at 040 (its migration step does not know the revision); rollback
-is roll-forward, or `alembic downgrade 039` run with this image first, which
+cannot start at 047 (its migration step does not know the revision); rollback
+is roll-forward, or `alembic downgrade 046` run with this image first, which
 drops the three columns and both CHECKs — and with them every saved task
 rule, task tag and filter text.
 
@@ -33,16 +33,16 @@ object of another shape, or one without the marker, is refused by name before
 anything is created. `downgrade()` drops only marked objects, the CHECKs
 first.
 
-039 compares `task_settings` completely, so it leaves exactly these five
-units — each only with its exact marker below — to this revision (039's
+046 compares `task_settings` completely, so it leaves exactly these five
+units — each only with its exact marker below — to this revision (046's
 allow-list, the second after 032's).
 
 `search_path` is pinned, and `lock_timeout` / `statement_timeout` set and
 `RESET`. Nothing here needs superuser and no extension is created
 (`test_nonsuperuser_migrations_pg.py`).
 
-Revision ID: 040
-Revises: 039
+Revision ID: 047
+Revises: 046
 Create Date: 2026-11-10
 """
 from typing import Sequence, Union
@@ -202,16 +202,16 @@ def _assert_is_the_qualified_table(bind) -> None:
     unqualified = _oid(bind, SETTINGS)
     if resolved is None or resolved != unqualified:
         raise RuntimeError(
-            f"040's {SETTINGS} is not the table {SETTINGS_QUALIFIED} resolves to "
+            f"047's {SETTINGS} is not the table {SETTINGS_QUALIFIED} resolves to "
             f"(search_path-relative oid {unqualified!r}, qualified oid {resolved!r}). "
-            "039 creates it; the server reads the unqualified name. Set the "
+            "046 creates it; the server reads the unqualified name. Set the "
             "migration role's search_path so `public` comes first, then re-run. "
             "Nothing has been changed."
         )
 
 
 def _column_problems(bind) -> tuple[list, list]:
-    """`(problems, missing)` over every column 040 adds."""
+    """`(problems, missing)` over every column 047 adds."""
     problems, missing = [], []
     for column, ddl_type, fmt, notnull, default, marker in COLUMNS:
         state = _column_state(bind, column)
@@ -224,7 +224,7 @@ def _column_problems(bind) -> tuple[list, list]:
         if live_notnull != notnull:
             problems.append(
                 f"{SETTINGS}.{column} is {'NOT NULL' if live_notnull else 'nullable'}; "
-                f"040 creates it {'NOT NULL' if notnull else 'nullable'}"
+                f"047 creates it {'NOT NULL' if notnull else 'nullable'}"
             )
         expected_default = _probe_default(bind, ddl_type, default) if default else None
         if live_default != expected_default:
@@ -233,7 +233,7 @@ def _column_problems(bind) -> tuple[list, list]:
                 f"not {expected_default!r}"
             )
         if comment != marker:
-            problems.append(f"{SETTINGS}.{column} does not carry 040's comment marker")
+            problems.append(f"{SETTINGS}.{column} does not carry 047's comment marker")
     return problems, missing
 
 
@@ -250,7 +250,7 @@ def _check_problems(bind) -> list:
         if contype == "c" and validated and definition == canonical[name] and comment == marker:
             continue
         problems.append(
-            f"{SETTINGS} already carries a constraint {name} that is not 040's "
+            f"{SETTINGS} already carries a constraint {name} that is not 047's "
             f"(type {contype!r}, definition {definition!r}, validated={validated}, "
             f"marker {'present' if comment == marker else 'absent'})"
         )
@@ -276,10 +276,10 @@ def upgrade() -> None:
     if refusals:
         raise RuntimeError(
             ". ".join(refusals)
-            + ". 040 will not adopt a unit of unknown provenance: the task tools "
+            + ". 047 will not adopt a unit of unknown provenance: the task tools "
             "decide from these columns which checkboxes each owner's listings "
             "show, and a shape this migration did not create can hide a task or "
-            "apply a rule nobody chose. Resolve by hand — drop it and let 040 "
+            "apply a rule nobody chose. Resolve by hand — drop it and let 047 "
             "create it — then re-run. Nothing has been changed."
         )
 
@@ -302,15 +302,15 @@ def upgrade() -> None:
 
 def _leave(unit: str, marker: str, comment) -> None:
     print(
-        f"040 downgrade: leaving {unit} in place. It does not carry 040's marker "
-        f"({marker!r}) — its comment is {comment!r} — so 040 did not create it "
+        f"047 downgrade: leaving {unit} in place. It does not carry 047's marker "
+        f"({marker!r}) — its comment is {comment!r} — so 047 did not create it "
         "and will not drop it. Remove it by hand if you mean to.",
         flush=True,
     )
 
 
 def downgrade() -> None:
-    """Drop each unit only if it carries 040's marker, the CHECKs first, each
+    """Drop each unit only if it carries 047's marker, the CHECKs first, each
     decided on its own, printing what is left and why. The rest of
     `task_settings` is untouched; the saved task rules, task tags and filter
     texts go with their columns (the count is printed)."""
@@ -340,7 +340,7 @@ def downgrade() -> None:
             )).scalar_one()
             if rows:
                 print(
-                    f"040 downgrade: discarding the task rule, task tags or global "
+                    f"047 downgrade: discarding the task rule, task tags or global "
                     f"filter text of {rows} {SETTINGS} row(s); the previous build "
                     "does not read them and lists every checkbox.",
                     flush=True,
@@ -353,8 +353,8 @@ def downgrade() -> None:
                 _leave(f"{SETTINGS}.{column}", marker, state[3])
             elif column in kept:
                 print(
-                    f"040 downgrade: leaving {SETTINGS}.{column} in place — an object "
-                    "040 did not create, and so did not drop, still reads it.",
+                    f"047 downgrade: leaving {SETTINGS}.{column} in place — an object "
+                    "047 did not create, and so did not drop, still reads it.",
                     flush=True,
                 )
             else:

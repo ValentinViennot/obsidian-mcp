@@ -59,17 +59,17 @@ defaults, every constraint, indexes) plus the foreign key's printed definition
 and its marker. Any other same-named object is refused by name before anything
 is created. `downgrade()` drops only marked objects.
 
-**Units marked by this revision are 039's to verify.** 032 compares
+**Units marked by this revision are 046's to verify.** 032 compares
 `note_tasks` completely, so a stamp-back that re-runs 032 over a head database
-would otherwise refuse 039's columns, CHECK and indexes as foreign. 032 leaves
+would otherwise refuse 046's columns, CHECK and indexes as foreign. 032 leaves
 every unit whose comment carries a later revision's marker to that revision.
 
 `search_path` is pinned, and `lock_timeout` / `statement_timeout` set and
 `RESET`, for 021's, 024's and 025's reasons. Nothing here needs superuser and
 no extension is created (`test_nonsuperuser_migrations_pg.py`).
 
-Revision ID: 039
-Revises: 038
+Revision ID: 046
+Revises: 045
 Create Date: 2026-11-10
 """
 import re
@@ -148,7 +148,7 @@ OPEN_DESC_INDEX = "ix_note_tasks_open_desc"
 
 
 def _index_ddl(table: str) -> dict:
-    """`{name: CREATE INDEX statement}` for 039's two `note_tasks` indexes."""
+    """`{name: CREATE INDEX statement}` for 046's two `note_tasks` indexes."""
     return {
         TAG_PREFIXES_INDEX: (
             f"CREATE INDEX {TAG_PREFIXES_INDEX} ON {table} USING gin (tag_prefixes)",
@@ -307,7 +307,7 @@ def _later_revision_unit(allow_list: dict, name, comment) -> bool:
 
 
 def _shape(bind, qualified: str) -> dict:
-    """Everything 039 compares about `task_settings`, from the catalogue (033's
+    """Everything 046 compares about `task_settings`, from the catalogue (033's
     reader), less a later revision's marked units (`LATER_SETTINGS_*`).
     Foreign keys are excluded here and compared on their own."""
     columns = [
@@ -393,7 +393,7 @@ def _probe_default(bind, sqltype: str, declaration: str) -> str:
 
 
 def _probe_tasks(bind):
-    """A TEMP table with the `note_tasks` columns 039's CHECK and indexes read,
+    """A TEMP table with the `note_tasks` columns 046's CHECK and indexes read,
     typed identically, so their printed definitions can be measured."""
     bind.execute(sa.text(f"DROP TABLE IF EXISTS pg_temp.{_PROBE}"))
     bind.execute(
@@ -466,7 +466,7 @@ def _assert_is_the_qualified_table(bind, table: str, qualified: str) -> None:
     unqualified = _oid(bind, table)
     if resolved is None or resolved != unqualified:
         raise RuntimeError(
-            f"039's {table} is not the table {qualified} resolves to "
+            f"046's {table} is not the table {qualified} resolves to "
             f"(search_path-relative oid {unqualified!r}, qualified oid "
             f"{resolved!r}). The server reads the unqualified name. Set the "
             "migration role's search_path so `public` comes first, then re-run. "
@@ -475,7 +475,7 @@ def _assert_is_the_qualified_table(bind, table: str, qualified: str) -> None:
 
 
 def _column_problems(bind) -> tuple[list, list]:
-    """`(problems, missing)` over every column 039 adds."""
+    """`(problems, missing)` over every column 046 adds."""
     problems, missing = [], []
     canonical_defaults: dict = {}
     for table, qualified, column, ddl_type, fmt, notnull, default, marker in COLUMNS:
@@ -489,7 +489,7 @@ def _column_problems(bind) -> tuple[list, list]:
         if live_notnull != notnull:
             problems.append(
                 f"{table}.{column} is {'NOT NULL' if live_notnull else 'nullable'}; "
-                f"039 creates it {'NOT NULL' if notnull else 'nullable'}"
+                f"046 creates it {'NOT NULL' if notnull else 'nullable'}"
             )
         expected_default = None
         if default is not None:
@@ -503,7 +503,7 @@ def _column_problems(bind) -> tuple[list, list]:
                 f"not {expected_default!r}"
             )
         if comment != marker:
-            problems.append(f"{table}.{column} does not carry 039's comment marker")
+            problems.append(f"{table}.{column} does not carry 046's comment marker")
     return problems, missing
 
 
@@ -516,7 +516,7 @@ def _key_shape_problems(bind) -> list:
     if contype == "c" and validated and definition == canonical and comment == KEY_SHAPE_MARKER:
         return []
     return [
-        f"{TASKS} already carries a constraint {KEY_SHAPE} that is not 039's "
+        f"{TASKS} already carries a constraint {KEY_SHAPE} that is not 046's "
         f"(type {contype!r}, definition {definition!r}, validated={validated}, "
         f"marker {'present' if comment == KEY_SHAPE_MARKER else 'absent'})"
     ]
@@ -549,7 +549,7 @@ def _index_problems(bind) -> list:
                 f"the index {name} is {definition!r}, not {canonical[name]!r}"
             )
         elif comment != marker:
-            problems.append(f"the index {name} does not carry 039's comment marker")
+            problems.append(f"the index {name} does not carry 046's comment marker")
     return problems
 
 
@@ -557,7 +557,7 @@ def _settings_problems(bind) -> list:
     if _oid(bind, SETTINGS_QUALIFIED) is None:
         return []
     if _table_comment(bind, SETTINGS_QUALIFIED) != SETTINGS_MARKER:
-        return [f"{SETTINGS} already exists but it does not carry 039's comment marker"]
+        return [f"{SETTINGS} already exists but it does not carry 046's comment marker"]
     problems = []
     live = _shape(bind, SETTINGS_QUALIFIED)
     expected = _expected_settings_shape(bind)
@@ -566,7 +566,7 @@ def _settings_problems(bind) -> list:
             extra = sorted(set(live[part]) - set(expected[part]))
             absent = sorted(set(expected[part]) - set(live[part]))
             problems.append(
-                f"{SETTINGS} already exists but its {part} differ from 039's "
+                f"{SETTINGS} already exists but its {part} differ from 046's "
                 f"(unexpected: {extra}; missing: {absent})"
             )
     fks = _foreign_keys(bind, SETTINGS_QUALIFIED)
@@ -601,11 +601,11 @@ def upgrade() -> None:
     if refusals:
         raise RuntimeError(
             ". ".join(refusals)
-            + ". 039 will not adopt a unit of unknown provenance: the task tools "
+            + ". 046 will not adopt a unit of unknown provenance: the task tools "
             "resolve writes, list and filter tasks and apply each owner's "
             "settings from these objects, and a shape this migration did not "
             "create can hide a task, list one that does not exist or apply "
-            "another scope's settings. Resolve by hand — drop it and let 039 "
+            "another scope's settings. Resolve by hand — drop it and let 046 "
             "create it — then re-run. Nothing has been changed."
         )
 
@@ -646,15 +646,15 @@ def upgrade() -> None:
 
 def _leave(unit: str, marker: str, comment) -> None:
     print(
-        f"039 downgrade: leaving {unit} in place. It does not carry 039's marker "
-        f"({marker!r}) — its comment is {comment!r} — so 039 did not create it "
+        f"046 downgrade: leaving {unit} in place. It does not carry 046's marker "
+        f"({marker!r}) — its comment is {comment!r} — so 046 did not create it "
         "and will not drop it. Remove it by hand if you mean to.",
         flush=True,
     )
 
 
 def downgrade() -> None:
-    """Drop each unit only if it carries 039's marker, each decided on its own,
+    """Drop each unit only if it carries 046's marker, each decided on its own,
     printing what is left and why (`alembic/env.py` configures no logging).
 
     The `note_tasks` and `notes_metadata` columns are derived: the previous
@@ -676,7 +676,7 @@ def downgrade() -> None:
             rows = bind.execute(sa.text(f"SELECT count(*) FROM {SETTINGS}")).scalar_one()
             if rows:
                 print(
-                    f"039 downgrade: dropping {SETTINGS} with {rows} saved settings "
+                    f"046 downgrade: dropping {SETTINGS} with {rows} saved settings "
                     "row(s); the previous build does not read them.",
                     flush=True,
                 )
@@ -719,7 +719,7 @@ def downgrade() -> None:
             _leave(f"{table}.{column}", marker, state[3])
         elif table == TASKS and column in kept:
             print(
-                f"039 downgrade: leaving {table}.{column} in place — an object 039 "
+                f"046 downgrade: leaving {table}.{column} in place — an object 046 "
                 "did not create, and so did not drop, still reads it.",
                 flush=True,
             )

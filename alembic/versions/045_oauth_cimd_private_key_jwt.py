@@ -45,9 +45,9 @@ here would silently change what a later downgrade to 012 does.
 
 The schema gate stamps back and re-runs. Each column is adopted only with the
 exact type, nullable, no default and its comment marker (mirrored in
-`src/models/db.py`). A replaced CHECK whose definition is 038's is kept; one
+`src/models/db.py`). A replaced CHECK whose definition is 045's is kept; one
 whose definition is its predecessor's is replaced; anything else is refused by
-name. The new CHECK is adopted only with 038's definition, validated, and
+name. The new CHECK is adopted only with 045's definition, validated, and
 `CONSTRAINT_MARKER`. Definitions are compared against what this server prints
 for a scratch probe constraint, never a hand-written rendering. A refusal
 raises inside the migration transaction, so nothing changes. No backfill.
@@ -62,8 +62,8 @@ the four columns and restores 036's exact two CHECK definitions.
 Nothing here needs superuser: table ownership suffices
 (`test_nonsuperuser_migrations_pg.py`).
 
-Revision ID: 038
-Revises: 037
+Revision ID: 045
+Revises: 044
 Create Date: 2026-11-07
 """
 from typing import Sequence, Union
@@ -235,7 +235,7 @@ def _pin_and_assert(bind) -> None:
     ).scalar()
     if qualified is None or qualified != unqualified:
         raise RuntimeError(
-            "038's oauth_clients is not the table public.oauth_clients resolves "
+            "045's oauth_clients is not the table public.oauth_clients resolves "
             f"to (search_path-relative oid {unqualified!r}, qualified oid "
             f"{qualified!r}). Set the migration role's search_path so `public` "
             "comes first, then re-run. Nothing has been changed."
@@ -269,11 +269,11 @@ def upgrade() -> None:
         if default is not None:
             problems.append(f"{TABLE}.{column} has a server default of {default!r}")
         if comment != marker:
-            problems.append(f"{TABLE}.{column} does not carry 038's comment marker")
+            problems.append(f"{TABLE}.{column} does not carry 045's comment marker")
     if problems:
         raise RuntimeError(
-            f"{'; '.join(problems)}. 038 will not adopt a column of unknown "
-            "provenance. Resolve by hand (drop it and let 038 create it), then "
+            f"{'; '.join(problems)}. 045 will not adopt a column of unknown "
+            "provenance. Resolve by hand (drop it and let 045 create it), then "
             "re-run. Nothing has been changed."
         )
     for column, _type, marker in missing:
@@ -294,8 +294,8 @@ def upgrade() -> None:
             _replace(name, predicate, comment)
             continue
         raise RuntimeError(
-            f"{name} exists with a definition that is neither 038's nor the one "
-            f"038 replaces ({definition!r}, validated={validated}). 038 will not "
+            f"{name} exists with a definition that is neither 045's nor the one "
+            f"045 replaces ({definition!r}, validated={validated}). 045 will not "
             "adopt or replace it. Drop it and re-run. Nothing has been changed."
         )
 
@@ -311,9 +311,9 @@ def upgrade() -> None:
             and definition == _render(bind, PKJWT_SHAPE_SQL)
         ):
             raise RuntimeError(
-                f"{PKJWT_SHAPE} already exists but is not 038's (definition "
+                f"{PKJWT_SHAPE} already exists but is not 045's (definition "
                 f"{definition!r}, validated={validated}, marker "
-                f"{'present' if comment == CONSTRAINT_MARKER else 'absent'}). 038 "
+                f"{'present' if comment == CONSTRAINT_MARKER else 'absent'}). 045 "
                 "will not adopt it. Drop it and re-run. Nothing has been changed."
             )
 
@@ -331,7 +331,7 @@ def downgrade() -> None:
     ).scalar_one()
     if count:
         raise RuntimeError(
-            f"038 downgrade refused: {count} private_key_jwt client row(s) exist in "
+            f"045 downgrade refused: {count} private_key_jwt client row(s) exist in "
             f"{TABLE}. Delete those clients in the control panel (their grants go "
             "with them) and run the downgrade again."
         )

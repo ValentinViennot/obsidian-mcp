@@ -178,9 +178,12 @@ staleness timer, which is why the same outage was noticed there in minutes and
 here not at all.
 
 Everything the window cannot trust repeats rather than going quiet, since
-silence is the failure being fixed: an mtime no `stat` could read, and a marker
-dated in the future after a clock change or a restore, both alert on every
-sweep until the record makes sense again. **The GNU spelling of `stat` comes
+silence is the failure being fixed: an mtime no `stat` could read, a marker
+dated in the future after a clock change or a restore, and a clock `date` could
+not report at all, each alert on every sweep until the record makes sense again.
+Both readings are guarded and both assignments are compound, because a bare one
+aborts the sweep under `set -e` — and a command substitution fails when a fork
+does, which is when the status handed to launchd matters most. **The GNU spelling of `stat` comes
 first**, because GNU `stat -f` is `--file-system` and prints six lines of it to
 stdout, which the arithmetic then died on under `set -u` — killing the sweep and
 replacing the engine's exit status with 1. The window is read in base 10
@@ -190,8 +193,9 @@ towards silence.
 Successful sync clears the notification marker, without deleting recovery
 versions. A busy writer lock stays a silent retry. Failed notification delivery
 leaves the next sweep eligible to retry; the original engine exit status is
-preserved whatever happens in the alerting, including an unusable `stat`, and
-`test_an_unusable_stat_never_changes_the_engines_exit_status` asserts it.
+preserved whatever happens in the alerting, including an unusable `stat` or
+`date`, and `test_an_unusable_clock_or_stat_never_changes_the_exit_status`
+asserts both.
 Notification availability follows macOS user permissions, so use `status` when
 diagnosing sync.
 

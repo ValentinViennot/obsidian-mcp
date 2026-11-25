@@ -49,9 +49,16 @@ elif [[ "$result" == 3 ]] && command -v osascript >/dev/null 2>&1; then
         repeat=0
         if [[ "$RENOTIFY_MINUTES" -gt 0 && -f "$MARKER" ]]; then
             said=$(stat -c %Y "$MARKER" 2>/dev/null || stat -f %m "$MARKER" 2>/dev/null || echo 0)
-            now=$(date +%s)
+            # `now` gets the same guard as `said`, and its assignment is a
+            # compound: a bare one would abort the sweep under `set -e` if
+            # `date` failed, and a command substitution also fails when a fork
+            # does — which is exactly when the machine is in trouble and the
+            # status handed to launchd matters most. An unusable clock repeats,
+            # like every other thing this window cannot trust.
+            now=$(date +%s) || now=0
+            [[ "$now" =~ ^[0-9]{1,12}$ ]] || now=0
             [[ "$said" =~ ^[0-9]{1,12}$ ]] && [[ "$said" -le "$now" ]] || said=0
-            [[ $(( ( now - said ) / 60 )) -lt "$RENOTIFY_MINUTES" ]] || repeat=1
+            [[ "$now" -gt 0 ]] && [[ $(( ( now - said ) / 60 )) -lt "$RENOTIFY_MINUTES" ]] || repeat=1
         fi
         # Both texts are fixed literals. Neither carries a note name, a path or
         # any saved content: those stay in the private status and log output.

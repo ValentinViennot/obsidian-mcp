@@ -43,6 +43,16 @@ ExecStart=/opt/obsidian-mcp/deploy/vault-reconcile.sh
 # Bounded, and comfortably above the script's own network timeouts (2 × 120 s)
 # so a slow remote is reported by the script — with its own exit code and its
 # own log line — rather than killed by systemd with neither.
+#
+# The engine's own publication budget (VAULT_RECONCILE_PUBLISH_BUDGET, 210 s)
+# sits under this on purpose: a publication too large for one sweep stops
+# between two notes, where its journal is exact, and the next sweep resumes it.
+# The budget covers the publication loop only — the fetch and the candidate
+# merge have no safe pause point — so this timeout is what still bounds those,
+# and raising it does buy them headroom. When it is this timeout that fires,
+# the unit records `result=timeout` and pages: the engine is killed by signal
+# and the exit code below never reaches systemd. Exit 76 is quiet only when
+# the engine's own budget got there first.
 TimeoutStartSec=300
 
 # **No Restart=.** The failures this can have are a divergence needing a human
@@ -64,9 +74,12 @@ ProtectControlGroups=yes
 # Shared directories inherit setgid through mkdir; the engine never copies
 # file set-ID bits or explicitly enables directory set-ID with chmod.
 RestrictSUIDSGID=yes
-# A busy supported writer is a retry, not a successful synchronization. The
-# wrapper preserves the old success marker, so staleness detection still works.
-SuccessExitStatus=75
+# A busy supported writer is a retry, not a successful synchronization, and
+# neither is 76 — a publication too large for one sweep that stopped at a safe
+# boundary. Both are "come back next sweep", and without this both page a human
+# every two minutes for as long as they last. The wrapper preserves the old
+# success marker for either, so staleness detection still works.
+SuccessExitStatus=75 76
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

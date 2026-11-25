@@ -352,8 +352,10 @@ python3 deploy/vault-reconcile.py --vault /path/to/vault recovery-list
 
 Status includes transaction/date, incoming commit, candidate worktree, original
 note path, retained location and latest SHA-256. `local_edit_recovered` means a
-saved editor version differs from the prior committed content. An incomplete
-transaction requires recovery even when the retained bytes are unchanged.
+saved editor version differs from the prior committed content. A merge conflict
+requires recovery even when the retained bytes are unchanged; an incomplete
+publication or preparation does not — the next sweep finishes or abandons it on
+its own (see below).
 Export the latest version outside the vault before choosing what to keep:
 
 ```bash
@@ -377,12 +379,38 @@ version too and leaves the chosen local edit ready for the next normal commit.
 A subsequent late save changing an acknowledged hash reopens review. These
 commands never delete recovery storage or force-push history.
 
-After an interrupted sync, keep editors closed and continue its transaction:
+A transaction interrupted part-way — SIGTERM, the publication budget, a reboot,
+a laptop closing mid-sweep — needs nothing: the next sweep finishes it, provided
+no operation is ambiguous and no retained version holds an unacknowledged editor
+save. A transaction that published nothing, or whose HEAD is no longer the base it was
+planned against, is marked `abandoned` — nothing is deleted, and the same sweep
+re-derives from the vault as it is; any other is resumed. A sweep that heals
+anything names the transaction and the reason under `healed` in its result. `status` showing any of those states for under
+a few minutes is that healing in progress, not a stuck vault. Exit 76 with "publication paused at
+a safe boundary" is the same thing said out loud: an import too large for one
+sweep, converging in slices. Neither refreshes the staleness marker, so an
+import that never converges is still reported by `obsidian-vault-staleness`.
+
+Two refusals name a file instead and need no recovery command at all.
+`incoming addition collides with a local save` and `local deletion arrived`
+mean something created or removed that exact path while the transaction was in
+flight — an editor, or an agent, whose note writes stay available while commits
+are gated. Move the named file aside (or put it back) and the next ordinary
+sweep resumes the transaction and converges; nothing was published and nothing
+is lost while it refuses.
+
+Run the manual continuation only for what stays explicit — a merge conflict, or
+a transaction the sweep refuses to finish (an ambiguous operation, a recovered
+editor save) — with editors closed:
 
 ```bash
 python3 deploy/vault-reconcile.py --vault /path/to/vault \
   recovery-continue TRANSACTION --editors-quiesced
 ```
+
+Run it directly, never through `systemctl start`: the unit's `TimeoutStartSec`
+would stop a long continuation part-way, which is how the state being recovered
+came about in the first place.
 
 Recovery classifies completed/native exchanges by inode identity. It does not
 replay an ambiguous exchange. If names changed unexpectedly, export retained

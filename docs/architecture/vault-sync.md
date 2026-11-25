@@ -170,16 +170,30 @@ trigger a new alert.
 own mtime is when the sweep last said anything, and
 `VAULT_RECONCILE_RENOTIFY_MINUTES` (60; `0` restores one alert per state and
 never again) is how long it may stay quiet. The repeat says the vault still has
-not synchronised, and a successful sync clears the marker as before. Suppressing
-by state alone was not enough: a desktop vault stopped syncing on 2026-11-24 at
-03:21, said so once — at twenty past three in the morning — and then nothing for
-43 hours and 510 refused sweeps. The server side has the opposite shape, a
-Telegram alert on every failed run plus a staleness timer, which is why the same
-outage was noticed there in minutes and here not at all. Successful sync
-clears the notification marker, without deleting recovery versions. A busy writer
-lock stays a silent retry. Failed notification delivery leaves the next sweep
-eligible to retry; the original engine exit status is preserved. Notification
-availability follows macOS user permissions, so use `status` when diagnosing sync.
+not synchronised. Suppressing by state alone was not enough: a desktop vault
+stopped syncing on 2026-11-24 at 03:21, said so once — at twenty past three in
+the morning — and then nothing for 43 hours and 510 refused sweeps. The server
+side has the opposite shape, a Telegram alert on every failed run plus a
+staleness timer, which is why the same outage was noticed there in minutes and
+here not at all.
+
+Everything the window cannot trust repeats rather than going quiet, since
+silence is the failure being fixed: an mtime no `stat` could read, and a marker
+dated in the future after a clock change or a restore, both alert on every
+sweep until the record makes sense again. **The GNU spelling of `stat` comes
+first**, because GNU `stat -f` is `--file-system` and prints six lines of it to
+stdout, which the arithmetic then died on under `set -u` — killing the sweep and
+replacing the engine's exit status with 1. The window is read in base 10
+explicitly: bash reads `008` as octal and aborted the comparison, which failed
+towards silence.
+
+Successful sync clears the notification marker, without deleting recovery
+versions. A busy writer lock stays a silent retry. Failed notification delivery
+leaves the next sweep eligible to retry; the original engine exit status is
+preserved whatever happens in the alerting, including an unusable `stat`, and
+`test_an_unusable_stat_never_changes_the_engines_exit_status` asserts it.
+Notification availability follows macOS user permissions, so use `status` when
+diagnosing sync.
 
 ## Named connection authors
 

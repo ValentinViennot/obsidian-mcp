@@ -14,7 +14,11 @@ MARKER="$VAULT_PATH/.git/obsidian-desktop-recovery-notified"
 # changed and the marker suppressed every later alert. 0 restores that
 # behaviour, one alert per state and never again.
 RENOTIFY_MINUTES="${VAULT_RECONCILE_RENOTIFY_MINUTES:-60}"
-[[ "$RENOTIFY_MINUTES" =~ ^[0-9]+$ ]] || RENOTIFY_MINUTES=60
+# Bounded digits, then base 10 explicitly: bash reads a leading zero as octal,
+# so `008` would abort the comparison — leaving the vault silent, the exact
+# direction this must never fail in — and `060` would quietly mean 48 minutes.
+[[ "$RENOTIFY_MINUTES" =~ ^[0-9]{1,7}$ ]] || RENOTIFY_MINUTES=60
+RENOTIFY_MINUTES=$((10#$RENOTIFY_MINUTES))
 result=0
 python3 "$ENGINE" --vault "$VAULT_PATH" --desktop sync >>"$LOG" 2>&1 || result=$?
 if [[ "$result" == 0 ]]; then
@@ -29,19 +33,36 @@ elif [[ "$result" == 3 ]] && command -v osascript >/dev/null 2>&1; then
         [[ ! -f "$MARKER" ]] || prior=$(cat "$MARKER") || prior=""
         # The marker's own mtime is when this last said anything, so a changed
         # recovery state still alerts at once and an unchanged one alerts again
-        # once the window is up. `stat` is spelled differently on the two
-        # platforms the test suite runs on.
+        # once the window is up.
+        #
+        # **The GNU spelling has to come first.** GNU `stat -f` is
+        # `--file-system` and takes no argument, so `-f %m FILE` prints six
+        # lines of filesystem detail to stdout and exits non-zero — which then
+        # ran the second form too and left `said` holding that text. Under
+        # `set -u` the arithmetic below died on it, killing the sweep and
+        # replacing the engine's exit status with 1. BSD `stat -c` fails with an
+        # empty stdout, so this order is right on both. Anything that is not a
+        # plain timestamp, a marker dated in the future after a clock change or
+        # a restore included, counts as no record of having spoken — which
+        # repeats rather than going quiet, and no `stat` output can abort a
+        # sweep or change its exit status again.
         repeat=0
         if [[ "$RENOTIFY_MINUTES" -gt 0 && -f "$MARKER" ]]; then
-            said=$(stat -f %m "$MARKER" 2>/dev/null || stat -c %Y "$MARKER" 2>/dev/null || echo 0)
-            [[ $(( ( $(date +%s) - said ) / 60 )) -lt "$RENOTIFY_MINUTES" ]] || repeat=1
+            said=$(stat -c %Y "$MARKER" 2>/dev/null || stat -f %m "$MARKER" 2>/dev/null || echo 0)
+            now=$(date +%s)
+            [[ "$said" =~ ^[0-9]{1,12}$ ]] && [[ "$said" -le "$now" ]] || said=0
+            [[ $(( ( now - said ) / 60 )) -lt "$RENOTIFY_MINUTES" ]] || repeat=1
         fi
         # Both texts are fixed literals. Neither carries a note name, a path or
         # any saved content: those stay in the private status and log output.
+        # They travel as `argv`, not interpolated into the AppleScript source,
+        # so no text can ever become script — AppleScript can `do shell script`.
         text="Saved note versions need review. Use vault sync status and recovery tools; details are in your private sync log."
         [[ "$fingerprint" == "$prior" ]] && text="This vault still has not synchronised. $text" || true
         if [[ -n "$fingerprint" ]] && [[ "$fingerprint" != "$prior" || "$repeat" == 1 ]]; then
-            if osascript -e "display notification \"$text\" with title \"Obsidian sync needs review\"" >>"$LOG" 2>&1; then
+            if osascript -e 'on run argv' \
+                          -e 'display notification (item 1 of argv) with title "Obsidian sync needs review"' \
+                          -e 'end run' -- "$text" >>"$LOG" 2>&1; then
                 # A digest-only private marker suppresses unchanged recovery alerts.
                 (umask 077; temporary=$(mktemp "$MARKER.XXXXXX"); printf '%s\n' "$fingerprint" >"$temporary"; mv -f "$temporary" "$MARKER") || true
             fi

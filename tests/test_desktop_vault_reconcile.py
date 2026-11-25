@@ -4,6 +4,8 @@ import fcntl
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 from tests.test_vault_reconcile_script import git, world  # noqa: F401
 
@@ -151,7 +153,7 @@ def test_a_blocked_sync_says_so_again_once_the_window_is_up(world, tmp_path):
     # The repeat is as private as the first one.
     assert "Alpha" not in alerts[1] and "private version" not in alerts[1]
     assert str(desktop) not in alerts[1]
-    # And the clock restarts, so the next sweep two minutes later stays quiet.
+    # And the clock restarts, so the sweeps in between stay quiet.
     assert run_desktop(desktop, tmp_path, **env).returncode == 3
     assert len((tmp_path / "notifications").read_text().splitlines()) == 2
 
@@ -167,6 +169,74 @@ def test_the_repeat_window_is_configurable_and_can_be_turned_off(world, tmp_path
     assert len((tmp_path / "notifications").read_text().splitlines()) == 1
 
     assert run_desktop(desktop, tmp_path, **env, VAULT_RECONCILE_RENOTIFY_MINUTES="5").returncode == 3
+    assert len((tmp_path / "notifications").read_text().splitlines()) == 2
+
+
+def test_a_changed_recovery_state_alerts_at_once_inside_the_window(world, tmp_path):
+    """The window may delay a repeat; it must never delay news.
+
+    A recovery state that changes — another displaced version, an editor saving
+    into a retained inode — is new information, and waiting an hour for it
+    would be a regression the two window tests above would not catch.
+    """
+    _, server, desktop = world
+    env = notification_env(tmp_path)
+    blocked_vault(server, desktop)
+    marker = desktop / ".git/obsidian-desktop-recovery-notified"
+    assert run_desktop(desktop, tmp_path, **env).returncode == 3
+    first = (tmp_path / "notifications").read_text().splitlines()
+    assert len(first) == 1
+    assert "still has not synchronised" not in first[0]
+
+    # Same instant, so the window is nowhere near up; different state.
+    marker.write_text("a digest from some other recovery state")
+    assert run_desktop(desktop, tmp_path, **env).returncode == 3
+
+    alerts = (tmp_path / "notifications").read_text().splitlines()
+    assert len(alerts) == 2
+    assert "still has not synchronised" not in alerts[1]
+
+
+def test_an_unusable_stat_never_changes_the_engines_exit_status(world, tmp_path):
+    """`stat` is spelled differently per platform and it is read in a sweep that
+    must hand launchd the engine's own exit status, whatever happens here.
+    """
+    _, server, desktop = world
+    env = notification_env(tmp_path)
+    blocked_vault(server, desktop)
+    marker = desktop / ".git/obsidian-desktop-recovery-notified"
+    assert run_desktop(desktop, tmp_path, **env).returncode == 3
+    # A `stat` that prints something which is not a timestamp at all: GNU
+    # `stat -f %m FILE` really does print six lines of filesystem detail.
+    broken = Path(env["PATH"].split(os.pathsep)[0]) / "stat"
+    broken.write_text(
+        '#!/bin/sh\n'
+        'printf "  File: \\"x\\"\\n    ID: deadbeef Namelen: 255\\n"\n'
+        'exit 1\n'
+    )
+    broken.chmod(0o755)
+    try:
+        done = run_desktop(desktop, tmp_path, **env)
+        assert done.returncode == 3, done.stderr
+        assert "unbound variable" not in done.stderr
+    finally:
+        broken.unlink()
+
+
+@pytest.mark.parametrize("value", ["abc", "-5", "008", "", "60 "])
+def test_an_unusable_window_falls_back_to_repeating(world, tmp_path, value):
+    """Every rejected value must land on the default, never on silence: a
+    leading zero reads as octal in bash, and `008` aborted the comparison.
+    """
+    _, server, desktop = world
+    env = notification_env(tmp_path)
+    blocked_vault(server, desktop)
+    marker = desktop / ".git/obsidian-desktop-recovery-notified"
+    assert run_desktop(desktop, tmp_path, **env,
+                       VAULT_RECONCILE_RENOTIFY_MINUTES=value).returncode == 3
+    said_at(marker, 61 * 60)
+    done = run_desktop(desktop, tmp_path, **env, VAULT_RECONCILE_RENOTIFY_MINUTES=value)
+    assert done.returncode == 3, done.stderr
     assert len((tmp_path / "notifications").read_text().splitlines()) == 2
 
 

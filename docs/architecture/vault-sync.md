@@ -27,17 +27,34 @@ identity, never by an unchanged hash or a `published` flag. Ambiguous names are
 not blindly replayed. Explicit recovery requires editors and other Git writers
 to be quiesced. HEAD/index finalization changes metadata only.
 
-A publication that merely stopped part-way is resumed by the next sweep without
-a human. The condition is narrow and checked per transaction: a decided merge
-(`merged` set), state `publishing` or `finalizing`, no ambiguous operation, and
-no retained version holding an unacknowledged editor save. The work is what
-`recovery-continue` performs, through the same `publish_and_finalize` and the
-same refusals; only the audience differs. A merge conflict, an interrupted
-preparation and a recovered local edit remain explicit, quiesced operations.
-This exists because the opposite was worse: one 896-file import whose
-publication was killed by `TimeoutStartSec` stopped every later sweep — and,
-through the same gate in `vault_sync.committing`, every agent commit — for two
-hours, until somebody ran `recovery-continue --editors-quiesced` by hand.
+A transaction that merely stopped part-way is finished by the next sweep
+without a human, because it is the engine's own work left half-done rather than
+a judgement call. Two shapes, both checked per transaction, neither admitting an
+ambiguous operation or a retained version holding an unacknowledged editor save:
+
+- State `publishing` or `finalizing` with a decided merge: the publication
+  continues. This is what `recovery-continue` performs, through the same
+  `publish_and_finalize` and the same refusals; only the audience differs.
+- State `preparing` — pinned heads, no candidate merge, `operations` empty,
+  nothing published or retained. While its `original` is still HEAD the
+  candidate merge is computed, exactly as a fresh sweep would; once HEAD has
+  moved on, that merge is void and the journal is marked `abandoned`, which
+  stops it gating without deleting anything. The incoming commit is fetched and
+  merged again in the same sweep, from the base the vault actually has.
+
+A merge conflict and a recovered local edit remain explicit, quiesced
+operations. Publication proves HEAD is `original` or `merged` **before** it
+touches a note as well as after the loop: a transaction planned against a base
+the vault has since left would otherwise publish its whole stale diff over
+newer notes and only then be refused.
+
+This exists because the opposite was worse, twice over. One 896-file import
+whose publication was killed by `TimeoutStartSec` stopped every later sweep —
+and, through the same gate in `vault_sync.committing`, every agent commit — for
+two hours. A desktop vault sat on a void `preparing` transaction for 43 hours
+and 510 sweeps, with one notification at the start of it. Both needed
+`recovery-continue --editors-quiesced` typed by a human who had to notice
+first.
 
 Publication is bounded by its own budget (`VAULT_RECONCILE_PUBLISH_BUDGET`,
 210 s) rather than by the unit's `TimeoutStartSec` (300 s), and `SIGTERM`/
@@ -49,8 +66,8 @@ merge out again. An import larger than one sweep therefore converges in slices
 with nobody watching, instead of being killed mid-note.
 
 Latest displaced bytes are compared on status, subsequent sweeps and every MCP
-commit. A recovered local edit, a merge conflict or an interrupted preparation
-pauses automatic Git commits and pushes; an interrupted publication is resumed
+commit. A recovered local edit or a merge conflict pauses automatic Git commits
+and pushes; an interrupted publication or preparation is finished or abandoned
 instead, as above. Note writes remain available, without rolling back their
 published bytes. Explicit resolution can keep the live version or republish a
 recovered version; republishing journals and retains the incumbent again. A

@@ -177,23 +177,69 @@ Reconciler(Path(root), desktop=True, observer=stop).run()
     state = engine.status()
     assert state["review_required"]
     tx = state["transactions"][0]["id"]
-    if boundary == "prepared":
-        # No merge was decided yet, so finishing it is a judgement call and
-        # stays a human one.
-        with pytest.raises(ReconcileError, match="recovery review"):
-            engine.run()
-        engine.continue_recovery(tx, editors_quiesced=True)
-    else:
-        # The merge is decided and every operation is journaled: the next
-        # sweep finishes the engine's own work with nobody watching.
-        engine.run()
-        assert not engine.status()["review_required"]
+    # Whatever it was doing, it was the engine's own work and every step of it
+    # is journaled: the next sweep finishes it with nobody watching.
+    assert tx
+    engine.run()
+    assert not engine.status()["review_required"]
     assert (live / "Note.md").read_text() == "incoming\n"
     assert git(live, "show", "HEAD:Note.md") == "incoming"
     assert git(live, "diff", "--cached", "--name-only") == ""
     retained = versions(engine)[0]
     assert Path(retained["location"]).stat().st_ino == original_inode
     assert Path(retained["location"]).read_text() == "baseline\n"
+
+
+def test_a_preparation_over_a_base_the_vault_has_left_is_abandoned_not_replayed(clones):
+    """A desktop vault sat on one of these for 43 hours and 510 sweeps.
+
+    `preparing` means the candidate merge was never computed: nothing is
+    published and nothing is retained. Once HEAD has moved on, that merge is
+    void — replaying it would publish a diff against a base the vault no longer
+    has — so it stops gating and the sweep merges again from the real HEAD.
+    """
+    import signal
+    import sys
+    _, live, peer = clones
+    incoming(peer)
+    code = """
+import os, signal, sys
+from pathlib import Path
+from src.services.vault_reconcile import Reconciler
+def stop(label, journal):
+    if label == "prepared":
+        os.kill(os.getpid(), signal.SIGKILL)
+Reconciler(Path(sys.argv[1]), desktop=True, observer=stop).run()
+"""
+    from src.services import vault_reconcile as module
+    source_root = Path(module.__file__).resolve().parents[2]
+    result = subprocess.run([sys.executable, "-c", code, str(live)],
+                            capture_output=True, cwd=source_root,
+                            env={**os.environ, "PYTHONPATH": str(source_root)})
+    assert result.returncode == -signal.SIGKILL
+    stale = Reconciler(live).status()["transactions"][0]["id"]
+    # The vault moves on: a local note is written and committed as any editor's
+    # work would be, which is what makes the pinned preparation void.
+    (live / "Local.md").write_text("written while the preparation was stale\n")
+    git(live, "add", "-A")
+    git(live, "commit", "-qm", "local work after the interrupted preparation")
+    moved = git(live, "rev-parse", "HEAD")
+
+    engine = Reconciler(live, desktop=True)
+    engine.run()
+
+    assert not engine.status()["review_required"]
+    abandoned = next(transaction for transaction in engine.status()["transactions"]
+                     if transaction["id"] == stale)
+    assert abandoned["state"] == "abandoned"
+    # Nothing was deleted, and both pinned heads are still inspectable.
+    refs = git(live, "for-each-ref", "--format=%(refname)", f"refs/obsidian-recovery/{stale}")
+    assert "local" in refs and "incoming" in refs
+    # The incoming note arrived anyway, merged from the base the vault has.
+    assert (live / "Note.md").read_text() == "incoming\n"
+    assert (live / "Local.md").read_text() == "written while the preparation was stale\n"
+    assert git(live, "merge-base", "--is-ancestor", moved, "HEAD") == ""
+    assert git(live, "status", "--porcelain") == ""
 
 
 def test_an_interrupted_publication_with_a_recovered_save_still_waits_for_a_human(clones):

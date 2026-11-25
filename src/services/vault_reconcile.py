@@ -309,7 +309,7 @@ class Reconciler:
                     versions.append({"path": op["path"], "location": str(retained),
                                      "sha256": digest, "local_edit_recovered": changed,
                                      "resolved": acknowledged, "position": self.operation_state(path.parent, op)})
-            incomplete = journal["state"] not in ("complete", "acknowledged")
+            incomplete = journal["state"] not in ("complete", "acknowledged", "abandoned")
             pending |= incomplete
             transactions.append({"id": journal["id"], "date": journal["date"],
                                  "incoming_commit": journal["incoming"], "state": journal["state"],
@@ -336,8 +336,8 @@ class Reconciler:
         with self.locked():
             return self._run()
 
-    def finish_interrupted_publications(self, state):
-        """Resume the engine's own half-finished publications, unattended.
+    def finish_interrupted_transactions(self, state):
+        """Resume the engine's own half-finished transactions, unattended.
 
         A transaction needs a human for exactly two reasons: a merge the engine
         could not decide, or a retained inode an editor wrote to after
@@ -358,19 +358,75 @@ class Reconciler:
         save is left exactly where it is, for the human path.
         """
         for transaction in state["transactions"]:
-            if transaction["state"] not in ("publishing", "finalizing"):
+            if transaction["state"] not in ("preparing", "publishing", "finalizing"):
                 continue
             if any(version["position"] == "ambiguous" or
                    (version["local_edit_recovered"] and not version["resolved"])
                    for version in transaction["versions"]):
                 continue
             path, journal = self.transaction(transaction["id"])
-            if journal["merged"] is None:
+            if journal["state"] == "preparing":
+                if journal["merged"] is not None or journal["operations"]:
+                    continue
+                if self.git("rev-parse", "HEAD").decode().strip() != journal["original"]:
+                    self.abandon_void_preparation(path, journal)
+                    continue
+                self.observer("resuming", journal)
+                self.prepare_candidate(path, journal)
+            if journal["merged"] is None or journal["state"] not in ("publishing", "finalizing"):
                 continue
             self.observer("resuming", journal)
             self.publish_and_finalize(journal)
             self.git("worktree", "remove", "--force", str(path.parent / "merge"), check=False)
         return self.status()
+
+    def prepare_candidate(self, path, journal):
+        """Compute the candidate merge of a transaction that has none yet.
+
+        All of it happens in the private worktree; the live vault is untouched
+        until publication. A conflict becomes `merge_conflict`, which is a
+        human's decision and stays one.
+        """
+        scratch = path.parent / "merge"
+        if not scratch.exists():
+            self.git("-c", "core.hooksPath=/dev/null", "worktree", "add", "--quiet", "--detach",
+                     str(scratch), journal["original"])
+        if self.git("ls-files", "-u", root=scratch):
+            journal["state"] = "merge_conflict"
+            self.checkpoint("merge_conflict", journal)
+            return
+        try:
+            self.git("-c", "core.hooksPath=/dev/null", "merge", "--no-edit", "--no-gpg-sign",
+                     journal["incoming"], root=scratch)
+        except ReconcileError:
+            if not self.git("ls-files", "-u", root=scratch):
+                raise
+            journal["state"] = "merge_conflict"
+            self.checkpoint("merge_conflict", journal)
+        if journal["state"] != "merge_conflict":
+            self.plan(journal, self.git("rev-parse", "HEAD", root=scratch).decode().strip())
+
+    def abandon_void_preparation(self, path, journal):
+        """Stop gating on a preparation that decided nothing over a stale base.
+
+        `preparing` is the state between pinning the two heads and computing the
+        candidate merge: `operations` is empty, no version is retained, and not
+        one byte of the vault has been touched — the only artefacts are the
+        journal and the two pinned refs. When HEAD has moved on since, that
+        merge is void, because it would be computed against a base the vault no
+        longer has; publishing it would overwrite newer notes with older bytes.
+
+        So it is marked `abandoned` and stops gating. Nothing is deleted — the
+        journal, both pinned heads and the directory stay for inspection — and
+        the same sweep then fetches and merges the incoming commit again, from
+        the base the vault actually has. Before this, one such transaction
+        stopped a desktop vault syncing for 43 hours and 510 sweeps, with a
+        single notification at the start of it.
+        """
+        if any(entry.name.startswith("version-") for entry in os.scandir(path.parent)):
+            return
+        journal["state"] = "abandoned"
+        self.checkpoint("abandoned", journal)
 
     def _run(self):
         if any((self.git_dir / name).exists() for name in
@@ -378,7 +434,7 @@ class Reconciler:
             raise ReconcileError("interrupted git operation; recover before retrying")
         state = self.status()
         if state["review_required"]:
-            state = self.finish_interrupted_publications(state)
+            state = self.finish_interrupted_transactions(state)
         if state["review_required"]:
             raise ReconcileError("recovery review required; run status and recovery export before syncing")
         branch = self.git("symbolic-ref", "--quiet", "--short", "HEAD", optional=True).decode().strip()
@@ -574,6 +630,13 @@ class Reconciler:
                 "incumbent_inode" not in op and op["new_blob"] for op in journal["operations"]):
             self.git("-c", "core.hooksPath=/dev/null", "worktree", "add", "--quiet", "--detach",
                      str(directory / "merge"), journal["merged"])
+        # Prove HEAD *before* publishing, not only after the loop. A transaction
+        # planned against a base the vault has since left would otherwise
+        # publish its whole stale diff — overwriting newer notes with older
+        # bytes — and only then be refused by the check below the loop.
+        current = self.git("rev-parse", "HEAD").decode().strip()
+        if current not in (journal["original"], journal["merged"]):
+            raise ReconcileError("HEAD changed outside synchronization; explicit review required")
         with self.pausable():
             recovery_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
@@ -646,21 +709,7 @@ class Reconciler:
                 return self.status()
             scratch = path.parent / "merge"
             if journal["merged"] is None and journal["state"] != "merge_conflict":
-                if not scratch.exists():
-                    self.git("-c", "core.hooksPath=/dev/null", "worktree", "add", "--quiet", "--detach", str(scratch), journal["original"])
-                if self.git("ls-files", "-u", root=scratch):
-                    journal["state"] = "merge_conflict"
-                    self.checkpoint("merge_conflict", journal)
-                else:
-                    try:
-                        self.git("-c", "core.hooksPath=/dev/null", "merge", "--no-edit", "--no-gpg-sign", journal["incoming"], root=scratch)
-                    except ReconcileError:
-                        if not self.git("ls-files", "-u", root=scratch):
-                            raise
-                        journal["state"] = "merge_conflict"
-                        self.checkpoint("merge_conflict", journal)
-                    if journal["state"] != "merge_conflict":
-                        self.plan(journal, self.git("rev-parse", "HEAD", root=scratch).decode().strip())
+                self.prepare_candidate(path, journal)
             if journal["state"] == "merge_conflict":
                 if self.git("ls-files", "-u", root=scratch):
                     raise ReconcileError("resolve and commit the candidate merge worktree shown by status first")

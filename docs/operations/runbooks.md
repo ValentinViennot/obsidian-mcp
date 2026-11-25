@@ -382,10 +382,10 @@ commands never delete recovery storage or force-push history.
 A transaction interrupted part-way — SIGTERM, the publication budget, a reboot,
 a laptop closing mid-sweep — needs nothing: the next sweep finishes it, provided
 no operation is ambiguous and no retained version holds an unacknowledged editor
-save. A `publishing` or `finalizing` transaction has its publication resumed; a
-`preparing` one has its merge computed, or is marked `abandoned` when HEAD has
-moved on and that merge is void (nothing is deleted, and the incoming commit is
-merged again from the real HEAD). `status` showing any of those states for under
+save. A transaction that published nothing, or whose HEAD is no longer the base it was
+planned against, is marked `abandoned` — nothing is deleted, and the same sweep
+re-derives from the vault as it is; any other is resumed. A sweep that heals
+anything names the transaction and the reason under `healed` in its result. `status` showing any of those states for under
 a few minutes is that healing in progress, not a stuck vault. Exit 76 with "publication paused at
 a safe boundary" is the same thing said out loud: an import too large for one
 sweep, converging in slices. Neither refreshes the staleness marker, so an

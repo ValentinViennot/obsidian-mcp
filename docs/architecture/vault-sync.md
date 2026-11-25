@@ -27,34 +27,50 @@ identity, never by an unchanged hash or a `published` flag. Ambiguous names are
 not blindly replayed. Explicit recovery requires editors and other Git writers
 to be quiesced. HEAD/index finalization changes metadata only.
 
-A transaction that merely stopped part-way is finished by the next sweep
+A transaction that merely stopped part-way is dealt with by the next sweep
 without a human, because it is the engine's own work left half-done rather than
-a judgement call. Two shapes, both checked per transaction, neither admitting an
-ambiguous operation or a retained version holding an unacknowledged editor save:
+a judgement call. A retained version holding an unacknowledged editor save, or
+an ambiguous operation, keeps one out of this entirely. Otherwise three rules,
+in order, each provable from the journal:
 
-- State `publishing` or `finalizing` with a decided merge: the publication
-  continues. This is what `recovery-continue` performs, through the same
-  `publish_and_finalize` and the same refusals; only the audience differs.
-- State `preparing` — pinned heads, no candidate merge, `operations` empty,
-  nothing published or retained. While its `original` is still HEAD the
-  candidate merge is computed, exactly as a fresh sweep would; once HEAD has
-  moved on, that merge is void and the journal is marked `abandoned`, which
-  stops it gating without deleting anything. The incoming commit is fetched and
-  merged again in the same sweep, from the base the vault actually has.
+- **Nothing was published** (no operation published, no version retained): the
+  journal is marked `abandoned`. `preparing` is this state by construction — it
+  reaches disk at one place, with `operations` empty, because `plan` writes the
+  journal only once it is already `publishing`.
+- **HEAD is neither `original` nor `merged`**: the plan was computed against a
+  tree the vault no longer has, so it is `abandoned` too. Publishing it would
+  put stale bytes over newer notes.
+- **Otherwise** the publication continues, which is what `recovery-continue`
+  performs, through the same `publish_and_finalize` and the same refusals; only
+  the audience differs.
+
+Abandonment deletes nothing: journal, every retained version and both pinned
+heads stay, and the same sweep re-derives from the vault as it is — `git add -A`
+records whatever was already published, the incoming commit is fetched again and
+the merge covers the remainder, so a half-published import converges instead of
+jamming. The only thing it can lose sight of is an `incoming` the remote no
+longer has (a force-push, a pruned branch); the commit survives as
+`refs/obsidian-recovery/<id>/incoming`, and every sweep that heals anything
+names the transaction and the reason in its result, so neither is silent. A
+`recovery-continue` on an abandoned transaction is refused: re-planning it would
+checkpoint `publishing` against the base the vault has left, and the publication
+guard would then refuse it forever — one wrong command, one permanent jam.
+
+Publication proves HEAD is `original` or `merged` **before** it touches a note
+as well as after the loop. Without that, resuming a transaction whose base the
+vault had left published its whole stale diff over newer committed bytes and
+only then refused: the destructive write this engine exists to prevent.
 
 A merge conflict and a recovered local edit remain explicit, quiesced
-operations. Publication proves HEAD is `original` or `merged` **before** it
-touches a note as well as after the loop: a transaction planned against a base
-the vault has since left would otherwise publish its whole stale diff over
-newer notes and only then be refused.
+operations.
 
-This exists because the opposite was worse, twice over. One 896-file import
-whose publication was killed by `TimeoutStartSec` stopped every later sweep —
-and, through the same gate in `vault_sync.committing`, every agent commit — for
-two hours. A desktop vault sat on a void `preparing` transaction for 43 hours
-and 510 sweeps, with one notification at the start of it. Both needed
-`recovery-continue --editors-quiesced` typed by a human who had to notice
-first.
+This exists because the opposite was worse, three times over. One 896-file
+import whose publication was killed by `TimeoutStartSec` stopped every later
+sweep — and, through the same gate in `vault_sync.committing`, every agent
+commit — for two hours. A desktop vault sat on a void `preparing` transaction
+for 43 hours and 510 sweeps, with one notification at the start of it. And a
+half-published import plus one ordinary `git add -A` in the vault — a human's,
+or an Obsidian Git "commit all" — was a dead end that no command could clear.
 
 Publication is bounded by its own budget (`VAULT_RECONCILE_PUBLISH_BUDGET`,
 210 s) rather than by the unit's `TimeoutStartSec` (300 s), and `SIGTERM`/
@@ -67,8 +83,8 @@ with nobody watching, instead of being killed mid-note.
 
 Latest displaced bytes are compared on status, subsequent sweeps and every MCP
 commit. A recovered local edit or a merge conflict pauses automatic Git commits
-and pushes; an interrupted publication or preparation is finished or abandoned
-instead, as above. Note writes remain available, without rolling back their
+and pushes; an interrupted transaction is finished or abandoned instead, as
+above. Note writes remain available, without rolling back their
 published bytes. Explicit resolution can keep the live version or republish a
 recovered version; republishing journals and retains the incumbent again. A
 later descriptor save changing an acknowledged hash reopens review. Recovery
@@ -79,14 +95,23 @@ Replacing a file preserves its POSIX owner, group and restrictive/shared mode;
 only Git's executable bit changes deliberately. New files/directories inherit
 parent permissions and group. Group write is preserved across the umask by
 `fchmod` on the created directory's own descriptor — the umask masks `mkdir`'s
-mode argument and nothing else — so the engine never changes the process umask
-and never forks. It used to fork: a `python3 -c "os.umask(0); os.mkdir(...)"`
-per path component, at three call sites per operation, which profiled on the
+mode argument and nothing else — so the engine never changes the process umask,
+which is process-global and shared with the async server, and never forks. It
+used to fork unconditionally: a `python3 -c "os.umask(0); os.mkdir(...)"` per
+path component, at three call sites per operation, which profiled on the
 production host as 149 s of a 154 s 400-note import (96%) and is how an import
 outran its unit timeout. Publication is a per-note loop; nothing in it may start
 a process other than Git, and `test_publication_creates_directories_without_forking_a_process_per_note`
-asserts that. File set-ID bits are never copied; directory
-setgid inheritance comes from the kernel, without an explicit set-ID chmod. A root
+asserts that. **A set-ID parent is the exception and still uses that child.**
+The kernel puts the parent's setgid bit on the new directory, and
+`RestrictSUIDSGID=yes` denies this process any `fchmod` carrying set-ID bits,
+while one without them would clear what the kernel just set — so when a set-ID
+parent meets a umask that masks bits the directory needs, the mode can only be
+got right at creation, under a umask of 0 only a child can have. The umask is
+read from `/proc/self/status`, never by calling `os.umask`. File set-ID bits are
+never copied; directory setgid inheritance comes from the kernel, without an
+explicit set-ID chmod — `test_a_setid_parent_never_gets_an_explicit_setid_chmod`
+asserts there is no chmod there at all. A root
 sweep inherits the service owner's UID for additions; prefer running the whole
 sweep as the service owner. Unavailable ownership/permission changes stop before
 publication. These guarantees concern POSIX modes, not preservation of extended

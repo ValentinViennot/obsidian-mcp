@@ -358,6 +358,162 @@ def test_a_manual_continuation_is_not_cut_short_by_the_sweep_budget(clones, monk
     assert not Reconciler(live, desktop=True).status()["review_required"]
 
 
+def keep_import(peer, count):
+    (peer / "Keep").mkdir()
+    for index in range(count):
+        (peer / "Keep" / f"note-{index}.md").write_text(f"note {index}\n")
+    git(peer, "add", "-A")
+    git(peer, "commit", "-qm", "import keep")
+    git(peer, "push", "-q")
+
+
+def test_a_paused_import_converges_when_the_vault_commits_meanwhile(clones, monkeypatch):
+    """The pause leaves published notes visible and uncommitted, so the next
+    `git add -A` — a human's, or Obsidian Git's "commit all" — absorbs them and
+    moves HEAD off the base the rest of the plan was computed against. That
+    used to be a dead end: every sweep refused, `recovery-continue` refused
+    too, and no command could clear it.
+    """
+    _, live, peer = clones
+    keep_import(peer, 6)
+    monkeypatch.setenv("VAULT_RECONCILE_PUBLISH_BUDGET", "0")
+    with pytest.raises(ReconcileError, match="paused at a safe boundary"):
+        Reconciler(live, desktop=True).run()
+    stale = Reconciler(live).status()["transactions"][0]["id"]
+    monkeypatch.delenv("VAULT_RECONCILE_PUBLISH_BUDGET")
+
+    # Somebody commits in the vault while the import is half published.
+    git(live, "add", "-A")
+    git(live, "commit", "-qm", "commit all, mid-import")
+
+    engine = Reconciler(live, desktop=True)
+    result = engine.run()
+
+    assert not engine.status()["review_required"]
+    for index in range(6):
+        assert (live / "Keep" / f"note-{index}.md").read_text() == f"note {index}\n"
+    assert git(live, "status", "--porcelain") == ""
+    abandoned = next(t for t in engine.status()["transactions"] if t["id"] == stale)
+    assert abandoned["state"] == "abandoned"
+    # The sweep says what it did rather than healing silently.
+    assert {"transaction": stale, "action": "abandoned", "reason": "base left"} in result["healed"]
+
+
+def test_a_plan_interrupted_before_its_first_publication_does_not_gate_forever(clones):
+    """`publishing` with nothing published is as void as `preparing`."""
+    import signal
+    import sys
+    _, live, peer = clones
+    incoming(peer)
+    code = """
+import os, signal, sys
+from pathlib import Path
+from src.services.vault_reconcile import Reconciler
+def stop(label, journal):
+    if label == "planned":
+        os.kill(os.getpid(), signal.SIGKILL)
+Reconciler(Path(sys.argv[1]), desktop=True, observer=stop).run()
+"""
+    from src.services import vault_reconcile as module
+    source_root = Path(module.__file__).resolve().parents[2]
+    result = subprocess.run([sys.executable, "-c", code, str(live)], capture_output=True,
+                            cwd=source_root, env={**os.environ, "PYTHONPATH": str(source_root)})
+    assert result.returncode == -signal.SIGKILL
+    stale = Reconciler(live).status()["transactions"][0]["id"]
+    assert Reconciler(live).status()["transactions"][0]["state"] == "publishing"
+    (live / "Local.md").write_text("work done while it was stuck\n")
+    git(live, "add", "-A")
+    git(live, "commit", "-qm", "local work")
+
+    engine = Reconciler(live, desktop=True)
+    engine.run()
+
+    assert not engine.status()["review_required"]
+    assert next(t for t in engine.status()["transactions"]
+                if t["id"] == stale)["state"] == "abandoned"
+    assert (live / "Note.md").read_text() == "incoming\n"
+    assert (live / "Local.md").read_text() == "work done while it was stuck\n"
+    assert git(live, "status", "--porcelain") == ""
+
+
+def test_publication_refuses_a_base_the_vault_has_left(clones, monkeypatch):
+    """The guard that keeps a stale plan off newer notes, asserted directly.
+
+    Without it, resuming published the whole stale diff over bytes committed
+    since and only then refused — the destructive write this engine exists to
+    prevent.
+    """
+    _, live, peer = clones
+    keep_import(peer, 4)
+    monkeypatch.setenv("VAULT_RECONCILE_PUBLISH_BUDGET", "0")
+    with pytest.raises(ReconcileError, match="paused at a safe boundary"):
+        Reconciler(live, desktop=True).run()
+    monkeypatch.delenv("VAULT_RECONCILE_PUBLISH_BUDGET")
+    engine = Reconciler(live, desktop=True)
+    _, journal = engine.transaction(engine.status()["transactions"][0]["id"])
+    git(live, "add", "-A")
+    git(live, "commit", "-qm", "the vault moves on")
+
+    with pytest.raises(ReconcileError, match="HEAD changed outside synchronization"):
+        engine.publish_and_finalize(journal)
+
+    assert sum((live / "Keep" / f"note-{index}.md").exists() for index in range(4)) < 4
+
+
+def test_a_manual_continuation_refuses_an_abandoned_transaction(clones, monkeypatch):
+    """Re-planning one would checkpoint `publishing` over a base the vault has
+    left, which the publication guard then refuses forever: one wrong command,
+    one permanent jam.
+    """
+    _, live, peer = clones
+    keep_import(peer, 4)
+    monkeypatch.setenv("VAULT_RECONCILE_PUBLISH_BUDGET", "0")
+    with pytest.raises(ReconcileError, match="paused"):
+        Reconciler(live, desktop=True).run()
+    monkeypatch.delenv("VAULT_RECONCILE_PUBLISH_BUDGET")
+    stale = Reconciler(live).status()["transactions"][0]["id"]
+    git(live, "add", "-A")
+    git(live, "commit", "-qm", "the vault moves on")
+    engine = Reconciler(live, desktop=True)
+    engine.run()
+    assert next(t for t in engine.status()["transactions"] if t["id"] == stale)["state"] == "abandoned"
+
+    with pytest.raises(ReconcileError, match="transaction abandoned"):
+        engine.continue_recovery(stale, editors_quiesced=True)
+    assert not engine.status()["review_required"]
+
+
+def test_a_setid_parent_never_gets_an_explicit_setid_chmod(tmp_path, monkeypatch):
+    """`RestrictSUIDSGID=yes` on the sweep unit denies any chmod carrying
+    set-ID bits, and one without them would clear the bit the kernel just
+    inherited. Commit 276033c already paid for this once.
+    """
+    import stat as stat_module
+    import sys
+    import src.services.vault_reconcile as module
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    os.chmod(parent, 0o2770)
+    if not os.stat(parent).st_mode & stat_module.S_ISGID:
+        pytest.skip("filesystem does not keep a directory setgid bit")
+    modes = []
+    actual = os.fchmod
+    monkeypatch.setattr(os, "fchmod", lambda fd, mode: (modes.append(mode), actual(fd, mode))[1])
+    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        module.make_directory(fd, "daily", stat_module.S_IMODE(os.fstat(fd).st_mode))
+    finally:
+        os.close(fd)
+    # Not "no set-ID bits in the chmod" — no chmod at all. With a set-ID
+    # parent the mode can only be got right at creation, so there is nothing
+    # left for an fchmod to do, and anything it did would be wrong.
+    assert modes == [], modes
+    created = os.stat(parent / "daily")
+    assert created.st_mode & 0o777 == 0o770
+    if sys.platform.startswith("linux"):
+        assert created.st_mode & stat_module.S_ISGID
+
+
 def test_publication_creates_directories_without_forking_a_process_per_note(clones, monkeypatch):
     """The import that broke the sweep spent 96% of 154 s starting interpreters.
 

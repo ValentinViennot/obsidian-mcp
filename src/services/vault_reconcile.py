@@ -15,6 +15,7 @@ import signal
 import stat
 import tempfile
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -69,35 +70,80 @@ def durable_json(path: Path, value: dict) -> None:
         os.close(directory)
 
 
-def make_directory(fd: int, name: str, mode: int):
-    """Create a note directory with an exact mode, independent of the umask.
+def process_umask() -> int | None:
+    """Read this process's umask without changing it; None when unreadable.
 
-    The engine still does not change the caller's process umask — it is
-    process-global and this module is imported by the async server — and the
-    kernel can still inherit a parent directory's setgid bit under
-    RestrictSUIDSGID=yes. `mkdir`'s mode argument is the only thing a umask
-    masks, so `fchmod` on the created descriptor restores the shared bits
-    afterwards and the set-ID bits the kernel inherited are preserved.
-
-    **This used to spawn `python3 -c "os.umask(0); os.mkdir(...)"`.** It was
-    correct and it cost an interpreter start per path component, at three call
-    sites per operation. Profiled on the production host, 1,200 of those spawns
-    were 149 s of a 154 s import — 96% of the work — which is how a 896-file
-    Google Keep import ran past TimeoutStartSec=300 and left a half-published
-    transaction. Publication is a per-note loop: nothing in it may fork.
+    `os.umask` is a setter that happens to return the old value, and this
+    module is imported by the async server, so calling it would briefly widen
+    every other file the process creates. Linux publishes the value instead.
     """
     try:
-        # Best effort at the exact mode first, so the window below is never
-        # wider than the umask already allows, then make it exact.
-        os.mkdir(name, mode & 0o777, dir_fd=fd)
+        with open("/proc/self/status", "rb") as status:
+            for line in status:
+                if line.startswith(b"Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def make_directory_under_zero_umask(fd: int, name: str, mode: int):
+    """Create the directory in a child whose umask is 0, so mkdir is exact."""
+    code = "import os,sys; os.umask(0); os.mkdir(sys.argv[2], int(sys.argv[3]), dir_fd=int(sys.argv[1]))"
+    result = subprocess.run([sys.executable, "-c", code, str(fd), name, str(mode)],
+                            pass_fds=(fd,), capture_output=True, timeout=15)
+    if result.returncode:
+        if inode_directory_exists(fd, name):
+            raise FileExistsError(name)
+        raise ReconcileError("could not create shared note directory; nothing published")
+
+
+def inode_directory_exists(fd, name):
+    try:
+        return stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def make_directory(fd: int, name: str, mode: int):
+    """Create a note directory with the parent's mode, whatever the umask.
+
+    **A set-ID parent is the one case that still needs a child process.** The
+    kernel puts the parent's setgid bit on the new directory, and
+    `RestrictSUIDSGID=yes` — which the sweep unit ships, and which commit
+    276033c already had to reckon with — denies this process any `fchmod`
+    carrying set-ID bits. An `fchmod` without them would *clear* what the
+    kernel just set. So when a set-ID parent meets a umask that masks bits the
+    child directory needs, the mode can only be got right at creation time,
+    and only a child may have umask 0. The engine never changes its own umask:
+    it is process-global and this module is imported by the async server.
+
+    Everywhere else — which is every vault whose directories are not set-ID —
+    `mkdir` is given the exact mode and `fchmod` only widens what the umask
+    masked, never touching set-ID bits. **That matters because this used to
+    fork unconditionally**: an interpreter start per path component, at three
+    call sites per operation, profiled on the production host as 149 s of a
+    154 s 400-note import (96%), which is how an 896-file Google Keep import
+    ran past TimeoutStartSec=300. Publication is a per-note loop, so the
+    common path through it must not fork.
+    """
+    target = mode & 0o777
+    masked = process_umask()
+    if stat.S_IMODE(os.fstat(fd).st_mode) & 0o7000 and (masked is None or target & ~masked != target):
+        make_directory_under_zero_umask(fd, name, target)
+        return
+    try:
+        os.mkdir(name, target, dir_fd=fd)
     except FileExistsError:
         raise
     except OSError as exc:
         raise ReconcileError("could not create shared note directory; nothing published") from exc
     created = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
     try:
-        inherited = stat.S_IMODE(os.fstat(created).st_mode) & 0o7000
-        os.fchmod(created, (mode & 0o777) | inherited)
+        if stat.S_IMODE(os.fstat(created).st_mode) & 0o777 != target:
+            # Only the permission bits, so this is never the chmod
+            # RestrictSUIDSGID forbids, and never drops an inherited set-ID bit.
+            os.fchmod(created, target)
     except OSError as exc:
         raise ReconcileError("could not create shared note directory; nothing published") from exc
     finally:
@@ -173,6 +219,7 @@ class Reconciler:
         self.budget = float(os.environ.get("VAULT_RECONCILE_PUBLISH_BUDGET", "210"))
         self.deadline = time.monotonic() + self.budget
         self.paused = None
+        self.healed = []
 
     def git(self, *args, root=None, check=True, optional=False) -> bytes:
         command = self.command(args, root)
@@ -270,9 +317,11 @@ class Reconciler:
         inode identity is already durable.
 
         Outside the main thread `signal.signal` is unavailable; the time budget
-        still applies, so the loop remains interruptible either way.
+        still applies, so the loop remains interruptible either way. The flag
+        is never cleared: a stop that arrives during the last operation of one
+        transaction must still stop the next one, or the process goes on to be
+        killed mid-note — the thing being prevented.
         """
-        self.paused = None
 
         def requested(number, _frame):
             self.paused = f"stop requested (signal {number})"
@@ -318,6 +367,12 @@ class Reconciler:
         return {"review_required": pending, "transactions": transactions,
                 "notice": "Displaced inodes remain retained: an editor descriptor can save there later. "
                           "Use recovery export before resolution; no automatic cleanup."}
+
+    def summary(self, result: dict) -> dict:
+        """A sweep's own words. Healing a transaction must not be silent: it
+        replaces what a human used to be asked to do, so it says what it did.
+        """
+        return result if not self.healed else {**result, "healed": self.healed}
 
     def tree(self, commit):
         result = {}
@@ -365,19 +420,19 @@ class Reconciler:
                    for version in transaction["versions"]):
                 continue
             path, journal = self.transaction(transaction["id"])
-            if journal["state"] == "preparing":
-                if journal["merged"] is not None or journal["operations"]:
-                    continue
-                if self.git("rev-parse", "HEAD").decode().strip() != journal["original"]:
-                    self.abandon_void_preparation(path, journal)
-                    continue
-                self.observer("resuming", journal)
-                self.prepare_candidate(path, journal)
-            if journal["merged"] is None or journal["state"] not in ("publishing", "finalizing"):
+            published = any(op.get("published") for op in journal["operations"])
+            retained = any(entry.name.startswith("version-") for entry in os.scandir(path.parent))
+            if not published and not retained:
+                self.abandon(journal, "nothing was published")
+                continue
+            if self.git("rev-parse", "HEAD").decode().strip() not in (journal["original"], journal["merged"]):
+                self.abandon(journal, "base left")
                 continue
             self.observer("resuming", journal)
             self.publish_and_finalize(journal)
             self.git("worktree", "remove", "--force", str(path.parent / "merge"), check=False)
+            self.healed.append({"transaction": journal["id"], "action": "resumed",
+                                "operations": len(journal["operations"])})
         return self.status()
 
     def prepare_candidate(self, path, journal):
@@ -406,27 +461,36 @@ class Reconciler:
         if journal["state"] != "merge_conflict":
             self.plan(journal, self.git("rev-parse", "HEAD", root=scratch).decode().strip())
 
-    def abandon_void_preparation(self, path, journal):
-        """Stop gating on a preparation that decided nothing over a stale base.
+    def abandon(self, journal, reason: str):
+        """Stop gating on a transaction the engine can neither finish nor own.
 
-        `preparing` is the state between pinning the two heads and computing the
-        candidate merge: `operations` is empty, no version is retained, and not
-        one byte of the vault has been touched — the only artefacts are the
-        journal and the two pinned refs. When HEAD has moved on since, that
-        merge is void, because it would be computed against a base the vault no
-        longer has; publishing it would overwrite newer notes with older bytes.
+        Abandonment deletes nothing: the journal, every retained version and
+        both pinned heads stay exactly where they are, and the same sweep then
+        re-derives from the vault as it actually is — `git add -A` records
+        whatever was already published, the incoming commit is fetched again,
+        and the merge covers the remainder. Two reasons, each provable from the
+        journal:
 
-        So it is marked `abandoned` and stops gating. Nothing is deleted — the
-        journal, both pinned heads and the directory stay for inspection — and
-        the same sweep then fetches and merges the incoming commit again, from
-        the base the vault actually has. Before this, one such transaction
-        stopped a desktop vault syncing for 43 hours and 510 sweeps, with a
-        single notification at the start of it.
+        `nothing was published` — a transaction that never reached its first
+        publication. `preparing` is that state by construction: it reaches
+        disk at one place, with `operations` empty and no version retained,
+        because `plan` writes the journal only once it is already `publishing`.
+
+        `base left` — HEAD is neither `original` nor `merged`, so the plan was
+        computed against a tree the vault no longer has. Publishing it would
+        put stale bytes over newer notes; refusing it forever was worse. One
+        such transaction stopped a desktop vault syncing for 43 hours and 510
+        sweeps, and `recovery-continue` refused it too: there was no way out
+        of that state at all, which is the failure this whole change exists to
+        remove rather than relocate.
+
+        Only a retained version holding an unacknowledged editor save keeps a
+        transaction out of here, and that is the caller's check.
         """
-        if any(entry.name.startswith("version-") for entry in os.scandir(path.parent)):
-            return
         journal["state"] = "abandoned"
+        journal["abandoned_reason"] = reason
         self.checkpoint("abandoned", journal)
+        self.healed.append({"transaction": journal["id"], "action": "abandoned", "reason": reason})
 
     def _run(self):
         if any((self.git_dir / name).exists() for name in
@@ -469,7 +533,7 @@ class Reconciler:
         remote = self.git("config", "--get", f"branch.{branch}.remote", optional=True).decode().strip()
         ref = self.git("config", "--get", f"branch.{branch}.merge", optional=True).decode().strip()
         if not remote:
-            return {"state": "local_only"}
+            return self.summary({"state": "local_only"})
         if remote == "." or not ref.startswith("refs/heads/"):
             raise ReconcileError("configure a remote branch upstream before syncing", 2)
         self.git("fetch", "--quiet", "--", remote, ref)
@@ -478,7 +542,7 @@ class Reconciler:
             if self.git("status", "--porcelain"):
                 raise ReconcileError("new local edit remains visible; retry before pushing")
             self.git("push", "--quiet", "--", remote, f"HEAD:{ref}")
-            return {"state": "complete"}
+            return self.summary({"state": "complete"})
         transaction = uuid.uuid4().hex
         directory = self.new_directory(transaction)
         scratch = directory / "merge"
@@ -515,8 +579,8 @@ class Reconciler:
             # transaction wrote the entire retained history into the system
             # journal every two minutes (~300 KB a tick by the time this was
             # found). `status` still reports everything, for a human.
-            return {"state": "complete", "published": len(journal["operations"]),
-                    "merged": journal["merged"]}
+            return self.summary({"state": "complete", "published": len(journal["operations"]),
+                                 "merged": journal["merged"]})
         finally:
             # A publication that paused or failed part-way keeps its candidate
             # worktree: `status` points a human at it, and the resume publishes
@@ -707,6 +771,14 @@ class Reconciler:
             path, journal = self.transaction(transaction)
             if journal["state"] in ("complete", "acknowledged"):
                 return self.status()
+            if journal["state"] == "abandoned":
+                # Re-planning it would checkpoint `publishing` against a base
+                # the vault has left, and the publication guard would then
+                # refuse it forever — one wrong command, one permanent jam.
+                raise ReconcileError(
+                    f"transaction abandoned ({journal.get('abandoned_reason', 'unknown')}); "
+                    "its incoming commit is merged again by an ordinary sync, "
+                    "and nothing of it was deleted")
             scratch = path.parent / "merge"
             if journal["merged"] is None and journal["state"] != "merge_conflict":
                 self.prepare_candidate(path, journal)

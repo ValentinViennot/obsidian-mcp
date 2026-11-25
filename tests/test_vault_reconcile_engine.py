@@ -499,6 +499,9 @@ def test_a_setid_parent_never_gets_an_explicit_setid_chmod(tmp_path, monkeypatch
     modes = []
     actual = os.fchmod
     monkeypatch.setattr(os, "fchmod", lambda fd, mode: (modes.append(mode), actual(fd, mode))[1])
+    # Pin the umask the routing sees: under 002 or 000 `mkdir` would land the
+    # mode exactly and this would pass even with the routing removed.
+    monkeypatch.setattr(module, "process_umask", lambda: 0o022)
     fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         module.make_directory(fd, "daily", stat_module.S_IMODE(os.fstat(fd).st_mode))
@@ -512,6 +515,74 @@ def test_a_setid_parent_never_gets_an_explicit_setid_chmod(tmp_path, monkeypatch
     assert created.st_mode & 0o777 == 0o770
     if sys.platform.startswith("linux"):
         assert created.st_mode & stat_module.S_ISGID
+
+
+def test_an_ignored_path_already_holding_the_incoming_bytes_is_not_a_collision(clones, monkeypatch):
+    """`git add -A` cannot stage an ignored path, so an abandoned slice leaves
+    one published but unrecorded. Refusing it as a collision made every sweep
+    abandon and open a fresh transaction — about 720 a day, in storage the
+    design never prunes.
+
+    `Archive.md` sorts before `Keep/`, so it is the operation the first slice
+    publishes; that ordering is what makes the scenario reachable at all.
+    """
+    _, live, peer = clones
+    (live / ".gitignore").write_text("Archive.md\n")
+    git(live, "add", "-A")
+    git(live, "commit", "-qm", "ignore Archive.md")
+    git(live, "push", "-q")
+    git(peer, "pull", "-q")
+    (peer / "Archive.md").write_text("tracked by the remote, ignored here\n")
+    notes = [f"Keep/note-{index}.md" for index in range(3)]
+    (peer / "Keep").mkdir()
+    for path in notes:
+        (peer / path).write_text(f"{path}\n")
+    git(peer, "add", "-A", "-f")
+    git(peer, "commit", "-qm", "import, including an ignored path")
+    git(peer, "push", "-q")
+
+    monkeypatch.setenv("VAULT_RECONCILE_PUBLISH_BUDGET", "0")
+    with pytest.raises(ReconcileError, match="paused at a safe boundary"):
+        Reconciler(live, desktop=True).run()
+    monkeypatch.delenv("VAULT_RECONCILE_PUBLISH_BUDGET")
+    assert (live / "Archive.md").exists(), "the ignored path must be the published slice"
+    # HEAD has to move for the stale transaction to be abandoned, and the
+    # published path cannot do it: it is ignored. Ordinary local work does.
+    (live / "Local.md").write_text("work done while the import was paused\n")
+    git(live, "add", "-A")
+    git(live, "commit", "-qm", "the vault moves on")
+    assert "Archive.md" not in git(live, "ls-files"), "git add -A cannot record it"
+
+    engine = Reconciler(live, desktop=True)
+    engine.run()
+
+    assert not engine.status()["review_required"]
+    assert (live / "Archive.md").read_text() == "tracked by the remote, ignored here\n"
+    for path in notes:
+        assert (live / path).read_text() == f"{path}\n"
+    assert git(live, "status", "--porcelain") == ""
+    # One transaction abandoned, one that converged — not one per sweep.
+    assert len(engine.status()["transactions"]) == 2
+
+
+def test_an_ignored_path_holding_different_bytes_still_refuses(clones):
+    """The collision refusal is narrowed to identical bytes, not removed."""
+    _, live, peer = clones
+    (live / ".gitignore").write_text("secret.md\n")
+    git(live, "add", "-A")
+    git(live, "commit", "-qm", "ignore secret.md")
+    git(live, "push", "-q")
+    git(peer, "pull", "-q")
+    (peer / "secret.md").write_text("the remote's version\n")
+    git(peer, "add", "-A", "-f")
+    git(peer, "commit", "-qm", "add an ignored path")
+    git(peer, "push", "-q")
+    (live / "secret.md").write_text("my own local version\n")
+
+    with pytest.raises(ReconcileError, match="collides with a local file"):
+        Reconciler(live, desktop=True).run()
+
+    assert (live / "secret.md").read_text() == "my own local version\n"
 
 
 def test_publication_creates_directories_without_forking_a_process_per_note(clones, monkeypatch):

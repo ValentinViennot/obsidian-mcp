@@ -391,6 +391,14 @@ a safe boundary" is the same thing said out loud: an import too large for one
 sweep, converging in slices. Neither refreshes the staleness marker, so an
 import that never converges is still reported by `obsidian-vault-staleness`.
 
+Two refusals name a file instead and need no recovery command at all.
+`incoming addition collides with a local save` and `local deletion arrived`
+mean something created or removed that exact path while the transaction was in
+flight — an editor, or an agent, whose note writes stay available while commits
+are gated. Move the named file aside (or put it back) and the next ordinary
+sweep resumes the transaction and converges; nothing was published and nothing
+is lost while it refuses.
+
 Run the manual continuation only for what stays explicit — a merge conflict, or
 a transaction the sweep refuses to finish (an ambiguous operation, a recovered
 editor save) — with editors closed:

@@ -179,6 +179,20 @@ def parent_fd(root: Path, relative: str, *, create: bool = False):
         os.close(fd)
 
 
+def digest_at(fd: int, name: str) -> str:
+    """Hash a live name without following a replacement symlink."""
+    handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    try:
+        if not stat.S_ISREG(os.fstat(handle).st_mode):
+            raise ReconcileError("publication/recovery name is not a regular file")
+        digest = hashlib.sha256()
+        while data := os.read(handle, 1024 * 1024):
+            digest.update(data)
+        return digest.hexdigest()
+    finally:
+        os.close(handle)
+
+
 def retained_digest(path: Path) -> str:
     """Read the latest inode bytes, never follow a replacement symlink."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -601,7 +615,16 @@ class Reconciler:
             with parent_fd(self.root, path, create=new is not None) as (fd, name):
                 incumbent = inode_at(fd, name)
                 if old is None and incumbent is not None:
-                    raise ReconcileError("incoming addition collides with a local file; retained unchanged")
+                    # Bytes already identical to what this merge would publish
+                    # are not a collision: they are a publication the index
+                    # never recorded. That is what an abandoned slice leaves on
+                    # an ignored-but-tracked path, which `git add -A` cannot
+                    # stage — so refusing it made the sweep abandon and start a
+                    # fresh transaction every two minutes, for ever, in storage
+                    # that is never pruned. Different bytes still refuse.
+                    if digest_at(fd, name) != self.blob_digest(new[2], path):
+                        raise ReconcileError("incoming addition collides with a local file; retained unchanged")
+                    continue
                 if old is not None and incumbent is None:
                     raise ReconcileError("local deletion arrived during sync; retained unchanged")
             journal["operations"].append({"path": path, "old_blob": old[2] if old else None,

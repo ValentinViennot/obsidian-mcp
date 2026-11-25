@@ -48,7 +48,15 @@ Abandonment deletes nothing: journal, every retained version and both pinned
 heads stay, and the same sweep re-derives from the vault as it is — `git add -A`
 records whatever was already published, the incoming commit is fetched again and
 the merge covers the remainder, so a half-published import converges instead of
-jamming. The only thing it can lose sight of is an `incoming` the remote no
+jamming. Two costs are accepted rather than fixed. The already-published subset
+lands as that sweep's own commit instead of HEAD advancing to the import's
+merge, so `git blame` names the sweep for those notes rather than whoever pushed
+them — resumption keeps the original authorship, abandonment cannot. And an
+ignored-but-tracked path is published but unrecordable (`git add -A` will not
+stage it), which is why `plan` treats an untracked incumbent whose bytes already
+equal the incoming blob as published rather than as a collision: without that,
+each sweep abandoned and opened another transaction, about 720 a day, for ever.
+Different bytes still refuse. The only thing it can lose sight of is an `incoming` the remote no
 longer has (a force-push, a pruned branch); the commit survives as
 `refs/obsidian-recovery/<id>/incoming`, and every sweep that heals anything
 names the transaction and the reason in its result, so neither is silent. A

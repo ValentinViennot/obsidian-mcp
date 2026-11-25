@@ -162,8 +162,20 @@ The application suite remains Linux-only because its vault containment uses
 
 The desktop sweep shows a generic macOS notification when recovery review is
 required. Note names, saved content and vault paths stay in private status/log
-output. A private digest marker inside `.git` suppresses repeated alerts for the
-same recovery state; changed retained bytes trigger a new alert. Successful sync
+output — both texts are fixed literals. A private digest marker inside `.git`
+suppresses repeated alerts for the same recovery state; changed retained bytes
+trigger a new alert.
+
+**A state that does not change alerts again anyway, once an hour.** The marker's
+own mtime is when the sweep last said anything, and
+`VAULT_RECONCILE_RENOTIFY_MINUTES` (60; `0` restores one alert per state and
+never again) is how long it may stay quiet. The repeat says the vault still has
+not synchronised, and a successful sync clears the marker as before. Suppressing
+by state alone was not enough: a desktop vault stopped syncing on 2026-11-24 at
+03:21, said so once — at twenty past three in the morning — and then nothing for
+43 hours and 510 refused sweeps. The server side has the opposite shape, a
+Telegram alert on every failed run plus a staleness timer, which is why the same
+outage was noticed there in minutes and here not at all. Successful sync
 clears the notification marker, without deleting recovery versions. A busy writer
 lock stays a silent retry. Failed notification delivery leaves the next sweep
 eligible to retry; the original engine exit status is preserved. Notification

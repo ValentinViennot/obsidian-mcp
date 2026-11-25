@@ -15,7 +15,7 @@ import signal
 import stat
 import tempfile
 import subprocess
-import sys
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -70,25 +70,38 @@ def durable_json(path: Path, value: dict) -> None:
 
 
 def make_directory(fd: int, name: str, mode: int):
-    """Use a child umask so shared bits survive without explicit set-ID chmod.
+    """Create a note directory with an exact mode, independent of the umask.
 
-    The engine does not change the caller's process umask; the kernel can
-    inherit a parent directory's setgid bit under RestrictSUIDSGID=yes.
+    The engine still does not change the caller's process umask — it is
+    process-global and this module is imported by the async server — and the
+    kernel can still inherit a parent directory's setgid bit under
+    RestrictSUIDSGID=yes. `mkdir`'s mode argument is the only thing a umask
+    masks, so `fchmod` on the created descriptor restores the shared bits
+    afterwards and the set-ID bits the kernel inherited are preserved.
+
+    **This used to spawn `python3 -c "os.umask(0); os.mkdir(...)"`.** It was
+    correct and it cost an interpreter start per path component, at three call
+    sites per operation. Profiled on the production host, 1,200 of those spawns
+    were 149 s of a 154 s import — 96% of the work — which is how a 896-file
+    Google Keep import ran past TimeoutStartSec=300 and left a half-published
+    transaction. Publication is a per-note loop: nothing in it may fork.
     """
-    code = "import os,sys; os.umask(0); os.mkdir(sys.argv[2], int(sys.argv[3]), dir_fd=int(sys.argv[1]))"
-    result = subprocess.run([sys.executable, "-c", code, str(fd), name, str(mode & 0o777)],
-                            pass_fds=(fd,), capture_output=True, timeout=15)
-    if result.returncode:
-        if inode_directory_exists(fd, name):
-            raise FileExistsError(name)
-        raise ReconcileError("could not create shared note directory; nothing published")
-
-
-def inode_directory_exists(fd, name):
     try:
-        return stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)
-    except FileNotFoundError:
-        return False
+        # Best effort at the exact mode first, so the window below is never
+        # wider than the umask already allows, then make it exact.
+        os.mkdir(name, mode & 0o777, dir_fd=fd)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        raise ReconcileError("could not create shared note directory; nothing published") from exc
+    created = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+    try:
+        inherited = stat.S_IMODE(os.fstat(created).st_mode) & 0o7000
+        os.fchmod(created, (mode & 0o777) | inherited)
+    except OSError as exc:
+        raise ReconcileError("could not create shared note directory; nothing published") from exc
+    finally:
+        os.close(created)
 
 
 @contextmanager
@@ -151,6 +164,15 @@ class Reconciler:
             self.env.update(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email,
                             GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
         self.timeout = float(os.environ.get("VAULT_RECONCILE_NET_TIMEOUT", "120"))
+        # A publication budget, not a network timeout: how long the per-note
+        # loop may keep running before it stops at an operation boundary and
+        # leaves the rest for the next sweep. It must stay comfortably under
+        # the unit's TimeoutStartSec (300 s), because the whole point is for
+        # the engine — which knows where the journal is exact — to decide where
+        # to stop, instead of systemd's SIGTERM deciding for it.
+        self.budget = float(os.environ.get("VAULT_RECONCILE_PUBLISH_BUDGET", "210"))
+        self.deadline = time.monotonic() + self.budget
+        self.paused = None
 
     def git(self, *args, root=None, check=True, optional=False) -> bytes:
         command = self.command(args, root)
@@ -235,6 +257,38 @@ class Reconciler:
         finally:
             os.close(fd)
 
+    @contextmanager
+    def pausable(self):
+        """Turn a termination signal into a pause at the next safe boundary.
+
+        systemd delivers TimeoutStartSec as SIGTERM, and Python's default
+        handler ends the process wherever it happens to be standing. That is
+        exactly how one oversized import left a transaction half published:
+        660 of 896 notes on disk, the journal mid-sequence, and a state only a
+        human with `recovery-continue` could leave. The signal now only sets a
+        flag that the publication loop reads between operations, where every
+        inode identity is already durable.
+
+        Outside the main thread `signal.signal` is unavailable; the time budget
+        still applies, so the loop remains interruptible either way.
+        """
+        self.paused = None
+
+        def requested(number, _frame):
+            self.paused = f"stop requested (signal {number})"
+
+        try:
+            previous = {number: signal.signal(number, requested)
+                        for number in (signal.SIGTERM, signal.SIGINT)}
+        except ValueError:
+            yield
+            return
+        try:
+            yield
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
+
     def journals(self):
         if self.storage.exists():
             for path in sorted(self.storage.glob("*/journal.json")):
@@ -282,12 +336,51 @@ class Reconciler:
         with self.locked():
             return self._run()
 
+    def finish_interrupted_publications(self, state):
+        """Resume the engine's own half-finished publications, unattended.
+
+        A transaction needs a human for exactly two reasons: a merge the engine
+        could not decide, or a retained inode an editor wrote to after
+        publication. A publication that merely stopped mid-sequence — SIGTERM,
+        the budget above, a reboot — is neither: every operation is journaled
+        individually and `operation_state` re-derives from the live inodes
+        whether it actually happened.
+
+        Before this, such a stop made every later sweep fail with "recovery
+        review required" until somebody ran `recovery-continue
+        --editors-quiesced` by hand. One oversized import therefore stopped the
+        vault syncing at all — agent commits included, since
+        `vault_sync.committing` consults the same gate — for as long as nobody
+        was watching; it took two hours the day it happened. What is resumed
+        here is byte for byte what `recovery-continue` does; only the audience
+        changed, and the refusals inside `publish_and_finalize` are unchanged.
+        Anything ambiguous, unmerged, conflicted or holding a recovered editor
+        save is left exactly where it is, for the human path.
+        """
+        for transaction in state["transactions"]:
+            if transaction["state"] not in ("publishing", "finalizing"):
+                continue
+            if any(version["position"] == "ambiguous" or
+                   (version["local_edit_recovered"] and not version["resolved"])
+                   for version in transaction["versions"]):
+                continue
+            path, journal = self.transaction(transaction["id"])
+            if journal["merged"] is None:
+                continue
+            self.observer("resuming", journal)
+            self.publish_and_finalize(journal)
+            self.git("worktree", "remove", "--force", str(path.parent / "merge"), check=False)
+        return self.status()
+
     def _run(self):
-        if self.status()["review_required"]:
-            raise ReconcileError("recovery review required; run status and recovery export before syncing")
         if any((self.git_dir / name).exists() for name in
                ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD")):
             raise ReconcileError("interrupted git operation; recover before retrying")
+        state = self.status()
+        if state["review_required"]:
+            state = self.finish_interrupted_publications(state)
+        if state["review_required"]:
+            raise ReconcileError("recovery review required; run status and recovery export before syncing")
         branch = self.git("symbolic-ref", "--quiet", "--short", "HEAD", optional=True).decode().strip()
         if not branch:
             raise ReconcileError("HEAD is detached; refusing to sync", 2)
@@ -361,9 +454,18 @@ class Reconciler:
                 self.git("push", "--quiet", "--", remote, f"HEAD:{ref}")
             except ReconcileError:
                 raise ReconcileError("push failed; both histories retained locally", 4) from None
-            return self.status()
+            # A summary, not the whole status: this is a sweep's stdout, and
+            # recovery journals are never pruned, so returning every
+            # transaction wrote the entire retained history into the system
+            # journal every two minutes (~300 KB a tick by the time this was
+            # found). `status` still reports everything, for a human.
+            return {"state": "complete", "published": len(journal["operations"]),
+                    "merged": journal["merged"]}
         finally:
-            if journal["state"] != "merge_conflict":
+            # A publication that paused or failed part-way keeps its candidate
+            # worktree: `status` points a human at it, and the resume publishes
+            # from it rather than checking the whole merge out again.
+            if journal["state"] not in ("merge_conflict", "publishing", "finalizing"):
                 self.git("worktree", "remove", "--force", str(scratch), check=False)
 
     def plan(self, journal, merged):
@@ -472,33 +574,43 @@ class Reconciler:
                 "incumbent_inode" not in op and op["new_blob"] for op in journal["operations"]):
             self.git("-c", "core.hooksPath=/dev/null", "worktree", "add", "--quiet", "--detach",
                      str(directory / "merge"), journal["merged"])
-        recovery_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            for op in journal["operations"]:
-                freshly_staged = "incumbent_inode" not in op
-                if freshly_staged:
-                    self.stage(directory, op, recovery_fd)
-                    # Inode identities persist BEFORE the syscall. A success
-                    # followed by fsync failure/death cannot be replayed blindly.
-                    self.checkpoint("before_publication", journal)
-                position = self.operation_state(directory, op)
-                if position == "ambiguous" and not freshly_staged:
-                    raise ReconcileError("publication names changed unexpectedly; no operation replayed; inspect recovery")
-                if position == "not_applied" or freshly_staged:
-                    with parent_fd(self.root, op["path"], create=bool(op["new_blob"])) as (fd, name):
-                        callback = lambda: self.observer("after_syscall", journal)
-                        if op["new_blob"]:
-                            rename(recovery_fd, op["retained"], fd, name,
-                                   exchange=bool(op["old_blob"]), after=callback)
-                        else:
-                            rename(fd, name, recovery_fd, op["retained"], exchange=False, after=callback)
-                elif position != "applied":
-                    raise ReconcileError("publication staging incomplete; inspect recovery")
-                op["displaced_inode"] = inode_at(recovery_fd, op["retained"]) if op["old_blob"] else None
-                op["published"] = True
-                self.checkpoint("after_publication", journal)
-        finally:
-            os.close(recovery_fd)
+        with self.pausable():
+            recovery_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                for op in journal["operations"]:
+                    freshly_staged = "incumbent_inode" not in op
+                    if freshly_staged:
+                        self.stage(directory, op, recovery_fd)
+                        # Inode identities persist BEFORE the syscall. A success
+                        # followed by fsync failure/death cannot be replayed blindly.
+                        self.checkpoint("before_publication", journal)
+                    position = self.operation_state(directory, op)
+                    if position == "ambiguous" and not freshly_staged:
+                        raise ReconcileError("publication names changed unexpectedly; no operation replayed; inspect recovery")
+                    if position == "not_applied" or freshly_staged:
+                        with parent_fd(self.root, op["path"], create=bool(op["new_blob"])) as (fd, name):
+                            callback = lambda: self.observer("after_syscall", journal)
+                            if op["new_blob"]:
+                                rename(recovery_fd, op["retained"], fd, name,
+                                       exchange=bool(op["old_blob"]), after=callback)
+                            else:
+                                rename(fd, name, recovery_fd, op["retained"], exchange=False, after=callback)
+                    elif position != "applied":
+                        raise ReconcileError("publication staging incomplete; inspect recovery")
+                    op["displaced_inode"] = inode_at(recovery_fd, op["retained"]) if op["old_blob"] else None
+                    op["published"] = True
+                    self.checkpoint("after_publication", journal)
+                    remaining = sum(1 for item in journal["operations"] if not item["published"])
+                    if remaining and (self.paused or time.monotonic() > self.deadline):
+                        # 76, its own code: nothing is wrong and nothing is
+                        # lost, but nothing is finished either. Like the busy
+                        # exit it leaves the staleness marker alone, so an
+                        # import that never converges is still noticed.
+                        raise ReconcileError(
+                            f"publication paused at a safe boundary; {remaining} operation(s) left "
+                            f"({self.paused or 'publication budget reached'}); the next sweep continues", 76)
+            finally:
+                os.close(recovery_fd)
         journal["state"] = "finalizing"
         self.checkpoint("before_head", journal)
         if journal.get("branch_ref") and self.git("symbolic-ref", "HEAD").decode().strip() != journal["branch_ref"]:
@@ -523,6 +635,11 @@ class Reconciler:
     def continue_recovery(self, transaction, *, editors_quiesced=False):
         if not editors_quiesced:
             raise ReconcileError("close editors and pause independent Git writers, then pass --editors-quiesced")
+        # No publication budget here. The budget exists to stop a *sweep* before
+        # its unit does; an operator who ran this command directly chose to wait,
+        # and pausing on them would be the sweep's problem imposed on a human.
+        # SIGINT/SIGTERM still pause at a boundary, which is what Ctrl-C should do.
+        self.deadline = float("inf")
         with self.locked():
             path, journal = self.transaction(transaction)
             if journal["state"] in ("complete", "acknowledged"):

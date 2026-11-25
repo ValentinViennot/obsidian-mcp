@@ -177,15 +177,177 @@ Reconciler(Path(root), desktop=True, observer=stop).run()
     state = engine.status()
     assert state["review_required"]
     tx = state["transactions"][0]["id"]
-    with pytest.raises(ReconcileError, match="recovery review"):
+    if boundary == "prepared":
+        # No merge was decided yet, so finishing it is a judgement call and
+        # stays a human one.
+        with pytest.raises(ReconcileError, match="recovery review"):
+            engine.run()
+        engine.continue_recovery(tx, editors_quiesced=True)
+    else:
+        # The merge is decided and every operation is journaled: the next
+        # sweep finishes the engine's own work with nobody watching.
         engine.run()
-    engine.continue_recovery(tx, editors_quiesced=True)
+        assert not engine.status()["review_required"]
     assert (live / "Note.md").read_text() == "incoming\n"
     assert git(live, "show", "HEAD:Note.md") == "incoming"
     assert git(live, "diff", "--cached", "--name-only") == ""
     retained = versions(engine)[0]
     assert Path(retained["location"]).stat().st_ino == original_inode
     assert Path(retained["location"]).read_text() == "baseline\n"
+
+
+def test_an_interrupted_publication_with_a_recovered_save_still_waits_for_a_human(clones):
+    """Automatic resumption stops exactly where the old manual gate mattered."""
+    import signal
+    import sys
+    _, live, peer = clones
+    incoming(peer)
+    descriptor = os.open(live / "Note.md", os.O_RDWR)
+    code = """
+import os, signal, sys
+from pathlib import Path
+from src.services.vault_reconcile import Reconciler
+root = sys.argv[1]
+def stop(label, journal):
+    if label == "after_syscall":
+        os.kill(os.getpid(), signal.SIGKILL)
+Reconciler(Path(root), desktop=True, observer=stop).run()
+"""
+    from src.services import vault_reconcile as module
+    source_root = Path(module.__file__).resolve().parents[2]
+    try:
+        result = subprocess.run([sys.executable, "-c", code, str(live)],
+                                capture_output=True, cwd=source_root,
+                                env={**os.environ, "PYTHONPATH": str(source_root)})
+        assert result.returncode == -signal.SIGKILL
+        # The publication exchanged the names, so this descriptor now addresses
+        # the retained inode. An editor saving through it after the crash is the
+        # one thing no sweep may decide on its own.
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, b"editor save after the crash\n")
+        os.fsync(descriptor)
+        engine = Reconciler(live, desktop=True)
+        assert any(version["local_edit_recovered"] for version in versions(engine))
+        with pytest.raises(ReconcileError, match="recovery review"):
+            engine.run()
+        assert any(Path(version["location"]).read_text() == "editor save after the crash\n"
+                   for version in versions(engine))
+    finally:
+        os.close(descriptor)
+
+
+def test_an_interrupted_publication_never_clobbers_an_editor_addition(clones):
+    import signal
+    import sys
+    _, live, peer = clones
+    incoming(peer, "Added.md")
+    code = """
+import os, signal, sys
+from pathlib import Path
+from src.services.vault_reconcile import Reconciler
+root = sys.argv[1]
+def stop(label, journal):
+    if label == "planned":
+        os.kill(os.getpid(), signal.SIGKILL)
+Reconciler(Path(root), desktop=True, observer=stop).run()
+"""
+    from src.services import vault_reconcile as module
+    source_root = Path(module.__file__).resolve().parents[2]
+    result = subprocess.run([sys.executable, "-c", code, str(live)],
+                            capture_output=True, cwd=source_root,
+                            env={**os.environ, "PYTHONPATH": str(source_root)})
+    assert result.returncode == -signal.SIGKILL
+    (live / "Added.md").write_text("editor wrote this first\n")
+    with pytest.raises((ReconcileError, FileExistsError)):
+        Reconciler(live, desktop=True).run()
+    assert (live / "Added.md").read_text() == "editor wrote this first\n"
+    assert Reconciler(live).status()["review_required"]
+
+
+def test_a_publication_too_large_for_one_sweep_pauses_and_the_next_one_finishes(clones, monkeypatch):
+    """What systemd's SIGTERM used to do mid-note, the engine now does between them."""
+    _, live, peer = clones
+    (peer / "Keep").mkdir()
+    for index in range(6):
+        (peer / "Keep" / f"note-{index}.md").write_text(f"note {index}\n")
+    git(peer, "add", "-A")
+    git(peer, "commit", "-qm", "import keep")
+    git(peer, "push", "-q")
+    before = git(live, "rev-parse", "HEAD")
+    monkeypatch.setenv("VAULT_RECONCILE_PUBLISH_BUDGET", "0")
+    with pytest.raises(ReconcileError, match="paused at a safe boundary") as paused:
+        Reconciler(live, desktop=True).run()
+    assert paused.value.code == 76
+    published = sum((live / "Keep" / f"note-{index}.md").exists() for index in range(6))
+    assert 0 < published < 6
+    # Published notes are visible; history only moves once all of them are.
+    assert git(live, "rev-parse", "HEAD") == before
+    monkeypatch.delenv("VAULT_RECONCILE_PUBLISH_BUDGET")
+    engine = Reconciler(live, desktop=True)
+    engine.run()
+    assert not engine.status()["review_required"]
+    for index in range(6):
+        assert (live / "Keep" / f"note-{index}.md").read_text() == f"note {index}\n"
+    assert git(live, "status", "--porcelain") == ""
+
+
+def test_a_manual_continuation_is_not_cut_short_by_the_sweep_budget(clones, monkeypatch):
+    """The budget stops a sweep before its unit does; a human chose to wait."""
+    _, live, peer = clones
+    (peer / "Keep").mkdir()
+    for index in range(6):
+        (peer / "Keep" / f"note-{index}.md").write_text(f"note {index}\n")
+    git(peer, "add", "-A")
+    git(peer, "commit", "-qm", "import keep")
+    git(peer, "push", "-q")
+    monkeypatch.setenv("VAULT_RECONCILE_PUBLISH_BUDGET", "0")
+    engine = Reconciler(live, desktop=True)
+    with pytest.raises(ReconcileError, match="paused at a safe boundary"):
+        engine.run()
+    pending = [transaction["id"] for transaction in engine.status()["transactions"]
+               if transaction["state"] == "publishing"]
+    Reconciler(live, desktop=True).continue_recovery(pending[0], editors_quiesced=True)
+    for index in range(6):
+        assert (live / "Keep" / f"note-{index}.md").read_text() == f"note {index}\n"
+    assert not Reconciler(live, desktop=True).status()["review_required"]
+
+
+def test_publication_creates_directories_without_forking_a_process_per_note(clones, monkeypatch):
+    """The import that broke the sweep spent 96% of 154 s starting interpreters.
+
+    `make_directory` used to run `python3 -c "os.umask(0); os.mkdir(...)"` once
+    per path component, at three call sites per operation. Git is the only
+    program a publication may start.
+    """
+    import src.services.vault_reconcile as module
+    _, live, peer = clones
+    (peer / "Keep").mkdir()
+    for index in range(12):
+        (peer / "Keep" / f"note-{index}.md").write_text(f"note {index}\n")
+    git(peer, "add", "-A")
+    git(peer, "commit", "-qm", "import keep")
+    git(peer, "push", "-q")
+    spawned = []
+    actual = module.subprocess.Popen
+
+    def recording(command, *args, **kwargs):
+        spawned.append(command[0])
+        return actual(command, *args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "Popen", recording)
+    Reconciler(live, desktop=True).run()
+    assert (live / "Keep/note-7.md").read_text() == "note 7\n"
+    assert set(spawned) == {"git"}
+
+
+def test_a_sweeps_result_is_a_summary_not_the_retained_history(clones):
+    """Recovery journals are never pruned; a sweep's stdout must not grow with them."""
+    _, live, peer = clones
+    incoming(peer)
+    result = Reconciler(live, desktop=True).run()
+    assert result["state"] == "complete"
+    assert result["published"] == 1
+    assert "transactions" not in result
 
 
 def test_failure_after_native_exchange_retains_ambiguous_checkpoint(clones):

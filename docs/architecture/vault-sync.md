@@ -27,9 +27,31 @@ identity, never by an unchanged hash or a `published` flag. Ambiguous names are
 not blindly replayed. Explicit recovery requires editors and other Git writers
 to be quiesced. HEAD/index finalization changes metadata only.
 
+A publication that merely stopped part-way is resumed by the next sweep without
+a human. The condition is narrow and checked per transaction: a decided merge
+(`merged` set), state `publishing` or `finalizing`, no ambiguous operation, and
+no retained version holding an unacknowledged editor save. The work is what
+`recovery-continue` performs, through the same `publish_and_finalize` and the
+same refusals; only the audience differs. A merge conflict, an interrupted
+preparation and a recovered local edit remain explicit, quiesced operations.
+This exists because the opposite was worse: one 896-file import whose
+publication was killed by `TimeoutStartSec` stopped every later sweep — and,
+through the same gate in `vault_sync.committing`, every agent commit — for two
+hours, until somebody ran `recovery-continue --editors-quiesced` by hand.
+
+Publication is bounded by its own budget (`VAULT_RECONCILE_PUBLISH_BUDGET`,
+210 s) rather than by the unit's `TimeoutStartSec` (300 s), and `SIGTERM`/
+`SIGINT` set a flag instead of ending the process. Both stop the loop between
+two operations, where the journal is exact, and exit 76: not a failure, no
+staleness marker, resumed by the next sweep. The candidate worktree is kept for
+an unfinished publication, so a resume publishes from it instead of checking the
+merge out again. An import larger than one sweep therefore converges in slices
+with nobody watching, instead of being killed mid-note.
+
 Latest displaced bytes are compared on status, subsequent sweeps and every MCP
-commit. A recovered local edit or incomplete transaction pauses automatic Git
-commits and pushes. Note writes remain available, without rolling back their
+commit. A recovered local edit, a merge conflict or an interrupted preparation
+pauses automatic Git commits and pushes; an interrupted publication is resumed
+instead, as above. Note writes remain available, without rolling back their
 published bytes. Explicit resolution can keep the live version or republish a
 recovered version; republishing journals and retains the incumbent again. A
 later descriptor save changing an acknowledged hash reopens review. Recovery
@@ -38,8 +60,15 @@ No automatic deletion/pruning of recovery files or references is provided.
 
 Replacing a file preserves its POSIX owner, group and restrictive/shared mode;
 only Git's executable bit changes deliberately. New files/directories inherit
-parent permissions and group, with group write preserved across umask through a short child-process mkdir.
-Only that child changes its umask. File set-ID bits are never copied; directory
+parent permissions and group. Group write is preserved across the umask by
+`fchmod` on the created directory's own descriptor — the umask masks `mkdir`'s
+mode argument and nothing else — so the engine never changes the process umask
+and never forks. It used to fork: a `python3 -c "os.umask(0); os.mkdir(...)"`
+per path component, at three call sites per operation, which profiled on the
+production host as 149 s of a 154 s 400-note import (96%) and is how an import
+outran its unit timeout. Publication is a per-note loop; nothing in it may start
+a process other than Git, and `test_publication_creates_directories_without_forking_a_process_per_note`
+asserts that. File set-ID bits are never copied; directory
 setgid inheritance comes from the kernel, without an explicit set-ID chmod. A root
 sweep inherits the service owner's UID for additions; prefer running the whole
 sweep as the service owner. Unavailable ownership/permission changes stop before
@@ -64,7 +93,11 @@ The supported guarantee is filesystem-published local edits remaining visible
 or durably recoverable. It excludes unsaved application buffers, editor-caused
 destructive overwrites, disk failure, and independent destructive Git commands.
 Publication across multiple notes is not atomic; the journal makes interruption
-recoverable. Native primitives must work on the actual mounted filesystem; an
+recoverable. Each operation rewrites the whole journal twice, so a single
+transaction's checkpointing is quadratic in its own size: tolerable at the
+thousands of notes an import realistically carries (≈ 9 ms per note measured),
+and the reason the budget and the automatic resume above exist rather than a
+larger timeout. Native primitives must work on the actual mounted filesystem; an
 unsupported mount leaves local bytes intact and raises recovery review.
 Recovery storage grows until an operator performs a separately planned backup
 and maintenance operation with editors closed. It is private, outside the

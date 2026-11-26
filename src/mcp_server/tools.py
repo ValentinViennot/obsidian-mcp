@@ -2458,6 +2458,88 @@ def _read_note_refusal(message: str) -> ReadNoteResult:
     return ReadNoteResult(error=message)
 
 
+def _missing_note(path: str) -> str:
+    return f"Note not found: {path}. Search the vault and use the exact path from the results."
+
+
+async def _resolve_note_reference(path: str, uid: int | None) -> str | BodyOutcome:
+    """Prefer the requested entry, then its .md sibling, then an exact indexed name."""
+    from sqlalchemy import or_, select
+    from src.models.db import NoteMetadata
+
+    reference = PurePosixPath(path)
+    # Explicit paths, including malformed ones, retain the native tool's
+    # validation and error precedence. Never reinterpret a traversal as a title.
+    if (
+        not path or path.endswith((".md", "/")) or reference.is_absolute()
+        or ".." in reference.parts or is_hidden_path(path)
+        or len(path) + 3 > MAX_PATH_CHARS or not is_encodable(path)
+    ):
+        return path
+    try:
+        validate_visible_path(path, user_id=uid)
+        root = _vault_root(uid)
+        # lexists includes dangling links: a named entry must keep its native
+        # semantics, particularly open_mutable's refusal to write through one.
+        if os.path.lexists(root / path):
+            return path
+        suffixed = path + ".md"
+        if os.path.lexists(root / suffixed):
+            validate_visible_path(suffixed, user_id=uid)
+            return suffixed
+    except ValueError as exc:
+        return _body_refusal(str(exc), "validation_failed")
+    except OSError:
+        return _body_refusal("The vault could not read that reference. Try its exact path.", "io_failure")
+    if "/" in path or path == ".":
+        return path
+
+    max_choices = 5
+    # The native owner predicate includes the shared vault's NULL owner.
+    # The basename comparator escapes SQL wildcard characters in note names.
+    query = (
+        select(NoteMetadata.file_path)
+        .where(
+            _note_owner_predicate(uid), NoteMetadata.file_path.endswith(".md"),
+            or_(NoteMetadata.title == path,
+                NoteMetadata.file_path.endswith("/" + suffixed, autoescape=True)),
+        )
+        .order_by(NoteMetadata.file_path)
+        .limit(max_choices + 1)
+    )
+    async with async_session() as session:
+        matches = (await session.scalars(query)).all()
+    choices = []
+    for candidate in matches:
+        parts = PurePosixPath(candidate)
+        if parts.is_absolute() or ".." in parts.parts or is_hidden_path(candidate):
+            continue
+        try:
+            target = validate_visible_path(candidate, user_id=uid)
+            if not target.is_file():
+                continue
+            # An index entry may outlive an edit. A stale title must not send a
+            # write to a different note. Basename matches need no content read.
+            if parts.name != suffixed and (
+                target.stat().st_size > MAX_NOTE_BYTES or read_file(candidate, user_id=uid)["title"] != path
+            ):
+                continue
+        except (FileNotFoundError, ValueError):
+            continue
+        choices.append(candidate)
+    capped = len(matches) > max_choices
+    if len(choices) == 1 and not capped:
+        return choices[0]
+    if capped and len(choices) < 2:
+        return _body_refusal("The note index is changing. Search again or use an exact path.", "index_not_ready")
+    if len(choices) > 1:
+        return BodyOutcome(
+            "More than one indexed note may match. Use an exact vault-relative path from search.",
+            refusals.Refusal(code="note_ambiguous", candidate_paths=tuple(choices[:max_choices])),
+        )
+    return path
+
+
 @_tracked(
     "read_note",
     ["path", "section", "offset", "limit", "include_relationships", "relationship_limit"],
@@ -2539,15 +2621,37 @@ async def read_note_impl(
         # exactly.
         if len(path) <= MAX_PATH_CHARS and is_encodable(path):
             result.path = path
+        if outcome.refusal.candidate_paths is not None:
+            from src.mcp_server.relationships import response_size
+
+            # A path is an opaque choice: drop complete entries rather than
+            # truncate one into a different path. Account for both MCP renderings.
+            choices = outcome.refusal.candidate_paths
+            while response_size(result) > metadata_budget:
+                if result.path is not None:
+                    result.path = None
+                elif choices:
+                    choices = choices[:-1]
+                    outcome = BodyOutcome(outcome.prose, refusals.Refusal(
+                        code="note_ambiguous", candidate_paths=choices,
+                    ))
+                    result.error = str(outcome)
+                    result._body_outcome = outcome
+                else:
+                    break
         return result
 
     # Error precedence, in this order and no other: path resolution first, then
     # parameter validation, then section resolution. Exactly one error comes
     # back, and no content-bearing field rides with it.
+    resolved = await _resolve_note_reference(path, uid)
+    if isinstance(resolved, BodyOutcome):
+        return _fail(resolved)
+    path = resolved
     try:
         note = read_file(path, user_id=uid, **({"include_index_hash": True} if include_relationships else {}))
     except FileNotFoundError:
-        return _fail(_body_refusal(f"Note not found: {path}", "not_found"))
+        return _fail(_body_refusal(_missing_note(path), "not_found"))
     except ValueError as e:
         return _fail(_body_refusal(str(e), "validation_failed"))
 
@@ -4837,13 +4941,17 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
 
     uid = current_user_id.get()
     limit = max(1, min(limit, 500))
+    resolved = await _resolve_note_reference(path, uid)
+    if isinstance(resolved, BodyOutcome):
+        return resolved
+    path = resolved
     async with async_session() as session:
         target_stmt = select(NoteMetadata).where(
             NoteMetadata.file_path == path, _note_owner_predicate(uid)
         )
         target = (await session.execute(target_stmt)).scalar_one_or_none()
         if target is None:
-            return _body_refusal(f"Note not found: {path}", "not_found")
+            return _body_refusal(_missing_note(path), "not_found")
 
         SourceMeta = NoteMetadata
         # The owner predicate rides the JOIN: a link row whose *source* is
@@ -4910,13 +5018,17 @@ async def get_links_impl(path: str, limit: int = 100) -> str:
 
     uid = current_user_id.get()
     limit = max(1, min(limit, 500))
+    resolved = await _resolve_note_reference(path, uid)
+    if isinstance(resolved, BodyOutcome):
+        return resolved
+    path = resolved
     async with async_session() as session:
         src_stmt = select(NoteMetadata).where(
             NoteMetadata.file_path == path, _note_owner_predicate(uid)
         )
         source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
-            return _body_refusal(f"Note not found: {path}", "not_found")
+            return _body_refusal(_missing_note(path), "not_found")
 
         TargetMeta = aliased(NoteMetadata)
         # The owner predicate is part of the outer join's ON clause, not a
@@ -5065,13 +5177,17 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
     depth = max(1, min(depth, 5))
     limit = max(1, min(limit, 200))
 
+    resolved = await _resolve_note_reference(path, uid)
+    if isinstance(resolved, BodyOutcome):
+        return resolved
+    path = resolved
     async with async_session() as session:
         src_stmt = select(NoteMetadata).where(
             NoteMetadata.file_path == path, _note_owner_predicate(uid)
         )
         source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
-            return _body_refusal(f"Note not found: {path}", "not_found")
+            return _body_refusal(_missing_note(path), "not_found")
 
         # BFS state.
         seen: dict[int, dict] = {source.id: {"distance": 0, "via": None}}
@@ -5665,6 +5781,10 @@ async def edit_note_impl(
     uid = current_user_id.get()
     from src.services.vault import parse_frontmatter_diagnose, replace_section
 
+    resolved = await _resolve_note_reference(path, uid)
+    if isinstance(resolved, BodyOutcome):
+        return resolved
+    path = resolved
     try:
         # Resolved and *opened* before the read, so every mode — `dry_run`
         # included — refuses an alias rather than diffing (and then reporting
@@ -5679,7 +5799,7 @@ async def edit_note_impl(
         if err := _leaf_state_error(
             target,
             path,
-            missing=f"Note not found: {path}. Use create_note to create it.",
+            missing=_missing_note(path) + " Use create_note to create it.",
         ):
             return err
 

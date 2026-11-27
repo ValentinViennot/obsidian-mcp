@@ -141,17 +141,35 @@ _pending: ContextVar[list[tuple[str, str]] | None] = ContextVar(
 )
 
 
+#: Human-readable notes a tool body attaches to this call's commit (today: the
+#: `path_normalized` line when a destination name was made portable), so the
+#: history says what the caller was told. Same lifecycle as `_pending`.
+_notes: ContextVar[list[str] | None] = ContextVar("_git_vault_notes", default=None)
+
+
 def begin():
     """Open a fresh accumulator for one tool call. Returns the reset token."""
+    _notes.set([])
     return _pending.set([])
 
 
 def clear(token) -> None:
     """Close the accumulator `begin()` opened. Never raises."""
+    _notes.set(None)
     try:
         _pending.reset(token)
     except ValueError:  # pragma: no cover - a token from another context
         _pending.set(None)
+
+
+def record_note(text: str) -> None:
+    """Attach one line to this call's commit message. Never raises."""
+    try:
+        notes = _notes.get()
+        if notes is not None:
+            notes.append(str(text))
+    except Exception:  # noqa: BLE001 - bookkeeping may not fail a write
+        pass
 
 
 def record_write(vault_root, rel_path) -> None:
@@ -269,7 +287,9 @@ _TOOL_VERBS = {
 }
 
 
-def build_message(tool: str, rel_paths, principal: str | None) -> str:
+def build_message(
+    tool: str, rel_paths, principal: str | None, notes=()
+) -> str:
     """The commit message for one tool call.
 
     ```
@@ -319,6 +339,12 @@ def build_message(tool: str, rel_paths, principal: str | None) -> str:
         lines.extend(f"  {_sanitise(p, 200)}" for p in shown)
         if len(rel_paths) > len(shown):
             lines.append(f"  … and {len(rel_paths) - len(shown)} more")
+        lines.append("")
+    # Notes the tool attached (e.g. a destination name made portable). One
+    # sanitised line each, in the body, so they can never open a trailer.
+    note_lines = [_sanitise(n, 400) for n in notes if n]
+    if note_lines:
+        lines.extend(note_lines)
         lines.append("")
     # The trailer block, last and separated by a blank line — that is what makes
     # these trailers rather than body text `git interpret-trailers` ignores.
@@ -722,7 +748,10 @@ async def commit_recorded(tool: str, principal: str | None, author: ConnectionAu
         if author is None:
             from src.auth.session import current_connection_author
             author = current_connection_author.get()
-        return await commit_published(root, rel_paths, tool, author, principal)
+        return await commit_published(
+            root, rel_paths, tool, author, principal,
+            notes=tuple(_notes.get() or ()),
+        )
     except Exception as exc:  # noqa: BLE001 - rule 1: never fail a write
         logger.warning(
             "Vault commit for %s failed unexpectedly (%s); the write stands "
@@ -735,7 +764,7 @@ async def commit_recorded(tool: str, principal: str | None, author: ConnectionAu
 
 
 async def commit_published(root, rel_paths, tool: str, author: ConnectionAuthor | None,
-                           principal: str | None = None) -> bool:
+                           principal: str | None = None, notes=()) -> bool:
     """Commit a completed publication with its captured author; never fail bytes.
 
     Callers hold the vault publication lock. Upload redemption passes the
@@ -748,7 +777,7 @@ async def commit_published(root, rel_paths, tool: str, author: ConnectionAuthor 
             logger.warning("Vault commit for %s failed unexpectedly (missing connection author); bytes remain published.",
                            tool, extra={"reason": "missing_connection_author", "tool": tool})
             return False
-        message = build_message(tool, rel_paths, principal or author.name)
+        message = build_message(tool, rel_paths, principal or author.name, notes)
         async with _commit_lock:
             return await asyncio.to_thread(commit_paths, rel_paths, message,
                                            author.name, author.email, root)

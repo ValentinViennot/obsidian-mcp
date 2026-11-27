@@ -321,10 +321,9 @@ async def read_note(
     include_relationships: bool = False,
     relationship_limit: int = 10,
 ) -> ReadNoteResult:
-    """Read a note by its vault-relative path.
+    """Read a note.
 
-    Arguments: `path`, `section`, `offset` / `limit`, `include_relationships` and `relationship_limit`. Returns a
-    **structured result**, not a rendered document — read the fields:
+    Arguments: `path`, `section`, `offset` / `limit`, `include_relationships` and `relationship_limit`. Returns these structured fields:
 
     - `content` — the selected note text. Whole-note reads: the body with a valid YAML frontmatter block
       stripped, which is byte-exact input for `edit_note(path, content)` full replacement only when the read is
@@ -355,7 +354,7 @@ async def read_note(
     as LF. `read_file` on the same path is the byte-exact route to the file itself.
 
     Args:
-        path: Exact vault path, the path without .md, or an unambiguous exact indexed title or basename. The result names the resolved path.
+        path: Vault path, with or without .md, or a unique exact title or filename stem.
         section: Optional ATX heading to read instead of the whole note. Plain text ("Balance Sheet"), a
             path-style chain ("Parent/Child") when the heading appears under different parents, or a "#N"
             ordinal ("#7", 1-based document order) — the only form that can address duplicate headings
@@ -632,10 +631,7 @@ async def edit_note(
     replace_frontmatter: bool = False,
     expected_hash: str | None = None,
 ) -> str:
-    """Edit an existing note in the Obsidian vault. Requires write permission (a `readwrite` API key or OAuth scope).
-
-    Use the exact vault path, omit .md or supply a unique exact indexed title or basename.
-    If a name is ambiguous, choose a returned candidate path before editing.
+    """Edit using a `readwrite` key or OAuth scope. Use a path, omit .md, or use a unique exact title or stem.
 
     Arguments: `path`, `content`, at most one mode flag — `append`, `find` or `section` (`operation` is a
     legacy alias) — plus `replace_all`, `dry_run`, `replace_frontmatter`, and the `expected_hash`

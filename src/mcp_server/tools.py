@@ -8170,6 +8170,13 @@ async def write_file_impl(
     # creates at the safe path before this write is never replaced.
     renamed = notice is not None
     if renamed:
+        if expected_hash is not None:
+            # The safe path was confirmed absent, so a replacement guarded by a
+            # hash has no incumbent — the same refusal as the exact-name call.
+            if err := _precondition_error(
+                "write_file", path, None, expected_hash, no_incumbent=True,
+            ):
+                return err
         overwrite = False
     # Validate before decoding and before the size check, for the same reason
     # as `create_note_impl`: a symlinked destination is a path problem, and

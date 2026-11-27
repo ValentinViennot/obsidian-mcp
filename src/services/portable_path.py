@@ -255,8 +255,8 @@ def normalize_destination(
                 raise PortablePathRefusal(
                     PATH_CASE_COLLISION if case_only else UNPORTABLE_PATH,
                     explained(
-                        (f"{where}{comp!s} would become {where}{safe} on Android/Windows, "
-                         if safe != comp else f"{where}{comp!s} is new, ")
+                        (f"{json.dumps(where + comp, ensure_ascii=False)} would become {where}{safe} on Android/Windows, "
+                         if safe != comp else f"{json.dumps(where + comp, ensure_ascii=False)} is new, ")
                         + f"but a {kind} {where}{twin} already exists there and a "
                         "case-insensitive filesystem cannot hold both. Nothing was "
                         "written; use the existing path (edit_note to change it) or "
@@ -283,12 +283,12 @@ def normalize_destination(
         # named. Refused whatever `overwrite` says.
         if safe_path == ignore:
             message = (
-                f"{raw} normalizes to {safe_path}, which is the source of this "
+                f"{json.dumps(raw, ensure_ascii=False)} normalizes to {safe_path}, which is the source of this "
                 "move: it would not move anywhere. Nothing was written."
             )
         else:
             message = (
-                f"{raw} would land on {safe_path} on Android/Windows, but that "
+                f"{json.dumps(raw, ensure_ascii=False)} would land on {safe_path} on Android/Windows, but that "
                 "file already exists and you did not name it. Nothing was "
                 "written (overwrite does not apply to a path you did not name); "
                 "name the existing path explicitly to replace it, or choose a different name."

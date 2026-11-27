@@ -127,7 +127,7 @@ BODY_CODES = frozenset({
     "connection_name_required", "permission_denied", "related_source_not_found", "related_source_not_embedded",
     "vault_assignment_changed", "vault_anchor_lost_at_publish",
     "vault_confirmation_unavailable", "invalid_argument", "validation_failed",
-    "invalid_path", "unsafe_path", "not_found", "already_exists",
+    "invalid_path", "unsafe_path", "not_found", "already_exists", "note_ambiguous",
     "read_window_unavailable", "selector_unresolved", "match_not_found",
     "match_ambiguous", "content_unsafe", "size_limit", "resource_limit",
     "unsupported_filesystem", "io_failure", "index_not_ready",
@@ -229,6 +229,7 @@ class Refusal:
     #: call's own `usage_logs` row is written regardless — that row is the
     #: audit trail, not a mutation.
     nothing_written: bool | None = None
+    candidate_paths: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.code not in CODES:
@@ -286,6 +287,8 @@ class Refusal:
             value = getattr(self, name)
             if value is not None:
                 payload[name] = value
+        if self.candidate_paths is not None:
+            payload["candidate_paths"] = list(self.candidate_paths)
         if self.retry_after_seconds is not None:
             payload["retry_after_seconds"] = self.retry_after_seconds
         return payload

@@ -321,10 +321,9 @@ async def read_note(
     include_relationships: bool = False,
     relationship_limit: int = 10,
 ) -> ReadNoteResult:
-    """Read a note by its vault-relative path.
+    """Read a note.
 
-    Arguments: `path`, `section`, `offset` / `limit`, `include_relationships` and `relationship_limit`. Returns a
-    **structured result**, not a rendered document — read the fields:
+    Arguments: `path`, `section`, `offset` / `limit`, `include_relationships` and `relationship_limit`. Returns these structured fields:
 
     - `content` — the selected note text. Whole-note reads: the body with a valid YAML frontmatter block
       stripped, which is byte-exact input for `edit_note(path, content)` full replacement only when the read is
@@ -355,7 +354,7 @@ async def read_note(
     as LF. `read_file` on the same path is the byte-exact route to the file itself.
 
     Args:
-        path: Vault-relative path to the note (e.g. "Cards/My Note.md")
+        path: Vault path, with or without .md, or a unique exact title or filename stem.
         section: Optional ATX heading to read instead of the whole note. Plain text ("Balance Sheet"), a
             path-style chain ("Parent/Child") when the heading appears under different parents, or a "#N"
             ordinal ("#7", 1-based document order) — the only form that can address duplicate headings
@@ -632,7 +631,7 @@ async def edit_note(
     replace_frontmatter: bool = False,
     expected_hash: str | None = None,
 ) -> str:
-    """Edit an existing note in the Obsidian vault. Requires write permission (a `readwrite` API key or OAuth scope).
+    """Edit using a `readwrite` key or OAuth scope. Use a path, omit .md, or use a unique exact title or stem.
 
     Arguments: `path`, `content`, at most one mode flag — `append`, `find` or `section` (`operation` is a
     legacy alias) — plus `replace_all`, `dry_run`, `replace_frontmatter`, and the `expected_hash`
@@ -727,7 +726,7 @@ async def get_backlinks(path: str, limit: int = 50) -> str:
     Resolved links only (dangling references are not counted as backlinks).
 
     Args:
-        path: Vault-relative path to the target note (e.g. "Cards/Foo.md").
+        path: Exact vault path, the path without .md, or an unambiguous exact indexed title or basename.
         limit: Maximum results (default 50, hard cap 500).
     """
     return await get_backlinks_impl(path, limit=limit)
@@ -754,7 +753,7 @@ async def get_links(path: str, limit: int = 100) -> str:
     Each row's link text is clipped to 120 characters.
 
     Args:
-        path: Vault-relative path to the source note.
+        path: Exact vault path, the path without .md, or an unambiguous exact indexed title or basename.
         limit: Maximum links returned (default 100, hard cap 500).
     """
     return await get_links_impl(path, limit=limit)
@@ -771,7 +770,7 @@ async def get_neighborhood(path: str, depth: int = 1, limit: int = 50) -> str:
     `find_related` when the connection is conceptual rather than linked.
 
     Args:
-        path: Vault-relative path to the seed note.
+        path: Exact vault path, the path without .md, or an unambiguous exact indexed title or basename.
         depth: Maximum BFS depth (default 1, capped at 5).
         limit: Maximum distinct neighbor notes (default 50, hard cap 200).
     """

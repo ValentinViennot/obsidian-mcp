@@ -1,5 +1,24 @@
 # Vault tools: writes, reads, section addressing, size caps
 
+## Referring to an existing note
+
+`read_note`, `edit_note`, `get_links`, `get_backlinks` and `get_neighborhood`
+share the same order of precedence. An existing vault-relative path wins. If
+the caller omits `.md`, the server tries the same path with that extension.
+For a bare name it then looks for an exact, case-sensitive Markdown filename
+stem or indexed title in the caller's vault. A successful response uses the
+resolved path, so the next call can refer to the same note directly.
+
+If several notes match, `note_ambiguous` includes up to five visible
+`candidate_paths` in its final JSON line. Choose one of those paths or search
+for a more specific name. An absent note returns `not_found` with search
+guidance. An index that has too many outdated matches can return
+`index_not_ready`; the caller can still use a full path immediately.
+
+`edit_note` checks `expected_hash` on the chosen file and uses its usual
+descriptor-based writer. `create_note` always uses the supplied destination.
+
+
 > Deep rationale extracted from `CLAUDE.md`. Read before touching any note or file tool — this is the destructive-write surface.
 
 ## Unknown arguments are refused (#295)

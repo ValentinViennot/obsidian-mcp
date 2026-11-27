@@ -1,6 +1,7 @@
 """Relationship reads through the real MCP protocol and indexed PostgreSQL graph."""
 import hashlib
 import json
+from contextlib import asynccontextmanager
 
 import pytest
 import pytest_asyncio
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import _harness
 from src.config import settings
 from src.auth.session import current_vault_root
+from src.mcp_server.auth import current_permission
 from src.mcp_server.server import mcp
 from src.mcp_server import tools
 from src.models.db import NoteLink, NoteMetadata, User
@@ -239,3 +241,122 @@ async def test_unframeable_path_is_a_bounded_actionable_error(corpus, monkeypatc
         default = await client.call_tool("read_note", {"path": path})
         assert not default.isError
         assert default.structuredContent["content"] == "The default read still works."
+
+
+@asynccontextmanager
+async def writing_client():
+    token = current_permission.set("readwrite")
+    try:
+        async with create_connected_server_and_client_session(mcp) as client:
+            await client.initialize()
+            yield client
+    finally:
+        current_permission.reset(token)
+
+
+async def test_reference_read_edit_and_graph_share_the_resolved_path(corpus):
+    folder = corpus / "Réunions récentes"
+    folder.mkdir()
+    path = folder / "Décision 100%.md"
+    path.write_text("---\ntitle: Bilan de l’été\n---\n[[Evergreen]]\n")
+    await indexer.index_vault(full_hash=True)
+    canonical = path.relative_to(corpus).as_posix()
+    async with writing_client() as client:
+        for reference in (canonical, canonical[:-3], "Décision 100%", "Bilan de l’été"):
+            result = await read(client, reference)
+            assert result["path"] == canonical
+            assert result["content"] == "[[Evergreen]]\n"
+        for name in ("get_links", "get_backlinks", "get_neighborhood"):
+            result = await client.call_tool(name, {"path": "Bilan de l’été"})
+            assert canonical in result.content[0].text
+        for reference in ("Décision 100_", "Bilan de l'été"):
+            missing = await read(client, reference)
+            assert '"code":"not_found"' in missing["error"] and "Search" in missing["error"]
+        expected = (await read(client, canonical))["content_hash"]
+        updated = await client.call_tool("edit_note", {
+            "path": "Bilan de l’été", "content": "Après\n", "expected_hash": expected,
+        })
+        assert canonical in updated.content[0].text
+        assert path.read_text().endswith("Après\n")
+        stale = await client.call_tool("edit_note", {
+            "path": canonical[:-3], "content": "Wrong", "expected_hash": expected,
+        })
+        assert '"code":"stale_precondition"' in stale.content[0].text
+        assert path.read_text().endswith("Après\n")
+
+
+async def test_ambiguous_reference_lists_visible_paths_and_never_writes(corpus, sessions):
+    paths = ["A/Résumé.md", "B/Résumé.md"]
+    contents = "---\ntitle: Synthèse\n---\nTexte\n"
+    for path in paths:
+        (corpus / path).parent.mkdir()
+        (corpus / path).write_text(contents)
+    await indexer.index_vault(full_hash=True)
+    async with sessions() as session:
+        other = User(username="reference_other", password_hash="unused")
+        session.add(other)
+        await session.flush()
+        session.add(NoteMetadata(file_path="Private/Résumé.md", title="Synthèse",
+                                 user_id=other.id, content_hash="fixture"))
+        await session.commit()
+    async with writing_client() as client:
+        for name in ("read_note", "edit_note", "get_links", "get_backlinks", "get_neighborhood"):
+            args = {"path": "Synthèse"}
+            if name == "edit_note":
+                args["content"] = "Wrong"
+            result = await client.call_tool(name, args)
+            text = result.structuredContent["error"] if name == "read_note" else result.content[0].text
+            sentinel = json.loads(text.rsplit("MCP-REFUSAL ", 1)[1])
+            assert sentinel == {"code": "note_ambiguous", "candidate_paths": paths}
+        assert all((corpus / path).read_text() == contents for path in paths)
+        # Creating by title uses the explicit destination. This also makes the
+        # root note the first match for later extensionless reads.
+        result = await client.call_tool("create_note", {"path": "Synthèse", "content": "Racine"})
+        assert (corpus / "Synthèse.md").is_file(), result.content
+        assert (await read(client, "Synthèse"))["path"] == "Synthèse.md"
+        assert all((corpus / path).read_text() == contents for path in paths)
+
+
+async def test_reference_does_not_expand_hidden_traversal_or_symlink_writes(corpus):
+    directory = corpus / ".private"
+    directory.mkdir()
+    (directory / "Keep.md").write_text("hidden")
+    (corpus / "Alias.md").symlink_to(corpus / "Decision.md")
+    original = (corpus / "Decision.md").read_bytes()
+    async with writing_client() as client:
+        for path in (".private/Keep", "../Decision"):
+            result = await read(client, path)
+            assert "error" in result and "content" not in result
+        result = await client.call_tool("edit_note", {"path": "Alias", "content": "Wrong"})
+        assert '"code":"validation_failed"' in result.content[0].text
+        assert (corpus / "Decision.md").read_bytes() == original
+
+async def test_ambiguity_shrinks_whole_paths_to_fit_a_small_response(corpus, monkeypatch):
+    monkeypatch.setattr(settings, "max_read_response_chars", 1000)
+    candidates = []
+    for number in range(7):
+        folder = corpus / (str(number) + "e" * 165)
+        folder.mkdir()
+        (folder / "Budget.md").write_text("Text")
+        candidates.append((folder / "Budget.md").relative_to(corpus).as_posix())
+    await indexer.index_vault(full_hash=True)
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.initialize()
+        result = await read(client, "Budget")
+        refusal = json.loads(result["error"].rsplit("MCP-REFUSAL ", 1)[1])
+        assert refusal["code"] == "note_ambiguous"
+        assert 0 < len(refusal["candidate_paths"]) < 5
+        assert all(path in candidates for path in refusal["candidate_paths"])
+
+
+async def test_existing_extensionless_entry_wins_and_stale_titles_do_not_retarget(corpus):
+    (corpus / "Readme").write_text("Exact entry")
+    (corpus / "Readme.md").write_text("Other note")
+    (corpus / "Decision.md").write_text("---\ntitle: Earlier title\n---\nBefore")
+    await indexer.index_vault(full_hash=True)
+    (corpus / "Decision.md").write_text("---\ntitle: Current title\n---\nAfter")
+    async with writing_client() as client:
+        assert (await read(client, "Readme"))["content"] == "Exact entry"
+        stale = await client.call_tool("edit_note", {"path": "Earlier title", "content": "Wrong"})
+        assert '"code":"not_found"' in stale.content[0].text
+        assert "After" in (corpus / "Decision.md").read_text()

@@ -29,6 +29,7 @@ is the reference:
 """
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from typing import Callable, Iterable
@@ -53,7 +54,12 @@ _TRAILING = " .?\""
 
 def notice_line(raw: str, safe: str, reasons: list[str]) -> str:
     """The `path_normalized:` line that tells the caller what was changed."""
-    return f'path_normalized: "{raw}" -> "{safe}" ({"; ".join(reasons)})'
+    # JSON-quoted, so a newline or quote in the caller's path can never start a
+    # new line (a forged `MCP-REFUSAL`) or make the field ambiguous.
+    def q(text: str) -> str:
+        return json.dumps(text, ensure_ascii=False)
+
+    return f'path_normalized: {q(raw)} -> {q(safe)} ({"; ".join(reasons)})'
 
 
 class PortablePathRefusal(ValueError):
@@ -249,8 +255,9 @@ def normalize_destination(
                 raise PortablePathRefusal(
                     PATH_CASE_COLLISION if case_only else UNPORTABLE_PATH,
                     explained(
-                        f"{where}{comp!s} would become {where}{safe} on Android/Windows, "
-                        f"but a {kind} {where}{twin} already exists there and a "
+                        (f"{where}{comp!s} would become {where}{safe} on Android/Windows, "
+                         if safe != comp else f"{where}{comp!s} is new, ")
+                        + f"but a {kind} {where}{twin} already exists there and a "
                         "case-insensitive filesystem cannot hold both. Nothing was "
                         "written; use the existing path (edit_note to change it) or "
                         "choose a different name.",
@@ -283,8 +290,8 @@ def normalize_destination(
             message = (
                 f"{raw} would land on {safe_path} on Android/Windows, but that "
                 "file already exists and you did not name it. Nothing was "
-                "written (not even with overwrite=True); name the existing path "
-                "explicitly to replace it, or choose a different name."
+                "written (overwrite does not apply to a path you did not name); "
+                "name the existing path explicitly to replace it, or choose a different name."
             )
         raise PortablePathRefusal(
             PATH_CASE_COLLISION, explained(message, [], [])

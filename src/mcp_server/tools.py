@@ -4798,10 +4798,9 @@ def _scan_siblings(root, parent: str):
 
     Read-only and informational: it only decides which spelling a *new* name
     takes. The write itself stays anchored, and without `overwrite` it is
-    no-clobber, so a race here cannot overwrite anything. With `overwrite=True`
-    and a name that was changed, the bound is a narrow window: a file created
-    at the safe path between this listing and the write is replaced. A changed
-    name never lands on a file that already exists when the listing is taken.
+    no-clobber, so a race here cannot overwrite anything. A changed name is
+    always published no-clobber, even under `overwrite=True` (the listing saw
+    the safe path empty), so a file created there in between is never replaced.
     A parent that is missing, unreadable or resolves outside the vault lists as
     empty.
     """
@@ -8166,6 +8165,12 @@ async def write_file_impl(
     if isinstance(portable, BodyOutcome):
         return portable
     path, notice = portable
+    # A changed name was confirmed absent by the listing, so `overwrite=True`
+    # has nothing to authorise there. Publish no-clobber: a file someone else
+    # creates at the safe path before this write is never replaced.
+    renamed = notice is not None
+    if renamed:
+        overwrite = False
     # Validate before decoding and before the size check, for the same reason
     # as `create_note_impl`: a symlinked destination is a path problem, and
     # saying so beats sending the caller away to shrink its payload.
@@ -8247,7 +8252,13 @@ async def write_file_impl(
                 return err
         except FileExistsError:
             return _leaf_state_error(target, path) or (
-                _body_refusal(f"File already exists: {path}. Pass overwrite=True to replace it.", "already_exists")
+                _body_refusal(
+                    f"File already exists: {path}. It appeared after your name was "
+                    "made portable, so it was not replaced; name it explicitly to "
+                    "overwrite it." if renamed else
+                    f"File already exists: {path}. Pass overwrite=True to replace it.",
+                    "already_exists",
+                )
             )
         except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
             if _is_in_call_conflict(e):

@@ -4,11 +4,11 @@
 
 The system SHALL make a **new** path component portable before `create_note`, `move_note` (its `to_path` only), `write_file`, `request_upload` or `import_from_url` publishes or mints for it, because the vault is synchronised to Android and Windows. A component that already exists SHALL never be changed, whatever it contains. Reads, `edit_note` and the source of a move SHALL be unaffected.
 
-For a new component the system SHALL: normalise it to Unicode NFC; replace each of `< > : " \ | ? * [ ] # ^` and the control characters U+0000–U+001F and U+007F with `-` (dropping a trailing `?` or `"`), collapsing the runs this produces; strip trailing spaces and dots; append `-` to the stem of a Windows device name (`CON PRN AUX NUL COM0-9 LPT0-9`); and shorten a component over 240 UTF-8 bytes at a character boundary, keeping its extension. Dot-prefixed names, `.` and `..` SHALL be left to the existing path guard.
+For a new component the system SHALL: normalise it to Unicode NFC; replace each of `< > : " \ | ? * [ ] # ^` and the control characters U+0000–U+001F and U+007F with `-` (dropping a trailing `?` or `"`), collapsing the runs this produces; strip a trailing space or dot at the end of the component (a leading space, or a space or dot inside the name including just before the extension, is legal and SHALL be left alone, so a name changes exactly when a reason is reported); append `-` to the stem of a Windows device name (`CON PRN AUX NUL COM0-9 LPT0-9`); and shorten a component over 240 UTF-8 bytes at a character boundary, keeping its extension. Dot-prefixed names, `.` and `..` SHALL be left to the existing path guard.
 
-The corrected path SHALL replace the caller's path **before** the tool's own validation, so that the existing exists, no-clobber, `overwrite`, precondition and symlink checks run on the path that will be written. Normalisation SHALL NOT cause an existing file to be overwritten.
+The corrected path SHALL replace the caller's path **before** the tool's own validation, so that the existing exists, no-clobber, `overwrite`, precondition and symlink checks run on the path that will be written. Normalisation SHALL NOT cause an existing file to be overwritten: when any component of the requested path was changed or reused, and the resulting file already exists, the tool SHALL refuse with `path_case_collision`, naming the existing file, whatever `overwrite` says; `overwrite=True` only replaces a file the caller named exactly.
 
-When a name changed, the success response SHALL report the path actually used and SHALL carry one line, `path_normalized: "<requested>" -> "<used>" (<reasons>)`, and the vault commit message SHALL record it. When no name changed the response SHALL be unchanged.
+When a name changed, the success response SHALL report the path actually used and SHALL carry one line, `path_normalized: "<requested>" -> "<used>" (<reasons>)`, and the vault commit message SHALL record it. Every refusal raised after a name was changed SHALL carry the same line, so the caller can understand a path it never sent. When no name changed the response SHALL be unchanged.
 
 #### Scenario: A forbidden character is replaced and reported
 
@@ -31,6 +31,16 @@ When a name changed, the success response SHALL report the path actually used an
 
 - **WHEN** the normalised file name equals an existing file
 - **THEN** the tool SHALL refuse with `unportable_path`, name the existing path, and write nothing, including under `overwrite=True`
+
+#### Scenario: A reused folder never steers an overwrite onto another file
+
+- **WHEN** `projects/logo.png` exists and `write_file`, `import_from_url` or `request_upload` is called with `Projects/logo.png` and `overwrite=True`
+- **THEN** the tool SHALL refuse with `path_case_collision`, naming `projects/logo.png` and carrying the `path_normalized:` line, and `projects/logo.png` SHALL be unchanged
+
+#### Scenario: A move onto its own source through a reused folder is refused and explained
+
+- **WHEN** `Notes/foo.md` exists and `move_note` moves it to `notes/foo.md`
+- **THEN** the tool SHALL refuse, say the destination is the source, and carry the `path_normalized:` line
 
 ### Requirement: A new name that differs from an existing sibling only by case or Unicode form
 

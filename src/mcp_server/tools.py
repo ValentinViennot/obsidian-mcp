@@ -4797,9 +4797,13 @@ def _scan_siblings(root, parent: str):
     """`(name, is_dir)` for the entries of `parent` under the vault `root`.
 
     Read-only and informational: it only decides which spelling a *new* name
-    takes. The write itself stays anchored and no-clobber, so a race here
-    cannot overwrite anything. A parent that is missing, unreadable or resolves
-    outside the vault lists as empty.
+    takes. The write itself stays anchored, and without `overwrite` it is
+    no-clobber, so a race here cannot overwrite anything. With `overwrite=True`
+    and a name that was changed, the bound is a narrow window: a file created
+    at the safe path between this listing and the write is replaced. A changed
+    name never lands on a file that already exists when the listing is taken.
+    A parent that is missing, unreadable or resolves outside the vault lists as
+    empty.
     """
     base = Path(root)
     where = base / parent if parent else base
@@ -4839,19 +4843,52 @@ def _portable_destination(
         return _body_refusal(e.message, e.code)
     if not reasons:
         return path, None
-    notice = f'path_normalized: "{path}" -> "{safe}" ({"; ".join(reasons)})'
+    notice = portable_path.notice_line(path, safe, reasons)
     git_vault.record_note(notice)
+    box = _path_notice_box.get()
+    if box is not None:
+        box.append(notice)
     return safe, notice
 
 
+#: Where `_portable_destination` leaves the notice for `_announces_path_change`.
+_path_notice_box: ContextVar[list | None] = ContextVar(
+    "_path_notice_box", default=None
+)
+
+
 def _with_notice(result, notice: str | None):
-    """Append the `path_normalized` line to a plain-text success response."""
-    if notice and isinstance(result, str) and not isinstance(result, BodyOutcome):
-        return f"{result}\n{notice}"
-    return result
+    """Append the `path_normalized` line to a response, refusals included."""
+    if not notice or not isinstance(result, str):
+        return result
+    if isinstance(result, BodyOutcome):
+        return result.with_prose(f"{result.prose}\n{notice}")
+    return f"{result}\n{notice}"
+
+
+def _announces_path_change(fn):
+    """Every outcome of a write tool that renamed its destination says so.
+
+    The caller sent a path it never sees written: a refusal raised *after* the
+    name was made portable (exists, symlink, size, io...) is about a path it did
+    not name, so it must carry the explanation just like a success. Applied
+    under `_tracked`, around the whole body.
+    """
+    @wraps(fn)
+    async def wrapper(*args, **kwargs):
+        box: list = []
+        token = _path_notice_box.set(box)
+        try:
+            result = await fn(*args, **kwargs)
+        finally:
+            _path_notice_box.reset(token)
+        return _with_notice(result, box[0] if box else None)
+
+    return wrapper
 
 
 @_tracked("create_note", ["path", "expected_hash"], write_class=True)
+@_announces_path_change
 async def create_note_impl(
     path: str, content: str, expected_hash: str | None = None
 ) -> str:
@@ -4939,10 +4976,9 @@ async def create_note_impl(
             )
             # D9: the bytes this call published, which `_atomic_write_at`
             # encoded exactly this way.
-            return _with_notice(
+            return (
                 f"Created note: {path}"
-                + _published_hash_clause(content.encode("utf-8")),
-                notice,
+                + _published_hash_clause(content.encode("utf-8"))
             )
         except FileExistsError:
             # No-clobber `link` refuses a plain file, a directory *and* a
@@ -6514,6 +6550,7 @@ def _ensure_move_source_in_index(index: dict, from_rel: str) -> None:
     ["from_path", "to_path", "rewrite_links", "expected_hash"],
     write_class=True,
 )
+@_announces_path_change
 async def move_note_impl(
     from_path: str,
     to_path: str,
@@ -7509,8 +7546,6 @@ async def _move_note_locked(
         else:
             parts.append(_hash_unavailable_clause(to_rel))
         message = " — ".join(parts) if len(parts) > 1 else parts[0]
-        if notice:
-            message = f"{message}\n{notice}"
         if db_failed or failed_rewrite_sources or stopped:
             return _body_refusal(
                 message, partial_marker or "partial_completion", disposition="partial"
@@ -8097,6 +8132,7 @@ def _write_cap_for(path: str) -> tuple[int, str]:
 
 
 @_tracked("write_file", ["path", "encoding", "overwrite", "expected_hash"], write_class=True)
+@_announces_path_change
 async def write_file_impl(
     path: str,
     content: str,
@@ -8226,11 +8262,11 @@ async def write_file_impl(
             )])
         result = f"Wrote {len(data):,} bytes to {path}"
         if over_cap or len(data) > read_cap:
-            return _with_notice(result + (
+            return result + (
                 f" — hash not reported: incumbent or published file exceeds "
                 f"{read_cap_name} ({read_cap:,} bytes)"
-            ), notice)
-        return _with_notice(result + _published_hash_clause(data), notice)
+            )
+        return result + _published_hash_clause(data)
 
 
 @_tracked("list_files", ["folder", "pattern", "recursive", "limit"])
@@ -8463,6 +8499,7 @@ def _clamp_note(window) -> str:
 
 
 @_tracked("request_upload", ["path", "overwrite", "expires_in"])
+@_announces_path_change
 async def request_upload_impl(
     path: str,
     overwrite: bool = False,
@@ -8524,7 +8561,7 @@ async def request_upload_impl(
         except transfer.CredentialNotUsable as e:
             return _body_refusal(f"{e} Nothing was minted.", "credential_unusable")
 
-    return _with_notice(
+    return (
         f"Upload link for `{rel}` (expires {_expiry_line(row)}):\n\n"
         f"{base}/transfer/upload#{token}\n\n"
         f"{_clamp_note(window)}"
@@ -8539,8 +8576,7 @@ async def request_upload_impl(
         f'-T <file> {base}/transfer/upload\n\n'
         f"Then call `check_upload(\"{row.public_id}\")` to confirm the bytes "
         "landed and get their sha256. Do not paste the token into a query "
-        "string — that would put it in access logs.",
-        notice,
+        "string — that would put it in access logs."
     )
 
 
@@ -8792,6 +8828,7 @@ def _url_host(url) -> str:
     write_class=True,
     arg_char_caps={"url": MAX_IMPORT_URL_CHARS},
 )
+@_announces_path_change
 async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> str:
     """Fetch a public URL straight into the vault, under the outbound policy."""
     # Same as `request_upload_impl`: the fetch lands on the safe path.
@@ -8897,7 +8934,7 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
             f"recording the import: {e}\n"
             "The file IS in place. Do not retry blindly — check it with "
             "`read_file` or `list_files` first."
-            + (f"\n{notice}" if notice else ""),
+            ,
             "partial_completion", disposition="partial")
         )
     except vault_fs.Conflict as e:
@@ -8922,12 +8959,11 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
             content_hash=h,
             reason=None if h is not None else change_feed.REASON_NOT_INDEXABLE,
         )])
-    return _with_notice(
+    return (
         f"Imported {written['size']:,} bytes to {rel}\n"
         f"sha256: {written['sha256']}\n"
         f"mime: {written['mime']}\n"
-        f"source: {final_url}",
-        notice,
+        f"source: {final_url}"
     )
 
 

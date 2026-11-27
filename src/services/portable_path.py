@@ -19,7 +19,7 @@ is the reference:
   changed, whatever it contains. Historical names stay; reads are unaffected.
 * Only a new component is normalised: NFC; each of `< > : " \\ | ? * [ ] # ^`
   and the control characters become `-` (a trailing `?` or `"` is dropped);
-  trailing spaces and dots are stripped; a Windows device name gets a `-`
+  a trailing space or dot at the end of the component is stripped; a Windows device name gets a `-`
   suffix; a component over 240 UTF-8 bytes is shortened, keeping the extension.
 * A new name that collides with an existing sibling under case/Unicode folding
   reuses a directory's spelling, and refuses for a file. **Nothing is ever
@@ -49,6 +49,11 @@ _REPLACED = re.compile(r"[ ]*\x00(?:[ \x00])*")
 #: Trailing characters stripped from a stem. `?` and `"` are *dropped* rather
 #: than turned into a hyphen, so `Why now?.md` reads `Why now.md`.
 _TRAILING = " .?\""
+
+
+def notice_line(raw: str, safe: str, reasons: list[str]) -> str:
+    """The `path_normalized:` line that tells the caller what was changed."""
+    return f'path_normalized: "{raw}" -> "{safe}" ({"; ".join(reasons)})'
 
 
 class PortablePathRefusal(ValueError):
@@ -99,29 +104,33 @@ def portable_component(name: str, *, is_file: bool) -> tuple[str, list[str]]:
     if nfc != name:
         reasons.append("normalized to Unicode NFC")
 
+    # Only the very end of a component is a problem on Windows (a trailing dot
+    # or space); `?` and `"` are dropped there too instead of hyphenated, so
+    # `Why now?` reads `Why now`. Leading spaces, and a space or dot *inside*
+    # the name (before the extension included), are legal and left alone.
+    end = nfc.rstrip(_TRAILING)
+    if end != nfc:
+        dropped = nfc[len(end):]
+        if "?" in dropped or '"' in dropped:
+            reasons.append("trailing '?' or '\"' dropped (not allowed on Android/Windows)")
+        if dropped.strip('?"'):
+            reasons.append("trailing spaces/dots removed (not allowed on Windows)")
+    nfc = end
+
     stem, ext = nfc, ""
     if is_file:
         dot = nfc.rfind(".")
         if 0 < dot < len(nfc) - 1:
             stem, ext = nfc[:dot], nfc[dot:]
+    if ext:
+        before = stem.rstrip('?"')
+        if before != stem:
+            reasons.append("trailing '?' or '\"' dropped (not allowed on Android/Windows)")
+            stem = before
 
     found: list[str] = []
-    # Trailing characters first, so that `Why now?` loses its `?` instead of
-    # gaining a hyphen, and `a. ` loses both. Dots and spaces are only a
-    # problem at the very end of a component on Windows.
-    trimmed = stem.rstrip(_TRAILING)
-    if trimmed != stem:
-        dropped = stem[len(trimmed):]
-        if "?" in dropped or '"' in dropped:
-            reasons.append("trailing '?' or '\"' dropped (not allowed on Android/Windows)")
-        if dropped.strip('?"'):
-            reasons.append("trailing spaces/dots removed (not allowed on Windows)")
-    stem = trimmed
-    stem = _replace_invalid(stem, found).strip(" ")
-    ext = _replace_invalid(ext, found).rstrip(" .") if ext else ""
-    if ext == ".":
-        ext = ""
-    stem = stem.rstrip(" .")
+    stem = _replace_invalid(stem, found)
+    ext = _replace_invalid(ext, found) if ext else ""
     if found:
         listed = ", ".join(_describe_char(ch) for ch in found)
         reasons.append(f"{listed} not allowed on Android/Windows, replaced with '-'")
@@ -189,7 +198,14 @@ def normalize_destination(
     parent_exists = True
     parent = ""
     changed = False
+    leaf_exists = False
     last = len(kept) - 1
+
+    def explained(message: str, tail: list[str], more: list[str]) -> str:
+        """`message` plus the explanation of the path the caller never sent."""
+        if not (reasons or more):
+            return message
+        return f"{message}\n{notice_line(raw, '/'.join(out + tail), reasons + more)}"
 
     for i, comp in enumerate(kept):
         is_file = i == last
@@ -204,6 +220,7 @@ def normalize_destination(
         if parent_exists:
             entries = {name: is_dir for name, is_dir in list_siblings(parent)}
         if comp in entries:
+            leaf_exists = leaf_exists or is_file
             out.append(comp)
             parent_exists = entries[comp] and not is_file
             parent = f"{parent}/{comp}" if parent else comp
@@ -231,11 +248,14 @@ def normalize_destination(
                 kind = "folder" if twin_is_dir else "file"
                 raise PortablePathRefusal(
                     PATH_CASE_COLLISION if case_only else UNPORTABLE_PATH,
-                    f"{where}{comp!s} would become {where}{safe} on Android/Windows, "
-                    f"but a {kind} {where}{twin} already exists there and a "
-                    "case-insensitive filesystem cannot hold both. Nothing was "
-                    "written; use the existing path (edit_note to change it) or "
-                    "choose a different name.",
+                    explained(
+                        f"{where}{comp!s} would become {where}{safe} on Android/Windows, "
+                        f"but a {kind} {where}{twin} already exists there and a "
+                        "case-insensitive filesystem cannot hold both. Nothing was "
+                        "written; use the existing path (edit_note to change it) or "
+                        "choose a different name.",
+                        [safe], why,
+                    ),
                 )
         elif not is_file:
             # A brand-new folder: nothing below it exists either.
@@ -249,4 +269,24 @@ def normalize_destination(
 
     if not changed:
         return rel_path, []
-    return "/".join(out), reasons
+    safe_path = "/".join(out)
+    if leaf_exists:
+        # A folder was renamed or reused on the way, and the leaf is already
+        # there: a tool's `overwrite=True` would replace a file the caller never
+        # named. Refused whatever `overwrite` says.
+        if safe_path == ignore:
+            message = (
+                f"{raw} normalizes to {safe_path}, which is the source of this "
+                "move: it would not move anywhere. Nothing was written."
+            )
+        else:
+            message = (
+                f"{raw} would land on {safe_path} on Android/Windows, but that "
+                "file already exists and you did not name it. Nothing was "
+                "written (not even with overwrite=True); name the existing path "
+                "explicitly to replace it, or choose a different name."
+            )
+        raise PortablePathRefusal(
+            PATH_CASE_COLLISION, explained(message, [], [])
+        )
+    return safe_path, reasons

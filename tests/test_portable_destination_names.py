@@ -96,10 +96,36 @@ def test_control_characters_are_reported_by_code_point():
     assert any("U+0001" in n for n in notes)
 
 
-def test_trailing_dots_and_spaces_are_stripped_from_the_stem_and_folders():
-    assert norm("a. .md")[0] == "a.md"
+def test_trailing_dots_and_spaces_are_stripped_at_the_end_of_a_component_only():
+    assert norm("a.md ")[0] == "a.md"
     assert norm("Folder. /x.md")[0] == "Folder/x.md"
-    assert norm("name .md")[0] == "name.md"
+    assert norm("name.")[0] == "name"
+    assert norm("Why now ?.md")[0] == "Why now .md"
+
+
+def test_leading_spaces_and_a_space_before_the_extension_are_legal_and_left_alone():
+    for p in (" foo.md", "foo .md", "a. .md", " lead/ x .md"):
+        out, notes = pp.normalize_destination(p, NOTHING)
+        assert out is p and notes == [], p
+    # ... so they never collide with the name they used to be rewritten to.
+    assert pp.normalize_destination(" foo.md", tree("foo.md")) == (" foo.md", [])
+
+
+def test_a_name_changes_exactly_when_a_reason_is_given():
+    import itertools
+
+    atoms = ["a", " ", ".", "?", '"', ":", "é", "\x01", "md", "CON"]
+    for n in range(1, 5):
+        for combo in itertools.product(atoms, repeat=n):
+            name = "".join(combo)
+            if name.startswith(".") or name.strip(" ") == "":
+                continue
+            for is_file in (True, False):
+                try:
+                    out, why = pp.portable_component(name, is_file=is_file)
+                except pp.PortablePathRefusal:
+                    continue
+                assert (out != name) == bool(why), (name, is_file, out, why)
 
 
 def test_windows_device_names_get_a_hyphen_suffix_on_the_stem():
@@ -190,6 +216,35 @@ def test_a_file_cannot_take_a_folders_place_as_a_parent():
 def test_the_exact_existing_name_is_left_to_the_tools_own_exists_logic():
     out, notes = norm("notes/plan.md", "notes/plan.md", "notes/Plan.md")
     assert out == "notes/plan.md" and notes == []
+
+
+def test_a_renamed_or_reused_folder_never_steers_onto_an_existing_leaf():
+    for dest, existing in (
+        ("Projects/logo.png", ("projects/logo.png",)),
+        ("x?/a.png", ("x/a.png",)),
+        ("x?/a.png", ("x/", "x/a.png")),
+        ("Notes/foo.md", ("notes/foo.md",)),
+    ):
+        with pytest.raises(pp.PortablePathRefusal) as e:
+            norm(dest, *existing)
+        assert e.value.code == pp.PATH_CASE_COLLISION, dest
+        assert "path_normalized:" in e.value.message and dest in e.value.message
+
+
+def test_a_leaf_that_exists_under_an_unchanged_path_is_still_the_tools_decision():
+    assert norm("projects/logo.png", "projects/logo.png") == ("projects/logo.png", [])
+
+
+def test_a_destination_that_normalizes_onto_the_move_source_is_explained():
+    with pytest.raises(pp.PortablePathRefusal) as e:
+        norm("notes/foo.md", "Notes/foo.md", ignore="Notes/foo.md")
+    assert "source" in e.value.message and "path_normalized:" in e.value.message
+
+
+def test_collision_refusals_after_a_folder_rename_carry_the_explanation():
+    with pytest.raises(pp.PortablePathRefusal) as e:
+        norm("x?/Plan.md", "x/", "x/plan.md")
+    assert 'path_normalized: "x?/Plan.md" -> "x/Plan.md"' in e.value.message
 
 
 def test_ignore_lets_a_case_only_rename_of_the_source_through():
@@ -343,6 +398,64 @@ async def test_write_file_overwrite_cannot_be_redirected_onto_another_file(vault
     assert (vault / "a.txt").read_text(encoding="utf-8") == "keep"
 
 
+async def _seed(vault, rel, data=b"keep"):
+    (vault / rel).parent.mkdir(parents=True, exist_ok=True)
+    (vault / rel).write_bytes(data)
+
+
+async def test_write_file_overwrite_never_lands_on_a_file_through_a_reused_folder(vault):
+    await _seed(vault, "projects/logo.png")
+    result = await tools.write_file_impl(
+        "Projects/logo.png", "new", encoding="text", overwrite=True
+    )
+    assert 'MCP-REFUSAL {"code":"path_case_collision"' in result
+    assert "projects/logo.png" in result and "path_normalized:" in result
+    assert (vault / "projects" / "logo.png").read_bytes() == b"keep"
+    assert files(vault) == ["projects/logo.png"]
+
+
+async def test_write_file_overwrite_never_lands_on_a_file_through_a_renamed_folder(vault):
+    await _seed(vault, "x/a.png")
+    result = await tools.write_file_impl("x?/a.png", "new", encoding="text", overwrite=True)
+    assert "MCP-REFUSAL" in result and "path_normalized:" in result
+    assert (vault / "x" / "a.png").read_bytes() == b"keep"
+
+
+async def test_create_note_never_lands_on_a_note_through_a_reused_folder(vault):
+    await _seed(vault, "projects/idea.md")
+    result = await tools.create_note_impl("Projects/idea", "new")
+    assert 'MCP-REFUSAL {"code":"path_case_collision"' in result
+    assert (vault / "projects" / "idea.md").read_bytes() == b"keep"
+
+
+async def test_import_from_url_overwrite_never_lands_through_a_reused_folder(vault, origin, monkeypatch):
+    await _seed(vault, "projects/logo.png")
+
+    async def never(*a, **k):
+        raise AssertionError("fetched for a refused destination")
+
+    monkeypatch.setattr(transfer, "fetch_url_guarded", never)
+    result = await tools.import_from_url_impl(
+        "https://example.com/a", "Projects/logo.png", overwrite=True
+    )
+    assert "MCP-REFUSAL" in result and "path_normalized:" in result
+    assert (vault / "projects" / "logo.png").read_bytes() == b"keep"
+
+
+async def test_request_upload_overwrite_never_lands_through_a_reused_folder(vault, mint):
+    await _seed(vault, "projects/logo.png")
+    result = await tools.request_upload_impl("Projects/logo.png", overwrite=True)
+    assert "MCP-REFUSAL" in result and "path_normalized:" in result
+    assert "rel" not in mint
+
+
+async def test_a_refusal_after_normalization_carries_the_explanation(vault, no_index):
+    result = await tools.move_note_impl("missing.md", "Archive/Done: it.md")
+    assert "Source note not found" in result and "MCP-REFUSAL" in result
+    assert 'path_normalized: "Archive/Done: it.md" -> "Archive/Done - it.md"' in result
+    assert result.rstrip().splitlines()[-1].startswith("MCP-REFUSAL")
+
+
 async def test_write_file_overwrite_of_an_exact_existing_name_still_works(vault):
     (vault / "odd?.txt").write_text("old", encoding="utf-8")
     result = await tools.write_file_impl("odd?.txt", "new", encoding="text", overwrite=True)
@@ -379,6 +492,14 @@ async def test_move_note_into_an_existing_folder_by_another_case_reuses_it(vault
     result = await tools.move_note_impl("n.md", "PROJECTS/n.md")
     assert (vault / "projects" / "n.md").exists()
     assert "path_normalized" in result
+
+
+async def test_move_note_onto_its_own_source_through_a_reused_folder_is_explained(vault, no_index):
+    await _seed(vault, "Notes/foo.md", b"foo")
+    result = await tools.move_note_impl("Notes/foo.md", "notes/foo.md")
+    assert 'MCP-REFUSAL {"code":"path_case_collision"' in result
+    assert "source" in result and "path_normalized:" in result
+    assert (vault / "Notes" / "foo.md").read_bytes() == b"foo"
 
 
 async def test_move_note_may_still_rename_a_note_by_case_only(vault, no_index):

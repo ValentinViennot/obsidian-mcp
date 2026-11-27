@@ -454,3 +454,18 @@ the tool SHALL return a bounded error asking for a read without relationships.
 - **AND** retained content SHALL be exact, with a useful `next_offset` when more remains
 - **AND** an empty list caused by response truncation SHALL have its has-more flag
 
+
+### Requirement: Resolve existing note references consistently
+The server SHALL resolve note references for reading, editing, outgoing links, backlinks and graph neighbourhoods within the caller's vault. The server SHALL prefer an existing exact path, then that path with the Markdown extension, then an exact indexed title or basename for a bare name. Successful calls SHALL return the chosen path.
+
+#### Scenario: A caller uses an omitted extension or an exact title
+- **WHEN** a caller supplies a path without the Markdown extension or a unique matching bare name
+- **THEN** the tool uses the canonical path, and an edit with an expected content hash verifies the same file
+
+#### Scenario: Several existing notes match
+- **WHEN** two visible notes match the same bare name
+- **THEN** the call returns a structured `note_ambiguous` refusal with bounded complete candidate paths and does not edit any note
+
+#### Scenario: A caller explicitly creates a note
+- **WHEN** another note already has the title supplied as the destination to `create_note`
+- **THEN** creation uses the explicit destination and preserves the other note's content

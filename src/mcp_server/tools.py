@@ -71,7 +71,7 @@ from src.mcp_server.read_result import (
 )
 from src.models.db import UsageLog
 from src.services.connection_identity import ConnectionAuthor
-from src.services import concurrency, git_vault, rate_limits, refusals, security_events, timing
+from src.services import concurrency, git_vault, portable_path, rate_limits, refusals, security_events, timing
 from src.services.tool_outcomes import BodyOutcome, body_refusal as _body_refusal
 from src.services.embeddings import (
     rechunk_pending_count,
@@ -4793,7 +4793,101 @@ def _move_precondition_error(
     return err.with_prose(err.prose + scope)
 
 
+def _scan_siblings(root, parent: str):
+    """`(name, is_dir)` for the entries of `parent` under the vault `root`.
+
+    Read-only and informational: it only decides which spelling a *new* name
+    takes. The write itself stays anchored, and without `overwrite` it is
+    no-clobber, so a race here cannot overwrite anything. A changed name is
+    always published no-clobber, even under `overwrite=True` (the listing saw
+    the safe path empty), so a file created there in between is never replaced.
+    A parent that is missing, unreadable or resolves outside the vault lists as
+    empty.
+    """
+    base = Path(root)
+    where = base / parent if parent else base
+    try:
+        real_root = os.path.realpath(base)
+        real = os.path.realpath(where)
+        if real != real_root and not real.startswith(real_root + os.sep):
+            return []
+        with os.scandir(where) as it:
+            return [(e.name, e.is_dir()) for e in it]
+    except OSError:
+        return []
+
+
+def _portable_destination(
+    path: str, uid, *, ignore: str | None = None
+) -> tuple[str, str | None] | BodyOutcome:
+    """Make a **new** destination name portable, or refuse.
+
+    Returns `(safe_path, notice)`; `notice` is the `path_normalized:` line the
+    tool appends to its response (and the commit message), `None` when the name
+    needed no change, in which case `safe_path is path`. Returns a refusal
+    when the name cannot be fixed without guessing or collides with an existing
+    sibling. Applied to destinations only, before the tool's own validation, so
+    every existing exists/overwrite/symlink check then runs on the **safe**
+    path: a normalised name can never overwrite what it was not asked to.
+    """
+    try:
+        root = _vault_root(uid)
+    except (ValueError, RuntimeError):
+        return path, None  # the tool's own validation reports it, as before
+    try:
+        safe, reasons = portable_path.normalize_destination(
+            path, lambda parent: _scan_siblings(root, parent), ignore=ignore
+        )
+    except portable_path.PortablePathRefusal as e:
+        return _body_refusal(e.message, e.code)
+    if not reasons:
+        return path, None
+    notice = portable_path.notice_line(path, safe, reasons)
+    git_vault.record_note(notice)
+    box = _path_notice_box.get()
+    if box is not None:
+        box.append(notice)
+    return safe, notice
+
+
+#: Where `_portable_destination` leaves the notice for `_announces_path_change`.
+_path_notice_box: ContextVar[list | None] = ContextVar(
+    "_path_notice_box", default=None
+)
+
+
+def _with_notice(result, notice: str | None):
+    """Append the `path_normalized` line to a response, refusals included."""
+    if not notice or not isinstance(result, str):
+        return result
+    if isinstance(result, BodyOutcome):
+        return result.with_prose(f"{result.prose}\n{notice}")
+    return f"{result}\n{notice}"
+
+
+def _announces_path_change(fn):
+    """Every outcome of a write tool that renamed its destination says so.
+
+    The caller sent a path it never sees written: a refusal raised *after* the
+    name was made portable (exists, symlink, size, io...) is about a path it did
+    not name, so it must carry the explanation just like a success. Applied
+    under `_tracked`, around the whole body.
+    """
+    @wraps(fn)
+    async def wrapper(*args, **kwargs):
+        box: list = []
+        token = _path_notice_box.set(box)
+        try:
+            result = await fn(*args, **kwargs)
+        finally:
+            _path_notice_box.reset(token)
+        return _with_notice(result, box[0] if box else None)
+
+    return wrapper
+
+
 @_tracked("create_note", ["path", "expected_hash"], write_class=True)
+@_announces_path_change
 async def create_note_impl(
     path: str, content: str, expected_hash: str | None = None
 ) -> str:
@@ -4838,6 +4932,13 @@ async def create_note_impl(
     ):
         return err
     uid = current_user_id.get()
+    # A new name that Android/Windows could not hold is made portable here,
+    # before any validation, so every check below -- no-clobber included --
+    # runs on the path that will really be written.
+    portable = _portable_destination(path, uid)
+    if isinstance(portable, BodyOutcome):
+        return portable
+    path, notice = portable
     # Validate before the size check: a caller naming an alias should learn
     # that the path is a symlink, not that its content is too big — the second
     # message sends it off to trim content that was never the problem.
@@ -4874,8 +4975,9 @@ async def create_note_impl(
             )
             # D9: the bytes this call published, which `_atomic_write_at`
             # encoded exactly this way.
-            return f"Created note: {path}" + _published_hash_clause(
-                content.encode("utf-8")
+            return (
+                f"Created note: {path}"
+                + _published_hash_clause(content.encode("utf-8"))
             )
         except FileExistsError:
             # No-clobber `link` refuses a plain file, a directory *and* a
@@ -6447,6 +6549,7 @@ def _ensure_move_source_in_index(index: dict, from_rel: str) -> None:
     ["from_path", "to_path", "rewrite_links", "expected_hash"],
     write_class=True,
 )
+@_announces_path_change
 async def move_note_impl(
     from_path: str,
     to_path: str,
@@ -6563,6 +6666,17 @@ async def _move_note_locked(
     # renaming a parent directory mid-call cannot redirect either. Both
     # endpoints are acquired inside the same guard: a non-`ValueError` failure
     # opening the destination would otherwise strand the source's descriptors.
+    # The destination only: a new name that Android/Windows could not hold is
+    # made portable (see `_portable_destination`) before it is validated, so
+    # the "destination already exists" and symlink checks judge the safe path.
+    # The source is never touched. Its own path is excluded from the collision
+    # test so a case-only rename of this very note stays possible.
+    portable = _portable_destination(
+        to_path, uid, ignore="/".join(p for p in from_path.split("/") if p not in ("", "."))
+    )
+    if isinstance(portable, BodyOutcome):
+        return portable
+    to_path, notice = portable
     targets: list = []
     shared_root_fd: int | None = None
     try:
@@ -8017,6 +8131,7 @@ def _write_cap_for(path: str) -> tuple[int, str]:
 
 
 @_tracked("write_file", ["path", "encoding", "overwrite", "expected_hash"], write_class=True)
+@_announces_path_change
 async def write_file_impl(
     path: str,
     content: str,
@@ -8044,6 +8159,25 @@ async def write_file_impl(
         return _body_refusal(f"Invalid encoding '{encoding}'. Use 'base64' or 'text'.", "invalid_argument")
 
     uid = current_user_id.get()
+    # New destination names are made portable first (see `create_note_impl`);
+    # the no-clobber / `overwrite` logic below then judges the safe path.
+    portable = _portable_destination(path, uid)
+    if isinstance(portable, BodyOutcome):
+        return portable
+    path, notice = portable
+    # A changed name was confirmed absent by the listing, so `overwrite=True`
+    # has nothing to authorise there. Publish no-clobber: a file someone else
+    # creates at the safe path before this write is never replaced.
+    renamed = notice is not None
+    if renamed:
+        if expected_hash is not None:
+            # The safe path was confirmed absent, so a replacement guarded by a
+            # hash has no incumbent — the same refusal as the exact-name call.
+            if err := _precondition_error(
+                "write_file", path, None, expected_hash, no_incumbent=True,
+            ):
+                return err
+        overwrite = False
     # Validate before decoding and before the size check, for the same reason
     # as `create_note_impl`: a symlinked destination is a path problem, and
     # saying so beats sending the caller away to shrink its payload.
@@ -8125,7 +8259,13 @@ async def write_file_impl(
                 return err
         except FileExistsError:
             return _leaf_state_error(target, path) or (
-                _body_refusal(f"File already exists: {path}. Pass overwrite=True to replace it.", "already_exists")
+                _body_refusal(
+                    f"File already exists: {path}. It appeared after your name was "
+                    "made portable, so it was not replaced; name it explicitly to "
+                    "overwrite it." if renamed else
+                    f"File already exists: {path}. Pass overwrite=True to replace it.",
+                    "already_exists",
+                )
             )
         except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
             if _is_in_call_conflict(e):
@@ -8377,12 +8517,21 @@ def _clamp_note(window) -> str:
 
 
 @_tracked("request_upload", ["path", "overwrite", "expires_in"])
+@_announces_path_change
 async def request_upload_impl(
     path: str,
     overwrite: bool = False,
     expires_in: int | None = None,
 ) -> str:
     """Mint a one-shot link a human can drop a file onto."""
+    # A new destination name is made portable before it is frozen into the
+    # token: the link lands on the safe path and the caller is told so.
+    if err := _require_write():  # permission outranks a naming refusal
+        return err
+    portable = _portable_destination(path, current_user_id.get())
+    if isinstance(portable, BodyOutcome):
+        return portable
+    path, notice = portable
     pre = _mint_preflight(path, need_write=True, overwrite=overwrite)
     if isinstance(pre, str):
         return pre
@@ -8697,8 +8846,16 @@ def _url_host(url) -> str:
     write_class=True,
     arg_char_caps={"url": MAX_IMPORT_URL_CHARS},
 )
+@_announces_path_change
 async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> str:
     """Fetch a public URL straight into the vault, under the outbound policy."""
+    # Same as `request_upload_impl`: the fetch lands on the safe path.
+    if err := _require_write():  # permission outranks a naming refusal
+        return err
+    portable = _portable_destination(path, current_user_id.get())
+    if isinstance(portable, BodyOutcome):
+        return portable
+    path, notice = portable
     pre = _mint_preflight(path, need_write=True, overwrite=overwrite)
     if isinstance(pre, str):
         return pre
@@ -8794,7 +8951,9 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
             _body_refusal(f"Imported the file to {rel}, but the server could not finish "
             f"recording the import: {e}\n"
             "The file IS in place. Do not retry blindly — check it with "
-            "`read_file` or `list_files` first.", "partial_completion", disposition="partial")
+            "`read_file` or `list_files` first."
+            ,
+            "partial_completion", disposition="partial")
         )
     except vault_fs.Conflict as e:
         return _body_refusal(f"{e}. Nothing was written.", "concurrent_write")

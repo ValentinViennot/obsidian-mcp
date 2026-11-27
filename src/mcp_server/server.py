@@ -582,6 +582,8 @@ async def create_note(
     write never lands on a note other than the one named; symlinked folders
     inside the vault work normally.
 
+    Destination names that would not sync to Android/Windows are made portable and the response says how (a `path_normalized:` line); refusals: `unportable_path`, `path_case_collision`.
+
     The note is published no-clobber: the content is staged out of sight and
     linked into place in one kernel-atomic step, so an existing file at `path`
     can never be replaced by this tool. A vault filesystem that cannot stage an
@@ -971,23 +973,24 @@ async def move_note(
     machine-readable `MCP-REFUSAL {"code":…}` line; an undeclared or mistyped argument is rejected by
     protocol validation before the tool runs and carries no such line.
 
+    A new `to_path` that would not sync to Android/Windows is made portable; the response says how (`path_normalized`).
+
     **`expected_hash`** binds **`from_path`'s own bytes and nothing else**: pass the `content_hash` a read
     returned, verbatim, and the move is refused with nothing written if that note
     changed since. It is compared at preflight, before the rename and before any rewrite; the rename then pins
     inode identity but does not compare the bytes again, so an in-place edit landing after that comparison is
     still moved. The backlink sources a `rewrite_links=True` move rewrites are *not* bound, because you never
-    read them. Optional by default — omitted, the move proceeds — unless the deployment requires it, when
-    an omitted hash is refused `precondition_required`. Codes: `stale_precondition`, `concurrent_write`,
+    read them. Optional by default, unless the deployment requires it (then an omitted hash is
+    refused `precondition_required`). Codes: `stale_precondition`, `concurrent_write`,
     `no_incumbent`, `malformed_precondition`, `precondition_unavailable`, `precondition_required`.
 
     With `rewrite_links=True`, every source note that links to this note is rewritten in place — wikilinks,
     embeds, path-style links, and bare-href markdown links `[text](Old.md)`, whose new href is written
     relative to the linking note's own folder; angle-bracket hrefs `[text](<Old.md>)` are **not** rewritten.
     Aliases and anchors survive. **The moved note's own body is rewritten as well**, so a self-reference
-    does not end up pointing at the old path. The rewrites are planned
-    before anything changes: if one would push a source past the note size limit, or the planning would exceed
-    the aggregate memory bound, the whole move is refused before any file is touched, naming the source or the
-    count.
+    does not end up pointing at the old path. Rewrites are planned
+    first: if one would push a source past the note size limit, or planning would exceed the aggregate
+    memory bound, the whole move is refused before any file is touched.
 
     **The same preflight refuses the whole move, before the rename, when any source it would rewrite — the
     moved note's own body included — contains a fence opener indented by one to three spaces that nothing below
@@ -1221,6 +1224,7 @@ async def write_file(
     as UTF-8. The write is atomic — the bytes are staged and flushed before
     anything is published — missing parent folders are created, and content over
     `MAX_FILE_WRITE_BYTES` (default 25 MB, decoded length) is refused.
+    Destination names that would not sync to Android/Windows are made portable and the response says how (a `path_normalized:` line); refusals: `unportable_path`, `path_case_collision`.
 
     No-clobber by default: writing over an existing file requires
     `overwrite=True`. The default publishes by linking a staged, never-named
@@ -1334,6 +1338,8 @@ async def request_upload(
     Peer to `write_file`, which takes the bytes directly — use this one when you
     do not have them.
 
+    Destination names that would not sync to Android/Windows are made portable and the response says how (a `path_normalized:` line); refusals: `unportable_path`, `path_case_collision`.
+
     No MCP client can hand a tool the bytes of a file the user is looking at,
     and your shell cannot reach their machine. This mints a link bound to
     exactly one destination path: hand it to the person you are helping, they
@@ -1443,6 +1449,7 @@ async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
     The server does the fetching, so nothing passes through your context: a
     20 MB PDF costs one tool call. Returns the path, size, sha256, MIME type
     and the final URL after any redirects.
+    Destination names that would not sync to Android/Windows are made portable and the response says how (a `path_normalized:` line); refusals: `unportable_path`, `path_case_collision`.
 
     **Only genuinely public addresses.** This server sits on a private network
     next to a database and other services, so the fetch is restricted: https

@@ -162,12 +162,42 @@ The application suite remains Linux-only because its vault containment uses
 
 The desktop sweep shows a generic macOS notification when recovery review is
 required. Note names, saved content and vault paths stay in private status/log
-output. A private digest marker inside `.git` suppresses repeated alerts for the
-same recovery state; changed retained bytes trigger a new alert. Successful sync
-clears the notification marker, without deleting recovery versions. A busy writer
-lock stays a silent retry. Failed notification delivery leaves the next sweep
-eligible to retry; the original engine exit status is preserved. Notification
-availability follows macOS user permissions, so use `status` when diagnosing sync.
+output — both texts are fixed literals. A private digest marker inside `.git`
+suppresses repeated alerts for the same recovery state; changed retained bytes
+trigger a new alert.
+
+**A state that does not change alerts again anyway, once an hour.** The marker's
+own mtime is when the sweep last said anything, and
+`VAULT_RECONCILE_RENOTIFY_MINUTES` (60; `0` restores one alert per state and
+never again) is how long it may stay quiet. The repeat says the vault still has
+not synchronised. Suppressing by state alone was not enough: a desktop vault
+stopped syncing on 2026-11-24 at 03:21, said so once — at twenty past three in
+the morning — and then nothing for 43 hours and 510 refused sweeps. The server
+side has the opposite shape, a Telegram alert on every failed run plus a
+staleness timer, which is why the same outage was noticed there in minutes and
+here not at all.
+
+Everything the window cannot trust repeats rather than going quiet, since
+silence is the failure being fixed: an mtime no `stat` could read, a marker
+dated in the future after a clock change or a restore, and a clock `date` could
+not report at all, each alert on every sweep until the record makes sense again.
+Both readings are guarded and both assignments are compound, because a bare one
+aborts the sweep under `set -e` — and a command substitution fails when a fork
+does, which is when the status handed to launchd matters most. **The GNU spelling of `stat` comes
+first**, because GNU `stat -f` is `--file-system` and prints six lines of it to
+stdout, which the arithmetic then died on under `set -u` — killing the sweep and
+replacing the engine's exit status with 1. The window is read in base 10
+explicitly: bash reads `008` as octal and aborted the comparison, which failed
+towards silence.
+
+Successful sync clears the notification marker, without deleting recovery
+versions. A busy writer lock stays a silent retry. Failed notification delivery
+leaves the next sweep eligible to retry; the original engine exit status is
+preserved whatever happens in the alerting, including an unusable `stat` or
+`date`, and `test_an_unusable_clock_or_stat_never_changes_the_exit_status`
+asserts both.
+Notification availability follows macOS user permissions, so use `status` when
+diagnosing sync.
 
 ## Named connection authors
 

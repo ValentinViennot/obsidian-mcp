@@ -391,6 +391,10 @@ a safe boundary" is the same thing said out loud: an import too large for one
 sweep, converging in slices. Neither refreshes the staleness marker, so an
 import that never converges is still reported by `obsidian-vault-staleness`.
 
+On a desktop vault the notification repeats every
+`VAULT_RECONCILE_RENOTIFY_MINUTES` (60) for as long as the sweep stays blocked,
+saying the vault still has not synchronised; a successful sync stops it.
+
 Two refusals name a file instead and need no recovery command at all.
 `incoming addition collides with a local save` and `local deletion arrived`
 mean something created or removed that exact path while the transaction was in

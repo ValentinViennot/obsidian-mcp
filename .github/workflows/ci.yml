@@ -63,6 +63,9 @@ jobs:
           fi
           unshare -Urm --propagation private true
       - run: python scripts/ci_tests.py offline
+        env:
+          # File permission tests must run against real POSIX ACLs on Linux.
+          OMCP_TEST_REQUIRE_POSIX_ACL: "1"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

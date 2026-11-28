@@ -197,6 +197,26 @@ update it in the same change.** What stays here is the short list:
   nothing is ever auto-promoted to admin. See
   [control panel](docs/architecture/control-panel.md).
 - Vault mounted read-write at /obsidian in container
+- **A published file's permissions come from a rule, never a fixed mode**
+  (#447; owner, in his words: "keep a note's existing permissions on edit").
+  Every write publishes a new inode staged at 0600, so `vault_fs.apply_plan`
+  writes the plan onto it before the one payload `fsync`. **Edit** (a
+  regular file is replaced): its bits (`0o777`), POSIX access ACL and gid.
+  **Create**: what `open(O_CREAT, 0o666)` gets in the destination folder
+  (its default ACL, umask not applied; else `0o666 & ~umask`), computed for
+  uploads although they stage in `.transfer-tmp`. A gid the server cannot
+  set (`EPERM`/`EINVAL`) moves the owning group's permissions to a named
+  group entry, never broader; any other failure is `PermissionsNotApplied`
+  → `io_failure` / pre-publication 500, nothing published; no fallback to
+  the other rule, no uid `fchown`. A named staged copy carries those
+  permissions from then on, so its bytes are compared with the payload
+  after the `fsync` (`_require_staged_bytes`; a difference is
+  `concurrent_write`; a refused read-back skips that comparison only for a copy whose applied mode gives the owner no read, else refuses the write). The overwrite branch re-captures before
+  the `expected=` comparison (a difference is `concurrent_write`), so the
+  compare-to-rename window is unchanged. New folders get `mkdirat` 0o777
+  only under a default ACL, else 0o755; `.transfer-tmp` stays 0700. See
+  [vault tools](docs/architecture/vault-tools.md), "Published file
+  permissions (#447)".
 - Read responses are capped in characters (`MAX_READ_RESPONSE_CHARS`, default
   40,000) independently of the byte caps on disk I/O — see "Three kinds of size cap"
   in [vault tools](docs/architecture/vault-tools.md). Tool output is model
@@ -739,7 +759,15 @@ update it in the same change.** What stays here is the short list:
   which the pass never stat-shortcuts (R3) and keeps only when refreshed at
   or after its `scan_started_at` (R4), so every row converges and none is
   stuck. A refresh that cannot run leaves the write standing:
-  `index: may lag (<code>)`. Generic writers do not refresh (L5). Settings
+  `index: may lag (<code>)`. Since #432 `edit_note`, `set_frontmatter`
+  and every `write_file` to a note path also attempt the refresh, after
+  their change-feed event, only when the replaced or published bytes may
+  hold a checkbox (`tasks.may_hold_tasks`, a superset of the extractor),
+  and silently: their output is unchanged, and a refresh that cannot run
+  leaves the rows to the next pass. `delete_note` always clears the deleted
+  note's task rows (absence form, never over a recreated file).
+  `create_note`, imports, uploads and `move_note`'s link rewrites wait for
+  the pass (task-refresh-on-write L1/L4). Settings
   are per owner scope in `task_settings` (durable, `UNIQUE NULLS NOT
   DISTINCT`, NULL fields → `TASKS_*` env defaults); an invalid
   `TASKS_DEFAULT_TIMEZONE` (or, since #434, `TASKS_RULE`,
